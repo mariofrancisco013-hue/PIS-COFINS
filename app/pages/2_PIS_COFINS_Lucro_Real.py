@@ -190,13 +190,24 @@ with aba_apuracao:
     """), {"cid": competencia_id}).mappings().all()
 
     def _base_da_linha(detalhe):
-        # detalhe (jsonb) vem como dict já desserializado — "base_total" existe nos grupos de CFOP (1.1,
-        # 1.2, 1.4, 1.6, 5.1, 5.2, 5.5, 5.7, 5.8), nos lançamentos manuais (5.3/5.4/5.6) e nos totais (1, 5).
-        # Nas demais linhas (2.x, 3, 6.x, 8.x, 9.x, 10.x, 11.x) não há uma "base" única — mostra "—".
+        # detalhe (jsonb) vem como dict já desserializado. "base_total" existe nos grupos de CFOP (1.1,
+        # 1.2, 1.4, 1.6, 5.1, 5.2, 5.5, 5.7, 5.8 — aqui é o valor BRUTO, Valor Contábil, antes de excluir o
+        # ICMS), nas linhas 2.3/6.4 (o próprio valor do ICMS destacado excluído), na 2/6 (soma das exclusões
+        # já implementadas) e nos totais 1/5 (idem, bruto). Nas demais linhas não há "base" — mostra "—".
         if not detalhe or "base_total" not in detalhe:
             return None
         try:
             return Decimal(str(detalhe["base_total"]))
+        except Exception:
+            return None
+
+    def _base_liquida_da_linha(detalhe):
+        # "base_liquida" só existe nas linhas 1.1-5.8/1/5 — é o bruto já com o ICMS destacado excluído, o
+        # valor que de fato multiplica pela alíquota (1,65%/7,60%). Usado só nos cartões de resumo.
+        if not detalhe or "base_liquida" not in detalhe:
+            return None
+        try:
+            return Decimal(str(detalhe["base_liquida"]))
         except Exception:
             return None
 
@@ -248,13 +259,14 @@ with aba_apuracao:
         # vs. total), que uma grade não faz — por isso a renderização é linha a linha com st.columns.
         linhas_ordenadas = ordenar_linhas_para_exibicao(linhas_salvas)
         totais = {r["linha"]: r for r in linhas_salvas}
-        base_debito = _base_da_linha(totais["1"]["detalhe"]) if "1" in totais else None
-        base_credito = _base_da_linha(totais["5"]["detalhe"]) if "5" in totais else None
+        base_debito_liquida = _base_liquida_da_linha(totais["1"]["detalhe"]) if "1" in totais else None
+        base_credito_liquida = _base_liquida_da_linha(totais["5"]["detalhe"]) if "5" in totais else None
 
         st.caption(
-            "Confira a **Base** de cada linha (vem direto da Rotina 1024/lançamentos manuais) — logo após "
-            "o Débito e logo após o Crédito, um cartão mostra a base final da seção com o PIS e o COFINS "
-            "já calculados em cima dela."
+            "A **Base** de cada linha 1.1 a 1.6 / 5.1 a 5.8 é o Valor Contábil bruto (antes de excluir o "
+            "ICMS destacado). A linha 2.3/6.4 mostra o ICMS que sai desse bruto — o cartão logo depois do "
+            "Débito e do Crédito mostra a Base de Cálculo já líquida (bruto − ICMS excluído) e o PIS/COFINS "
+            "calculados em cima dela."
         )
         cab = st.columns([6, 2, 1.3])
         cab[0].markdown("**Linha**")
@@ -266,10 +278,10 @@ with aba_apuracao:
             secao, _ordem, nivel = LAYOUT_LINHAS.get(r["linha"], ("Outras linhas", 999, 1))
             if secao != secao_atual:
                 if secao_atual == SECAO_EXCLUSOES_DEBITO and "1" in totais:
-                    _cartao_totais("Base de Cálculo — Débito", "📤", COR_DEBITO, base_debito,
+                    _cartao_totais("Base de Cálculo (líquida) — Débito", "📤", COR_DEBITO, base_debito_liquida,
                                     totais["1"]["valor_pis"], totais["1"]["valor_cofins"])
                 elif secao_atual == SECAO_EXCLUSOES_CREDITO and "5" in totais:
-                    _cartao_totais("Base de Cálculo — Crédito", "📥", COR_CREDITO, base_credito,
+                    _cartao_totais("Base de Cálculo (líquida) — Crédito", "📥", COR_CREDITO, base_credito_liquida,
                                     totais["5"]["valor_pis"], totais["5"]["valor_cofins"])
                 st.markdown(f"##### {SECAO_ICONE.get(secao, '')} {secao}")
                 secao_atual = secao

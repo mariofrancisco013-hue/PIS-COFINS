@@ -14,7 +14,8 @@ from lib.status_apuracao_pc import status_competencia
 from lib import importacao_pc, resumo_pc, lancamentos_manuais_pc as lmpc
 from lib.calculo_pis_cofins_lucro_real import (
     calcular_apuracao_pc, salvar_apuracao_pc, ordenar_linhas_para_exibicao, LAYOUT_LINHAS, ORDEM_SECOES,
-    conferencia_1024_x_1096,
+    conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
+    SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
 
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")
@@ -199,6 +200,46 @@ with aba_apuracao:
         except Exception:
             return None
 
+    def _cartao_totais(titulo, icone, cor, base, pis, cofins):
+        """Cartão visual (HTML/CSS inline) para destacar a base final de uma seção e o PIS/COFINS
+        calculados a partir dela — pedido do usuário: manter débito/exclusões como já estava, e só depois
+        de cada bloco (débito, crédito) mostrar uma linha de resumo com Base/PIS/COFINS, "mais visual".
+        `base=None` omite o bloco de Base (usado no cartão de resultado final, que não tem uma base própria)."""
+        bloco_base = "" if base is None else f"""
+    <div>
+      <div style="font-size:0.78rem; opacity:0.65; text-transform:uppercase; letter-spacing:.04em;">
+        Base de Cálculo</div>
+      <div style="font-size:1.5rem; font-weight:700;">{formatar_moeda(base)}</div>
+    </div>"""
+        st.markdown(f"""
+<div style="border-left: 6px solid {cor}; background: rgba(148,163,184,0.08); border-radius: 10px;
+            padding: 18px 24px; margin: 6px 0 22px 0;">
+  <div style="font-size: 1.05rem; font-weight: 700; margin-bottom: 12px;">{icone} {titulo}</div>
+  <div style="display:flex; gap: 48px; flex-wrap: wrap;">{bloco_base}
+    <div>
+      <div style="font-size:0.78rem; opacity:0.65; text-transform:uppercase; letter-spacing:.04em;">
+        Valor PIS</div>
+      <div style="font-size:1.5rem; font-weight:700; color:{cor};">{formatar_moeda(pis)}</div>
+    </div>
+    <div>
+      <div style="font-size:0.78rem; opacity:0.65; text-transform:uppercase; letter-spacing:.04em;">
+        Valor COFINS</div>
+      <div style="font-size:1.5rem; font-weight:700; color:{cor};">{formatar_moeda(cofins)}</div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    COR_DEBITO = "#f87171"    # vermelho — débito (o que a empresa deve)
+    COR_CREDITO = "#4ade80"   # verde — crédito (o que abate do débito)
+    COR_RESULTADO = "#fbbf24"  # âmbar — resultado final (DARF)
+
+    SECAO_ICONE = {
+        SECAO_DEBITO: "📤", SECAO_EXCLUSOES_DEBITO: "➖", SECAO_FINANCEIRAS: "💹",
+        SECAO_CREDITO: "📥", SECAO_EXCLUSOES_CREDITO: "➖", SECAO_SALDO_ANTERIOR: "🔄",
+        SECAO_RESULTADO: "🧾",
+    }
+
     if not linhas_salvas:
         st.info("Ainda não calculado — clique em **Calcular apuração**.")
     else:
@@ -207,41 +248,55 @@ with aba_apuracao:
         # vs. total), que uma grade não faz — por isso a renderização é linha a linha com st.columns.
         linhas_ordenadas = ordenar_linhas_para_exibicao(linhas_salvas)
         totais = {r["linha"]: r for r in linhas_salvas}
+        base_debito = _base_da_linha(totais["1"]["detalhe"]) if "1" in totais else None
+        base_credito = _base_da_linha(totais["5"]["detalhe"]) if "5" in totais else None
 
-        cab = st.columns([4, 2, 2, 2, 1.3])
+        st.caption(
+            "Confira a **Base** de cada linha (vem direto da Rotina 1024/lançamentos manuais) — logo após "
+            "o Débito e logo após o Crédito, um cartão mostra a base final da seção com o PIS e o COFINS "
+            "já calculados em cima dela."
+        )
+        cab = st.columns([6, 2, 1.3])
         cab[0].markdown("**Linha**")
         cab[1].markdown("**Base**")
-        cab[2].markdown("**PIS**")
-        cab[3].markdown("**COFINS**")
-        cab[4].markdown("**Situação**")
+        cab[2].markdown("**Situação**")
 
         secao_atual = None
         for r in linhas_ordenadas:
             secao, _ordem, nivel = LAYOUT_LINHAS.get(r["linha"], ("Outras linhas", 999, 1))
             if secao != secao_atual:
-                st.markdown(f"##### {secao}")
+                if secao_atual == SECAO_EXCLUSOES_DEBITO and "1" in totais:
+                    _cartao_totais("Base de Cálculo — Débito", "📤", COR_DEBITO, base_debito,
+                                    totais["1"]["valor_pis"], totais["1"]["valor_cofins"])
+                elif secao_atual == SECAO_EXCLUSOES_CREDITO and "5" in totais:
+                    _cartao_totais("Base de Cálculo — Crédito", "📥", COR_CREDITO, base_credito,
+                                    totais["5"]["valor_pis"], totais["5"]["valor_cofins"])
+                st.markdown(f"##### {SECAO_ICONE.get(secao, '')} {secao}")
                 secao_atual = secao
             destaque = nivel == 0  # linha de total da seção — negrito, sem indentação
             indent = "&nbsp;&nbsp;&nbsp;&nbsp;" if not destaque else ""
             abre, fecha = ("**", "**") if destaque else ("", "")
             base = _base_da_linha(r["detalhe"])
             base_txt = formatar_moeda(base) if base is not None else "—"
-            linha_cols = st.columns([4, 2, 2, 2, 1.3])
+            linha_cols = st.columns([6, 2, 1.3])
             linha_cols[0].markdown(f"{indent}{abre}{r['linha']} — {r['descricao']}{fecha}",
                                     unsafe_allow_html=True)
             linha_cols[1].markdown(f"{abre}{base_txt}{fecha}")
-            linha_cols[2].markdown(f"{abre}{formatar_moeda(r['valor_pis'])}{fecha}")
-            linha_cols[3].markdown(f"{abre}{formatar_moeda(r['valor_cofins'])}{fecha}")
-            linha_cols[4].markdown("⏳ pendente" if r["manual"] else "✅")
+            linha_cols[2].markdown("⏳ pendente" if r["manual"] else "✅")
 
         st.markdown("---")
         if "11.3" in totais:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Líquido a pagar — PIS", formatar_moeda(totais["11.1"]["valor_pis"]))
-            c2.metric("Líquido a pagar — COFINS", formatar_moeda(totais["11.2"]["valor_cofins"]))
-            c3.metric("Total DARF", formatar_moeda(
-                totais["11.3"]["valor_pis"] + totais["11.3"]["valor_cofins"]
-            ))
+            pagar_total = totais["11.3"]["valor_pis"] + totais["11.3"]["valor_cofins"]
+            _cartao_totais(
+                "Resultado da Apuração — Líquido a pagar em DARF", "🧾", COR_RESULTADO,
+                None, totais["11.1"]["valor_pis"], totais["11.2"]["valor_cofins"],
+            )
+            st.markdown(f"""
+<div style="text-align:center; margin-top:-10px;">
+  <span style="font-size:0.85rem; opacity:0.7;">Total DARF (PIS + COFINS)</span><br>
+  <span style="font-size:2rem; font-weight:800; color:{COR_RESULTADO};">{formatar_moeda(pagar_total)}</span>
+</div>
+""", unsafe_allow_html=True)
 
         n_pendentes_manual = sum(1 for r in linhas_salvas if r["manual"])
         if n_pendentes_manual:

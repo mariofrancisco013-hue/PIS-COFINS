@@ -208,12 +208,15 @@ with aba_apuracao:
         linhas_ordenadas = ordenar_linhas_para_exibicao(linhas_salvas)
         totais = {r["linha"]: r for r in linhas_salvas}
 
-        cab = st.columns([4, 2, 2, 2, 1.3])
+        st.caption(
+            "Primeiro confira a **Base** de cada linha (é o que vem direto da Rotina 1024/lançamentos "
+            "manuais) — o PIS e o COFINS calculados a partir dela aparecem no resumo, mais abaixo, depois "
+            "que a base final estiver validada."
+        )
+        cab = st.columns([6, 2, 1.3])
         cab[0].markdown("**Linha**")
         cab[1].markdown("**Base**")
-        cab[2].markdown("**PIS**")
-        cab[3].markdown("**COFINS**")
-        cab[4].markdown("**Situação**")
+        cab[2].markdown("**Situação**")
 
         secao_atual = None
         for r in linhas_ordenadas:
@@ -226,13 +229,30 @@ with aba_apuracao:
             abre, fecha = ("**", "**") if destaque else ("", "")
             base = _base_da_linha(r["detalhe"])
             base_txt = formatar_moeda(base) if base is not None else "—"
-            linha_cols = st.columns([4, 2, 2, 2, 1.3])
+            linha_cols = st.columns([6, 2, 1.3])
             linha_cols[0].markdown(f"{indent}{abre}{r['linha']} — {r['descricao']}{fecha}",
                                     unsafe_allow_html=True)
             linha_cols[1].markdown(f"{abre}{base_txt}{fecha}")
-            linha_cols[2].markdown(f"{abre}{formatar_moeda(r['valor_pis'])}{fecha}")
-            linha_cols[3].markdown(f"{abre}{formatar_moeda(r['valor_cofins'])}{fecha}")
-            linha_cols[4].markdown("⏳ pendente" if r["manual"] else "✅")
+            linha_cols[2].markdown("⏳ pendente" if r["manual"] else "✅")
+
+        st.markdown("---")
+        st.subheader("Resumo do cálculo (base final × alíquota)")
+        if "1" in totais and "5" in totais:
+            base_debito = _base_da_linha(totais["1"]["detalhe"])
+            base_credito = _base_da_linha(totais["5"]["detalhe"])
+            r1, r2 = st.columns(2)
+            with r1:
+                st.markdown("**Débito (Saída)**")
+                st.metric("Base Débito", formatar_moeda(base_debito))
+                cd1, cd2 = st.columns(2)
+                cd1.metric("PIS Débito", formatar_moeda(totais["1"]["valor_pis"]))
+                cd2.metric("COFINS Débito", formatar_moeda(totais["1"]["valor_cofins"]))
+            with r2:
+                st.markdown("**Crédito (Entrada)**")
+                st.metric("Base Crédito", formatar_moeda(base_credito))
+                cc1, cc2 = st.columns(2)
+                cc1.metric("PIS Crédito", formatar_moeda(totais["5"]["valor_pis"]))
+                cc2.metric("COFINS Crédito", formatar_moeda(totais["5"]["valor_cofins"]))
 
         st.markdown("---")
         if "11.3" in totais:

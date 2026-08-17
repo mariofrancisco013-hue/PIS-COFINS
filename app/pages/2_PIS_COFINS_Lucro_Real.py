@@ -14,7 +14,8 @@ from lib.status_apuracao_pc import status_competencia
 from lib import importacao_pc, resumo_pc, lancamentos_manuais_pc as lmpc
 from lib.calculo_pis_cofins_lucro_real import (
     calcular_apuracao_pc, salvar_apuracao_pc, ordenar_linhas_para_exibicao, LAYOUT_LINHAS, ORDEM_SECOES,
-    conferencia_1024_x_1096,
+    conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
+    SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
 
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")

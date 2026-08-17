@@ -1,4 +1,5 @@
 import sys
+from decimal import Decimal
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -183,9 +184,20 @@ with aba_apuracao:
         st.rerun()
 
     linhas_salvas = session.execute(text("""
-        select linha, descricao, valor_pis, valor_cofins, manual
+        select linha, descricao, valor_pis, valor_cofins, manual, detalhe
         from apuracao_pc_linhas where competencia_id = :cid
     """), {"cid": competencia_id}).mappings().all()
+
+    def _base_da_linha(detalhe):
+        # detalhe (jsonb) vem como dict já desserializado — "base_total" existe nos grupos de CFOP (1.1,
+        # 1.2, 1.4, 1.6, 5.1, 5.2, 5.5, 5.7, 5.8), nos lançamentos manuais (5.3/5.4/5.6) e nos totais (1, 5).
+        # Nas demais linhas (2.x, 3, 6.x, 8.x, 9.x, 10.x, 11.x) não há uma "base" única — mostra "—".
+        if not detalhe or "base_total" not in detalhe:
+            return None
+        try:
+            return Decimal(str(detalhe["base_total"]))
+        except Exception:
+            return None
 
     if not linhas_salvas:
         st.info("Ainda não calculado — clique em **Calcular apuração**.")
@@ -196,11 +208,12 @@ with aba_apuracao:
         linhas_ordenadas = ordenar_linhas_para_exibicao(linhas_salvas)
         totais = {r["linha"]: r for r in linhas_salvas}
 
-        cab = st.columns([5, 2, 2, 1.3])
+        cab = st.columns([4, 2, 2, 2, 1.3])
         cab[0].markdown("**Linha**")
-        cab[1].markdown("**PIS**")
-        cab[2].markdown("**COFINS**")
-        cab[3].markdown("**Situação**")
+        cab[1].markdown("**Base**")
+        cab[2].markdown("**PIS**")
+        cab[3].markdown("**COFINS**")
+        cab[4].markdown("**Situação**")
 
         secao_atual = None
         for r in linhas_ordenadas:
@@ -211,12 +224,15 @@ with aba_apuracao:
             destaque = nivel == 0  # linha de total da seção — negrito, sem indentação
             indent = "&nbsp;&nbsp;&nbsp;&nbsp;" if not destaque else ""
             abre, fecha = ("**", "**") if destaque else ("", "")
-            linha_cols = st.columns([5, 2, 2, 1.3])
+            base = _base_da_linha(r["detalhe"])
+            base_txt = formatar_moeda(base) if base is not None else "—"
+            linha_cols = st.columns([4, 2, 2, 2, 1.3])
             linha_cols[0].markdown(f"{indent}{abre}{r['linha']} — {r['descricao']}{fecha}",
                                     unsafe_allow_html=True)
-            linha_cols[1].markdown(f"{abre}{formatar_moeda(r['valor_pis'])}{fecha}")
-            linha_cols[2].markdown(f"{abre}{formatar_moeda(r['valor_cofins'])}{fecha}")
-            linha_cols[3].markdown("⏳ pendente" if r["manual"] else "✅")
+            linha_cols[1].markdown(f"{abre}{base_txt}{fecha}")
+            linha_cols[2].markdown(f"{abre}{formatar_moeda(r['valor_pis'])}{fecha}")
+            linha_cols[3].markdown(f"{abre}{formatar_moeda(r['valor_cofins'])}{fecha}")
+            linha_cols[4].markdown("⏳ pendente" if r["manual"] else "✅")
 
         st.markdown("---")
         if "11.3" in totais:

@@ -169,6 +169,7 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     # --- débito (saída) ---
     debito_pis_total = Decimal("0")
     debito_cofins_total = Decimal("0")
+    debito_base_total = Decimal("0")
     icms_excluido_saida = Decimal("0")
     for grupo, descricao in GRUPOS_DEBITO.items():
         base_total, det = _base_por_grupo(resumo_1024, "saida", grupo)
@@ -180,6 +181,7 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         }))
         debito_pis_total += soma_pis
         debito_cofins_total += soma_cofins
+        debito_base_total += base_total
 
     for grupo, descricao in GRUPOS_DEBITO.items():
         icms_excluido_saida += sum(
@@ -191,10 +193,14 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
 
     linhas.append(LinhaApuracaoPC(
-        "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"), manual=False,
+        "2.3", "(-) ICMS Apuração - Destacado Saídas (informativo — já excluído dentro da base de 1.1 a 1.6)",
+        Decimal("0"), Decimal("0"), manual=False,
         detalhe={
-            "nota": "Já embutido na base de cada grupo de débito (Valor Contábil − ICMS destacado, Rotina "
-                    "1024) — não é somado separadamente aqui, para não excluir o ICMS duas vezes.",
+            "base_total": str(icms_excluido_saida),
+            "nota": "Este é o valor de ICMS destacado nas saídas (soma de todas as filiais, Rotina 1024). Já "
+                    "foi subtraído dentro da base de cada grupo de débito (1.1/1.2/1.4/1.6) — por isso o PIS "
+                    "e o COFINS aqui ficam R$ 0,00 e não são somados de novo no Total das Exclusões (2): "
+                    "somar aqui em cima do que já foi embutido excluiria o mesmo ICMS duas vezes.",
             "icms_destacado_saida_total": str(icms_excluido_saida),
         },
     ))
@@ -204,11 +210,13 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
                           "1024/1096), ver metodologia."},
     ))
     linhas.append(LinhaApuracaoPC("1", "Total das Receitas Tributáveis (débito)",
-                                   debito_pis_total, debito_cofins_total))
+                                   debito_pis_total, debito_cofins_total,
+                                   detalhe={"base_total": str(debito_base_total)}))
 
     # --- crédito (entrada) ---
     credito_pis_total = Decimal("0")
     credito_cofins_total = Decimal("0")
+    credito_base_total = Decimal("0")
     icms_excluido_entrada = Decimal("0")
     for grupo, descricao in GRUPOS_CREDITO.items():
         base_total, det = _base_por_grupo(resumo_1024, "entrada", grupo)
@@ -220,6 +228,7 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         }))
         credito_pis_total += soma_pis
         credito_cofins_total += soma_cofins
+        credito_base_total += base_total
 
     for grupo, descricao in GRUPOS_CREDITO.items():
         icms_excluido_entrada += sum(
@@ -237,19 +246,28 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         itens_tipo = [l for l in lancamentos if l["tipo"] == tipo]
         soma_pis = sum((_dec(l["valor_pis"]) for l in itens_tipo), Decimal("0"))
         soma_cofins = sum((_dec(l["valor_cofins"]) for l in itens_tipo), Decimal("0"))
-        det = {"lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo]}
+        base_lancamentos = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
+        det = {
+            "base_total": str(base_lancamentos),
+            "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
+        }
         linhas.append(LinhaApuracaoPC(linha, descricao, soma_pis, soma_cofins, detalhe=det))
         credito_pis_total += soma_pis
         credito_cofins_total += soma_cofins
+        credito_base_total += base_lancamentos
 
     for linha, descricao in LINHAS_PENDENTES_CREDITO.items():
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
 
     linhas.append(LinhaApuracaoPC(
-        "6.4", "(-) ICMS Apuração - Destacado Entradas", Decimal("0"), Decimal("0"), manual=False,
+        "6.4", "(-) ICMS Apuração - Destacado Entradas (informativo — já excluído dentro da base de 5.1 a 5.8)",
+        Decimal("0"), Decimal("0"), manual=False,
         detalhe={
-            "nota": "Já embutido na base de cada grupo de crédito (Valor Contábil − ICMS destacado, Rotina "
-                    "1024) — não é somado separadamente aqui, para não excluir o ICMS duas vezes.",
+            "base_total": str(icms_excluido_entrada),
+            "nota": "Este é o valor de ICMS destacado nas entradas (soma de todas as filiais, Rotina 1024). Já "
+                    "foi subtraído dentro da base de cada grupo de crédito (5.1/5.2/5.5/5.7/5.8) — por isso o "
+                    "PIS e o COFINS aqui ficam R$ 0,00 e não são somados de novo no Total das Exclusões (6): "
+                    "somar aqui em cima do que já foi embutido excluiria o mesmo ICMS duas vezes.",
             "icms_destacado_entrada_total": str(icms_excluido_entrada),
         },
     ))
@@ -257,7 +275,8 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "6", "Total das Exclusões (crédito)", Decimal("0"), Decimal("0"), manual=True,
         detalhe={"nota": "6.4 já embutida na base (ver acima); 6.3/6.5/6.6 seguem pendentes, ver metodologia."},
     ))
-    linhas.append(LinhaApuracaoPC("5", "Total de Créditos", credito_pis_total, credito_cofins_total))
+    linhas.append(LinhaApuracaoPC("5", "Total de Créditos", credito_pis_total, credito_cofins_total,
+                                   detalhe={"base_total": str(credito_base_total)}))
 
     # --- saldo credor do período anterior (entrada manual — ver saldo_credor_anterior_pc) ---
     saldo_anterior = session.execute(text("""

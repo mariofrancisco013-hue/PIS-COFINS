@@ -1,12 +1,38 @@
 """
-Leitura em grade dos itens importados (Relatório 1096) — visão resumida por CFOP e visão analítica por
-item, usadas na aba "Entrada"/"Saída" da página PIS/COFINS Lucro Real. Sem granularidade de NF (o relatório
-não traz — ver metodologia no projeto), então não há edição item a item aqui como no módulo ICMS: se um
-lançamento está errado, o certo é corrigir no Winthor e reimportar (com "substituir") — mais seguro do que
-editar um valor calculado pelo próprio Winthor a partir do CST.
+Leitura em grade dos dados importados — visão resumida por CFOP (Rotina 1024, fonte primária, e Relatório
+1096, conferência) e visão analítica por item do 1096, usadas nas abas "Entrada"/"Saída" da página PIS/
+COFINS Lucro Real. Sem granularidade de NF (nem o 1024 nem o 1096 trazem — ver metodologia no projeto), então
+não há edição item a item aqui como no módulo ICMS: se um lançamento está errado, o certo é corrigir na
+origem (Winthor/1024) e reimportar (com "substituir") — mais seguro do que editar um valor já calculado.
 """
 import pandas as pd
 from sqlalchemy import text
+
+ALIQ_PIS = 0.0165
+ALIQ_COFINS = 0.0760
+
+
+def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
+    """Resumo por CFOP a partir da Rotina 1024 (fonte primária da apuração) — soma todas as filiais da
+    competência (grupo). base = valor_contabil - valor_icms; pis/cofins = base × alíquota, só para leitura
+    (o cálculo oficial da apuração está em calculo_pis_cofins_lucro_real.calcular_apuracao_pc)."""
+    rows = session.execute(text("""
+        select r.cfop, coalesce(cpe.grupo, '(sem grupo)') as grupo, cp.descricao,
+               count(distinct r.empresa_id) as n_filiais,
+               sum(r.valor_contabil) as valor_contabil, sum(r.valor_icms) as valor_icms
+        from resumo_1024_pc r
+        left join cfop_pis_cofins_efetivo cpe on cpe.codigo = r.cfop
+        left join cfop_pis_cofins cp on cp.codigo = r.cfop
+        where r.competencia_id = :cid and r.tipo_operacao = :tipo
+        group by r.cfop, cpe.grupo, cp.descricao
+        order by r.cfop
+    """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
+    df = pd.DataFrame(rows, columns=["cfop", "grupo", "descricao", "n_filiais", "valor_contabil", "valor_icms"])
+    if not df.empty:
+        df["base"] = df["valor_contabil"] - df["valor_icms"]
+        df["valor_pis"] = (df["base"] * ALIQ_PIS).round(2)
+        df["valor_cofins"] = (df["base"] * ALIQ_COFINS).round(2)
+    return df
 
 
 def resumo_por_cfop(session, competencia_id, tipo_operacao):

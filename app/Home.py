@@ -13,11 +13,18 @@ st.caption("Grupo Sodine — módulo Lucro Real (não-cumulativo), construído e
 
 session = get_session()
 resumo = session.execute(text("""
-    select e.razao_social, e.regime, c.ano, c.mes, c.status,
-           (select count(*) from relatorio_pc_itens r where r.competencia_id = c.id) as n_itens,
+    select c.cnpj_raiz,
+           coalesce(
+               (select e2.razao_social from empresas e2
+                where e2.cnpj_raiz = c.cnpj_raiz and e2.razao_social ilike '%matriz%'
+                order by e2.razao_social limit 1),
+               (select min(e3.razao_social) from empresas e3 where e3.cnpj_raiz = c.cnpj_raiz)
+           ) as nome_grupo,
+           c.ano, c.mes, c.status,
+           (select count(distinct empresa_id) from resumo_1024_pc r where r.competencia_id = c.id) as n_filiais_1024,
+           (select count(*) from relatorio_pc_itens r where r.competencia_id = c.id) as n_itens_1096,
            (select count(*) from inconsistencias_pc i where i.competencia_id = c.id and i.status = 'pendente') as n_pendentes
     from competencias c
-    join empresas e on e.id = c.empresa_id
     where c.modulo = 'pis_cofins_lucro_real'
     order by c.ano desc, c.mes desc
 """)).mappings().all()
@@ -33,7 +40,8 @@ else:
         linhas.append(r)
     st.dataframe(
         linhas, use_container_width=True,
-        column_order=["razao_social", "regime", "ano", "mes", "status", "situação", "n_itens", "n_pendentes"],
+        column_order=["nome_grupo", "ano", "mes", "status", "situação", "n_filiais_1024", "n_itens_1096",
+                       "n_pendentes"],
     )
 
 st.markdown("---")

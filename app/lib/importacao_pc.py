@@ -1,19 +1,17 @@
 """
-Importação do "Relatório 1096" do Winthor ("Relatório por combinação de CFOP, CST, NCM e alíquota -
-Analítico" — Entrada/Saída) para a tabela `relatorio_pc_itens`.
+Importação de dados para a apuração de PIS/COFINS — Lucro Real.
 
-Mapeamento de colunas confirmado com o usuário em 14/08/2026 (print do cabeçalho do relatório original +
-conferência aritmética: Vl.Tributado × %PIS/COFINS ÷ 100 = Vl.PIS/Vl.COFINS bateu em todas as linhas
-testadas nos arquivos reais `1096 - Entradas.xlsx` / `1096 - saidas.xlsx`). Ver metodologia completa em
-`claude/metodologia-pis-cofins-lucro-real.md` no projeto "PIS/COFINS".
+Desde 14/08/2026 a apuração é feita por GRUPO (CNPJ raiz — matriz + filiais consolidadas), não mais por uma
+empresa isolada, e a fonte PRIMÁRIA do cálculo é a Rotina 1024 (ver `app/lib/importar_1024_pc.py`), uma por
+filial. O Relatório 1096 ("Relatório por combinação de CFOP, CST, NCM e alíquota - Analítico" — Entrada/
+Saída) continua sendo importado, mas agora só para conferência por CFOP (ver `calculo_pis_cofins_lucro_real.
+conferencia_1024_x_1096`) e para a checagem de CST fora da tabela oficial — não alimenta mais a apuração
+diretamente. Ver metodologia completa em `claude/metodologia-pis-cofins-lucro-real.md` no projeto
+"PIS/COFINS".
 
-IMPORTANTE: este export ("Report", sem cabeçalho, 14 colunas) NÃO traz o número da NF — só o relatório
-impresso/agrupado por bloco de NF traz isso. Este módulo trabalha por item agregado (produto × NCM × CST ×
-CFOP), sem granularidade de NF — ver nota na metodologia sobre por quê não há tela "por NF" neste módulo
-(diferente do módulo ICMS Normal).
+IMPORTANTE: o Relatório 1096 ("Report", sem cabeçalho, 14 colunas) NÃO traz o número da NF — só o relatório
+impresso/agrupado por bloco de NF traz isso.
 """
-import json
-
 import pandas as pd
 from sqlalchemy import text
 
@@ -23,68 +21,118 @@ COLS = [
     "valor_nao_tributado",
 ]
 
-COLS_TABELA = ["competencia_id", "tipo_operacao"] + COLS
+COLS_TABELA = ["competencia_id", "empresa_id", "tipo_operacao"] + COLS
 
 
-def buscar_competencia(session, empresa_cnpj, ano, mes, modulo="pis_cofins_lucro_real"):
-    """Só CONSULTA — devolve o id da competência se já existir, ou None. Não cria nada (mesmo motivo do
-    módulo ICMS: navegar pelos filtros da tela não deve criar competência vazia no banco)."""
-    empresa = session.execute(
-        text("select id from empresas where cnpj = :cnpj"), {"cnpj": empresa_cnpj}
-    ).fetchone()
-    if not empresa:
-        return None
+# ---------------------------------------------------------------------------------------------- Competência (grupo)
+def buscar_competencia_grupo(session, cnpj_raiz, ano, mes, modulo="pis_cofins_lucro_real"):
+    """Só CONSULTA — devolve o id da competência do grupo (cnpj_raiz) se já existir, ou None."""
     return session.execute(text("""
-        select id from competencias where empresa_id=:eid and ano=:ano and mes=:mes and modulo=:modulo
-    """), {"eid": empresa[0], "ano": ano, "mes": mes, "modulo": modulo}).scalar()
+        select id from competencias where cnpj_raiz=:raiz and ano=:ano and mes=:mes and modulo=:modulo
+    """), {"raiz": cnpj_raiz, "ano": ano, "mes": mes, "modulo": modulo}).scalar()
 
 
-def get_or_create_competencia(session, empresa_cnpj, ano, mes, modulo="pis_cofins_lucro_real"):
-    empresa = session.execute(
-        text("select id from empresas where cnpj = :cnpj"), {"cnpj": empresa_cnpj}
-    ).fetchone()
-    if not empresa:
-        raise ValueError(f"Empresa com CNPJ {empresa_cnpj} não encontrada.")
-    empresa_id = empresa[0]
-
-    comp = session.execute(text("""
-        select id from competencias where empresa_id=:eid and ano=:ano and mes=:mes and modulo=:modulo
-    """), {"eid": empresa_id, "ano": ano, "mes": mes, "modulo": modulo}).fetchone()
+def get_or_create_competencia_grupo(session, cnpj_raiz, ano, mes, modulo="pis_cofins_lucro_real"):
+    comp = buscar_competencia_grupo(session, cnpj_raiz, ano, mes, modulo)
     if comp:
-        return comp[0]
-
+        return comp
     result = session.execute(text("""
-        insert into competencias (empresa_id, ano, mes, modulo, status)
-        values (:eid, :ano, :mes, :modulo, 'aberta') returning id
-    """), {"eid": empresa_id, "ano": ano, "mes": mes, "modulo": modulo})
+        insert into competencias (cnpj_raiz, ano, mes, modulo, status)
+        values (:raiz, :ano, :mes, :modulo, 'aberta') returning id
+    """), {"raiz": cnpj_raiz, "ano": ano, "mes": mes, "modulo": modulo})
     novo_id = result.fetchone()[0]
     session.commit()
     return novo_id
 
 
-def checar_duplicacao(session, competencia_id, tipos, substituir):
-    """Mesma lógica do módulo ICMS: checa/apaga só os tipos (entrada/saída) sendo reimportados agora, sem
-    mexer no outro tipo já importado."""
+def listar_grupos(session, regime_like="Lucro Real%"):
+    """Um grupo = um cnpj_raiz. Nome de referência = a empresa com 'Matriz' no nome, se houver, senão a
+    primeira em ordem alfabética — só para rotular a caixa de seleção, não afeta o cálculo."""
+    rows = session.execute(text("""
+        select e.cnpj_raiz,
+               coalesce(
+                   (select e2.razao_social from empresas e2
+                    where e2.cnpj_raiz = e.cnpj_raiz and e2.razao_social ilike '%matriz%'
+                    order by e2.razao_social limit 1),
+                   min(e.razao_social)
+               ) as nome_grupo,
+               count(*) as n_filiais
+        from empresas e
+        where e.regime ilike :regime
+        group by e.cnpj_raiz
+        order by nome_grupo
+    """), {"regime": regime_like}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def listar_filiais_grupo(session, cnpj_raiz):
+    rows = session.execute(text("""
+        select id, filial_winthor, razao_social, cnpj
+        from empresas where cnpj_raiz = :raiz
+        order by filial_winthor nulls last, razao_social
+    """), {"raiz": cnpj_raiz}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def status_filiais_grupo(session, cnpj_raiz, ano, mes, modulo="pis_cofins_lucro_real"):
+    """Uma linha por filial do grupo, com o que já foi importado nesta competência (se ela existir) — usado
+    na tela de Importar Relatórios para mostrar o que falta antes de calcular a apuração consolidada."""
+    filiais = listar_filiais_grupo(session, cnpj_raiz)
+    competencia_id = buscar_competencia_grupo(session, cnpj_raiz, ano, mes, modulo)
+    if not competencia_id:
+        return [{**f, "cfops_1024": 0, "itens_1096_entrada": 0, "itens_1096_saida": 0} for f in filiais], None
+
+    contagem_1024 = dict(session.execute(text("""
+        select empresa_id, count(*) from resumo_1024_pc where competencia_id = :cid group by empresa_id
+    """), {"cid": competencia_id}).all())
+    contagem_1096 = session.execute(text("""
+        select empresa_id, tipo_operacao, count(*) as n
+        from relatorio_pc_itens where competencia_id = :cid group by empresa_id, tipo_operacao
+    """), {"cid": competencia_id}).mappings().all()
+    entrada_1096, saida_1096 = {}, {}
+    for r in contagem_1096:
+        if r["tipo_operacao"] == "entrada":
+            entrada_1096[r["empresa_id"]] = r["n"]
+        else:
+            saida_1096[r["empresa_id"]] = r["n"]
+
+    out = []
+    for f in filiais:
+        out.append({
+            **f,
+            "cfops_1024": contagem_1024.get(f["id"], 0),
+            "itens_1096_entrada": entrada_1096.get(f["id"], 0),
+            "itens_1096_saida": saida_1096.get(f["id"], 0),
+        })
+    return out, competencia_id
+
+
+# ---------------------------------------------------------------------------------------------- Relatório 1096 (conferência)
+def checar_duplicacao(session, competencia_id, empresa_id, tipos, substituir):
+    """Escopado por filial (empresa_id) — múltiplas filiais convivem na mesma competência (grupo), então
+    reimportar o 1096 de uma filial não pode mexer nos itens já importados de outra."""
     placeholders = ", ".join(f":t{i}" for i in range(len(tipos)))
     params = {f"t{i}": t for i, t in enumerate(tipos)}
     params["cid"] = competencia_id
+    params["eid"] = empresa_id
 
     n = session.execute(
-        text(f"select count(*) from relatorio_pc_itens where competencia_id = :cid "
+        text(f"select count(*) from relatorio_pc_itens where competencia_id = :cid and empresa_id = :eid "
              f"and tipo_operacao in ({placeholders})"),
         params,
     ).scalar()
     if n and not substituir:
         raise ValueError(
-            f"Já existem {n} itens de {'/'.join(tipos)} importados para esta competência. Marque "
-            f"'substituir' se este é um relatório corrigido (evita duplicar). Isso NÃO afeta o outro tipo "
-            f"(Entrada/Saída) já importado para esta competência."
+            f"Esta filial já tem {n} itens de {'/'.join(tipos)} (Relatório 1096) importados para esta "
+            f"competência. Marque 'substituir' se este é um relatório corrigido (evita duplicar). Isso NÃO "
+            f"afeta outras filiais nem o outro tipo (Entrada/Saída) já importado."
         )
     if n and substituir:
-        session.execute(text("delete from inconsistencias_pc where competencia_id = :cid"), {"cid": competencia_id})
-        session.execute(text("delete from apuracao_pc_linhas where competencia_id = :cid"), {"cid": competencia_id})
+        session.execute(text("""
+            delete from inconsistencias_pc where competencia_id = :cid and fonte = 'relatorio_1096'
+        """), {"cid": competencia_id})
         session.execute(
-            text(f"delete from relatorio_pc_itens where competencia_id = :cid "
+            text(f"delete from relatorio_pc_itens where competencia_id = :cid and empresa_id = :eid "
                  f"and tipo_operacao in ({placeholders})"),
             params,
         )
@@ -92,7 +140,7 @@ def checar_duplicacao(session, competencia_id, tipos, substituir):
     return n or 0
 
 
-def _preparar_dataframe(arquivo, tipo_operacao, competencia_id):
+def _preparar_dataframe(arquivo, tipo_operacao, competencia_id, empresa_id):
     """Lê o .xlsx do Relatório 1096 (aba 'Report', sem cabeçalho, 14 colunas posicionais) e devolve um
     DataFrame já no formato da tabela `relatorio_pc_itens`, pronto para to_sql."""
     # engine="calamine": o Winthor às vezes exporta esse relatório como .xlsx gerado por uma ferramenta
@@ -107,9 +155,6 @@ def _preparar_dataframe(arquivo, tipo_operacao, competencia_id):
         )
     df.columns = COLS
 
-    # linhas de rodapé (ex.: "Total geral") vêm com CFOP vazio — descarta só essas; se sobrar alguma linha
-    # com CFOP vazio mas com produto/valor preenchido, trava com erro explicando (mais seguro que gravar
-    # um item sem CFOP ou adivinhar).
     cfop_vazio = pd.to_numeric(df["cfop"], errors="coerce").isna()
     if cfop_vazio.any():
         tem_valor = cfop_vazio & (pd.to_numeric(df["valor_itens"], errors="coerce").fillna(0) != 0)
@@ -124,6 +169,7 @@ def _preparar_dataframe(arquivo, tipo_operacao, competencia_id):
 
     out = pd.DataFrame({"produto_codigo": df["produto_codigo"].astype(str)})
     out["competencia_id"] = competencia_id
+    out["empresa_id"] = empresa_id
     out["tipo_operacao"] = tipo_operacao
     out["ncm"] = df["ncm"].apply(lambda v: None if pd.isna(v) else str(int(v)) if float(v) == int(v) else str(v))
     out["cst"] = pd.to_numeric(df["cst"], errors="coerce").astype("Int64")
@@ -147,9 +193,8 @@ def _preparar_dataframe(arquivo, tipo_operacao, competencia_id):
     return out[COLS_TABELA]
 
 
-def importar_arquivo(session, arquivo, tipo_operacao, competencia_id):
-    """`arquivo` pode ser um caminho (str/Path) ou um buffer tipo st.file_uploader."""
-    df = _preparar_dataframe(arquivo, tipo_operacao, competencia_id)
+def importar_arquivo(session, arquivo, tipo_operacao, competencia_id, empresa_id):
+    df = _preparar_dataframe(arquivo, tipo_operacao, competencia_id, empresa_id)
     df.to_sql(
         "relatorio_pc_itens", session.bind, if_exists="append", index=False,
         method="multi", chunksize=500,
@@ -157,70 +202,72 @@ def importar_arquivo(session, arquivo, tipo_operacao, competencia_id):
     return len(df)
 
 
-def _registrar_inconsistencias(session, competencia_id):
-    """Sinaliza (não ignora) CST fora da tabela oficial e CFOP sem grupo cadastrado — ver metodologia no
-    projeto sobre por que isso não pode ser adivinhado."""
-    session.execute(text("delete from inconsistencias_pc where competencia_id = :cid and tipo in "
-                          "('cst_nao_mapeado','cfop_sem_grupo')"), {"cid": competencia_id})
+def _registrar_inconsistencias_1096(session, competencia_id, empresa_id):
+    """CST fora da tabela oficial e CFOP sem grupo cadastrado, olhando só os itens desta filial (1096) —
+    sinalizado, não ignorado. Desde a migração para o 1024 como fonte primária, isso serve só de conferência
+    (não bloqueia o cálculo, que roda em cima de resumo_1024_pc). Escopado por empresa_id (filial): recria
+    do zero só os achados desta filial, sem tocar nos de outras filiais da mesma competência (grupo)."""
+    session.execute(text("""
+        delete from inconsistencias_pc
+        where competencia_id = :cid and empresa_id = :eid and fonte = 'relatorio_1096'
+    """), {"cid": competencia_id, "eid": empresa_id})
 
     csts_ruins = session.execute(text("""
         select distinct ri.cst, ri.tipo_operacao
         from relatorio_pc_itens ri
         left join cst_pis_cofins c on c.codigo = ri.cst
-        where ri.competencia_id = :cid and c.codigo is null
-    """), {"cid": competencia_id}).mappings().all()
+        where ri.competencia_id = :cid and ri.empresa_id = :eid and c.codigo is null
+    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
     for r in csts_ruins:
         session.execute(text("""
-            insert into inconsistencias_pc (competencia_id, tipo, cst, tipo_operacao, descricao)
-            values (:cid, 'cst_nao_mapeado', :cst, :tipo,
+            insert into inconsistencias_pc (competencia_id, empresa_id, tipo, cst, tipo_operacao, descricao, fonte)
+            values (:cid, :eid, 'cst_nao_mapeado', :cst, :tipo,
                     'CST ' || :cst || ' não consta na tabela oficial de PIS/COFINS — confira se é erro de '
-                    || 'exportação do Winthor ou um código novo que precisa de cadastro manual.')
-        """), {"cid": competencia_id, "cst": r["cst"], "tipo": r["tipo_operacao"]})
+                    || 'exportação do Winthor ou um código novo que precisa de cadastro manual.', 'relatorio_1096')
+        """), {"cid": competencia_id, "eid": empresa_id, "cst": r["cst"], "tipo": r["tipo_operacao"]})
 
     cfops_ruins = session.execute(text("""
         select distinct ri.cfop, ri.tipo_operacao
         from relatorio_pc_itens ri
         left join cfop_pis_cofins cp on cp.codigo = ri.cfop
-        where ri.competencia_id = :cid and cp.codigo is null
-    """), {"cid": competencia_id}).mappings().all()
+        where ri.competencia_id = :cid and ri.empresa_id = :eid and cp.codigo is null
+    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
     for r in cfops_ruins:
         session.execute(text("""
-            insert into inconsistencias_pc (competencia_id, tipo, cfop, tipo_operacao, descricao)
-            values (:cid, 'cfop_sem_grupo', :cfop, :tipo,
-                    'CFOP ' || :cfop || ' não está cadastrado em nenhum grupo da apuração (1.1/1.2/1.4/1.6 '
-                    || 'ou 5.1/5.2/5.5/5.7/5.8) — os itens desse CFOP ficam de fora do cálculo até ser '
-                    || 'cadastrado em CFOP × PIS/COFINS.')
-        """), {"cid": competencia_id, "cfop": r["cfop"], "tipo": r["tipo_operacao"]})
+            insert into inconsistencias_pc (competencia_id, empresa_id, tipo, cfop, tipo_operacao, descricao, fonte)
+            values (:cid, :eid, 'cfop_sem_grupo', :cfop, :tipo,
+                    'CFOP ' || :cfop || ' (Relatório 1096) não está cadastrado em nenhum grupo da apuração '
+                    || '— não entra na conferência com o 1024 para este CFOP até ser cadastrado em CFOP × '
+                    || 'PIS/COFINS.', 'relatorio_1096')
+        """), {"cid": competencia_id, "eid": empresa_id, "cfop": r["cfop"], "tipo": r["tipo_operacao"]})
     session.commit()
 
 
-def importar(session, empresa_cnpj, ano, mes, arquivo_entrada=None, arquivo_saida=None, substituir=False):
-    """Fluxo completo: cria/acha a competência, checa duplicação, importa o(s) arquivo(s), sinaliza
-    inconsistências de CST/CFOP e marca status."""
+def importar_1096(session, empresa_id, competencia_id, arquivo_entrada=None, arquivo_saida=None, substituir=False):
+    """Importa o Relatório 1096 (Entrada e/ou Saída) de UMA filial para dentro da competência do grupo já
+    existente (ver get_or_create_competencia_grupo). Usado só para conferência com o 1024 e checagem de CST
+    — não alimenta mais a apuração diretamente."""
     if not arquivo_entrada and not arquivo_saida:
         raise ValueError("Informe pelo menos um arquivo (Entrada e/ou Saída).")
 
-    competencia_id = get_or_create_competencia(session, empresa_cnpj, ano, mes)
     tipos = []
     if arquivo_entrada:
         tipos.append("entrada")
     if arquivo_saida:
         tipos.append("saida")
-    removidos = checar_duplicacao(session, competencia_id, tipos, substituir)
+    removidos = checar_duplicacao(session, competencia_id, empresa_id, tipos, substituir)
 
     partes = []
     if removidos:
         partes.append(f"{removidos} itens antigos de {'/'.join(tipos)} removidos (substituição).")
     if arquivo_entrada:
-        n = importar_arquivo(session, arquivo_entrada, "entrada", competencia_id)
+        n = importar_arquivo(session, arquivo_entrada, "entrada", competencia_id, empresa_id)
         partes.append(f"Entrada: {n} itens importados.")
     if arquivo_saida:
-        n = importar_arquivo(session, arquivo_saida, "saida", competencia_id)
+        n = importar_arquivo(session, arquivo_saida, "saida", competencia_id, empresa_id)
         partes.append(f"Saída: {n} itens importados.")
 
-    _registrar_inconsistencias(session, competencia_id)
-
+    _registrar_inconsistencias_1096(session, competencia_id, empresa_id)
     session.execute(text("update competencias set status = 'importada' where id = :cid"), {"cid": competencia_id})
     session.commit()
-    partes.append(f"Competência {competencia_id} pronta para cálculo.")
     return " ".join(partes)

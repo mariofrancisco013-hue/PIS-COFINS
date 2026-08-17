@@ -139,18 +139,24 @@ def _dec(v):
 
 
 def _base_por_grupo(resumo_1024, tipo_operacao, grupo):
-    """Soma (valor_contabil - valor_icms) de todas as linhas do resumo_1024_pc (já somando todas as
-    filiais da competência) cujo CFOP pertence a este grupo, e devolve (base_total, detalhe_por_cfop)."""
-    base_total = Decimal("0")
+    """Soma valor_contábil (bruto) e valor_contábil - valor_icms (líquido) de todas as linhas do
+    resumo_1024_pc (já somando todas as filiais da competência) cujo CFOP pertence a este grupo. Devolve
+    (base_bruta, base_liquida, detalhe_por_cfop) — o líquido é o que efetivamente entra no PIS/COFINS
+    (base_liquida × alíquota); o bruto é só para exibir a "Receita" antes da exclusão do ICMS, pra ficar
+    visível na tela que a exclusão (linha 2.3/6.4) realmente sai da base bruta."""
+    base_bruta = Decimal("0")
+    base_liquida = Decimal("0")
     det = {}
     for r in resumo_1024:
         if r["tipo_operacao"] != tipo_operacao or r["grupo"] != grupo:
             continue
-        base_item = _dec(r["valor_contabil"]) - _dec(r["valor_icms"])
-        base_total += base_item
+        contabil = _dec(r["valor_contabil"])
+        icms = _dec(r["valor_icms"])
+        base_bruta += contabil
+        base_liquida += contabil - icms
         atual = det.get(r["cfop"], Decimal("0"))
-        det[r["cfop"]] = atual + base_item
-    return base_total, det
+        det[r["cfop"]] = atual + (contabil - icms)
+    return base_bruta, base_liquida, det
 
 
 def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
@@ -169,74 +175,73 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     # --- débito (saída) ---
     debito_pis_total = Decimal("0")
     debito_cofins_total = Decimal("0")
-    debito_base_total = Decimal("0")
-    icms_excluido_saida = Decimal("0")
+    debito_base_bruta_total = Decimal("0")   # soma de Valor Contábil (antes de excluir o ICMS)
+    debito_base_liquida_total = Decimal("0")  # = base bruta - ICMS destacado — é o que vira PIS/COFINS
     for grupo, descricao in GRUPOS_DEBITO.items():
-        base_total, det = _base_por_grupo(resumo_1024, "saida", grupo)
-        soma_pis = (base_total * ALIQ_PIS).quantize(Decimal("0.01"))
-        soma_cofins = (base_total * ALIQ_COFINS).quantize(Decimal("0.01"))
+        base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "saida", grupo)
+        soma_pis = (base_liquida * ALIQ_PIS).quantize(Decimal("0.01"))
+        soma_cofins = (base_liquida * ALIQ_COFINS).quantize(Decimal("0.01"))
         linhas.append(LinhaApuracaoPC(grupo, descricao, soma_pis, soma_cofins, detalhe={
-            "base_total": str(base_total),
+            "base_total": str(base_bruta),
+            "base_liquida": str(base_liquida),
             "base_por_cfop": {str(k): str(v) for k, v in det.items()},
         }))
         debito_pis_total += soma_pis
         debito_cofins_total += soma_cofins
-        debito_base_total += base_total
+        debito_base_bruta_total += base_bruta
+        debito_base_liquida_total += base_liquida
 
-    for grupo, descricao in GRUPOS_DEBITO.items():
-        icms_excluido_saida += sum(
-            (_dec(r["valor_icms"]) for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["grupo"] == grupo),
-            Decimal("0"),
-        )
+    icms_excluido_saida = debito_base_bruta_total - debito_base_liquida_total
 
     for linha, descricao in LINHAS_PENDENTES_DEBITO.items():
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
 
     linhas.append(LinhaApuracaoPC(
-        "2.3", "(-) ICMS Apuração - Destacado Saídas (informativo — já excluído dentro da base de 1.1 a 1.6)",
-        Decimal("0"), Decimal("0"), manual=False,
+        "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_saida),
-            "nota": "Este é o valor de ICMS destacado nas saídas (soma de todas as filiais, Rotina 1024). Já "
-                    "foi subtraído dentro da base de cada grupo de débito (1.1/1.2/1.4/1.6) — por isso o PIS "
-                    "e o COFINS aqui ficam R$ 0,00 e não são somados de novo no Total das Exclusões (2): "
-                    "somar aqui em cima do que já foi embutido excluiria o mesmo ICMS duas vezes.",
+            "nota": "Valor de ICMS destacado nas saídas (soma de todas as filiais, Rotina 1024) — é o que sai "
+                    "da Receita Bruta (linha 1.1 a 1.6) para chegar na Base de Cálculo líquida do PIS/COFINS.",
             "icms_destacado_saida_total": str(icms_excluido_saida),
         },
     ))
     linhas.append(LinhaApuracaoPC(
         "2", "Total das Exclusões (débito)", Decimal("0"), Decimal("0"), manual=True,
-        detalhe={"nota": "2.3 já embutida na base (ver acima); 2.4/2.6 seguem pendentes (fora do escopo do "
-                          "1024/1096), ver metodologia."},
+        detalhe={
+            "base_total": str(icms_excluido_saida),
+            "nota": "Por enquanto só soma a 2.3 (ICMS destacado) — 2.4/2.6 seguem pendentes (fora do escopo "
+                    "do 1024/1096 nesta versão), ver metodologia.",
+        },
     ))
     linhas.append(LinhaApuracaoPC("1", "Total das Receitas Tributáveis (débito)",
                                    debito_pis_total, debito_cofins_total,
-                                   detalhe={"base_total": str(debito_base_total)}))
+                                   detalhe={
+                                       "base_total": str(debito_base_bruta_total),
+                                       "base_liquida": str(debito_base_liquida_total),
+                                   }))
 
     # --- crédito (entrada) ---
     credito_pis_total = Decimal("0")
     credito_cofins_total = Decimal("0")
-    credito_base_total = Decimal("0")
-    icms_excluido_entrada = Decimal("0")
+    credito_base_bruta_total = Decimal("0")
+    credito_base_liquida_total = Decimal("0")
     for grupo, descricao in GRUPOS_CREDITO.items():
-        base_total, det = _base_por_grupo(resumo_1024, "entrada", grupo)
-        soma_pis = (base_total * ALIQ_PIS).quantize(Decimal("0.01"))
-        soma_cofins = (base_total * ALIQ_COFINS).quantize(Decimal("0.01"))
+        base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "entrada", grupo)
+        soma_pis = (base_liquida * ALIQ_PIS).quantize(Decimal("0.01"))
+        soma_cofins = (base_liquida * ALIQ_COFINS).quantize(Decimal("0.01"))
         linhas.append(LinhaApuracaoPC(grupo, descricao, soma_pis, soma_cofins, detalhe={
-            "base_total": str(base_total),
+            "base_total": str(base_bruta),
+            "base_liquida": str(base_liquida),
             "base_por_cfop": {str(k): str(v) for k, v in det.items()},
         }))
         credito_pis_total += soma_pis
         credito_cofins_total += soma_cofins
-        credito_base_total += base_total
+        credito_base_bruta_total += base_bruta
+        credito_base_liquida_total += base_liquida
 
-    for grupo, descricao in GRUPOS_CREDITO.items():
-        icms_excluido_entrada += sum(
-            (_dec(r["valor_icms"]) for r in resumo_1024 if r["tipo_operacao"] == "entrada" and r["grupo"] == grupo),
-            Decimal("0"),
-        )
+    icms_excluido_entrada = credito_base_bruta_total - credito_base_liquida_total
 
-    # lançamentos manuais (aluguéis, depreciação)
+    # lançamentos manuais (aluguéis, depreciação) — não têm ICMS pra excluir, bruto = líquido
     lancamentos = session.execute(text("""
         select tipo, descricao, base_valor, valor_pis, valor_cofins
         from lancamentos_manuais_pc where competencia_id = :cid
@@ -249,34 +254,40 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         base_lancamentos = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
         det = {
             "base_total": str(base_lancamentos),
+            "base_liquida": str(base_lancamentos),
             "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
         }
         linhas.append(LinhaApuracaoPC(linha, descricao, soma_pis, soma_cofins, detalhe=det))
         credito_pis_total += soma_pis
         credito_cofins_total += soma_cofins
-        credito_base_total += base_lancamentos
+        credito_base_bruta_total += base_lancamentos
+        credito_base_liquida_total += base_lancamentos
 
     for linha, descricao in LINHAS_PENDENTES_CREDITO.items():
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
 
     linhas.append(LinhaApuracaoPC(
-        "6.4", "(-) ICMS Apuração - Destacado Entradas (informativo — já excluído dentro da base de 5.1 a 5.8)",
-        Decimal("0"), Decimal("0"), manual=False,
+        "6.4", "(-) ICMS Apuração - Destacado Entradas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_entrada),
-            "nota": "Este é o valor de ICMS destacado nas entradas (soma de todas as filiais, Rotina 1024). Já "
-                    "foi subtraído dentro da base de cada grupo de crédito (5.1/5.2/5.5/5.7/5.8) — por isso o "
-                    "PIS e o COFINS aqui ficam R$ 0,00 e não são somados de novo no Total das Exclusões (6): "
-                    "somar aqui em cima do que já foi embutido excluiria o mesmo ICMS duas vezes.",
+            "nota": "Valor de ICMS destacado nas entradas (soma de todas as filiais, Rotina 1024) — é o que "
+                    "sai da base bruta de crédito (linha 5.1 a 5.8) para chegar na Base de Cálculo líquida.",
             "icms_destacado_entrada_total": str(icms_excluido_entrada),
         },
     ))
     linhas.append(LinhaApuracaoPC(
         "6", "Total das Exclusões (crédito)", Decimal("0"), Decimal("0"), manual=True,
-        detalhe={"nota": "6.4 já embutida na base (ver acima); 6.3/6.5/6.6 seguem pendentes, ver metodologia."},
+        detalhe={
+            "base_total": str(icms_excluido_entrada),
+            "nota": "Por enquanto só soma a 6.4 (ICMS destacado) — 6.3/6.5/6.6 seguem pendentes, ver "
+                    "metodologia.",
+        },
     ))
     linhas.append(LinhaApuracaoPC("5", "Total de Créditos", credito_pis_total, credito_cofins_total,
-                                   detalhe={"base_total": str(credito_base_total)}))
+                                   detalhe={
+                                       "base_total": str(credito_base_bruta_total),
+                                       "base_liquida": str(credito_base_liquida_total),
+                                   }))
 
     # --- saldo credor do período anterior (entrada manual — ver saldo_credor_anterior_pc) ---
     saldo_anterior = session.execute(text("""

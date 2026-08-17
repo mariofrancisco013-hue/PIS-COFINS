@@ -29,6 +29,10 @@ def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
     """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
     df = pd.DataFrame(rows, columns=["cfop", "grupo", "descricao", "n_filiais", "valor_contabil", "valor_icms"])
     if not df.empty:
+        # sum(numeric) no Postgres volta como decimal.Decimal (via psycopg2), não float — Decimal * float
+        # (ALIQ_PIS/ALIQ_COFINS) explode com TypeError dentro do pandas. Converte pra float antes de operar.
+        df["valor_contabil"] = pd.to_numeric(df["valor_contabil"], errors="coerce").fillna(0.0)
+        df["valor_icms"] = pd.to_numeric(df["valor_icms"], errors="coerce").fillna(0.0)
         df["base"] = df["valor_contabil"] - df["valor_icms"]
         df["valor_pis"] = (df["base"] * ALIQ_PIS).round(2)
         df["valor_cofins"] = (df["base"] * ALIQ_COFINS).round(2)

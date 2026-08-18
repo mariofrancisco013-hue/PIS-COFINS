@@ -137,6 +137,45 @@ def _card_inconsistencia(session, row, csts_disponiveis):
                 st.rerun()
 
 
+def _resumo_por_tipo(df):
+    """Consolida as inconsistências (já filtradas por Status/Tipo/Filial/Operação) numa linha por tipo —
+    grupos (quantas linhas de inconsistencias_pc), itens (soma de `quantidade`, 1 quando não agrupado) e
+    quantos ainda estão pendentes. Pedido do usuário em 18/08/2026: "consolidar os erros por tipo, já que
+    consigo filtrar na tela de entrada e saída" — como o filtro de Tipo já deixa ver só os cards de um tipo
+    específico, esta tabela serve pra dar a visão geral por tipo ANTES de decidir em qual tipo entrar (não
+    substitui os cards abaixo, só evita ter que abrir um por um pra saber onde estão concentrados os erros)."""
+    if df.empty:
+        return pd.DataFrame(columns=["tipo", "descricao", "grupos", "itens", "pendentes"])
+    tmp = df.copy()
+    tmp["quantidade"] = pd.to_numeric(tmp.get("quantidade"), errors="coerce").fillna(1)
+    resumo = tmp.groupby("tipo").agg(
+        grupos=("tipo", "size"),
+        itens=("quantidade", "sum"),
+        pendentes=("status", lambda s: (s == "pendente").sum()),
+    ).reset_index()
+    resumo["descricao"] = resumo["tipo"].map(planilha_pc.LABELS_INCONSISTENCIA).fillna(resumo["tipo"])
+    resumo["itens"] = resumo["itens"].astype(int)
+    return resumo[["tipo", "descricao", "grupos", "itens", "pendentes"]].sort_values(
+        ["pendentes", "itens"], ascending=False
+    ).reset_index(drop=True)
+
+
+def _mostrar_resumo_por_tipo(df, key_prefix):
+    resumo = _resumo_por_tipo(df)
+    if resumo.empty:
+        return
+    st.dataframe(
+        resumo, use_container_width=True, hide_index=True, key=f"{key_prefix}_resumo_tipo",
+        column_config={
+            "tipo": st.column_config.TextColumn("Tipo (código)"),
+            "descricao": st.column_config.TextColumn("O que é", width="large"),
+            "grupos": st.column_config.NumberColumn("Grupos (linhas)"),
+            "itens": st.column_config.NumberColumn("Itens do 1096"),
+            "pendentes": st.column_config.NumberColumn("Pendentes"),
+        },
+    )
+
+
 def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix):
     """Bloco de inconsistências + ajuste de CST, filtrado por operação (saida/entrada) — usado nas abas
     Entrada/Saída. Filtro igual ao da aba Inconsistências (Status/Tipo/Filial), já pré-filtrado pela
@@ -162,6 +201,8 @@ def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponi
         st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
         return
     st.caption(f"Mostrando {len(df_filtrado)} de {len(df_op)} inconsistência(s) desta operação.")
+    _mostrar_resumo_por_tipo(df_filtrado, key_prefix)
+    st.divider()
     for _, row in df_filtrado.iterrows():
         _card_inconsistencia(session, row, csts_disponiveis)
 
@@ -840,6 +881,8 @@ with aba_inconsist:
             st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
         else:
             st.caption(f"Mostrando {len(df_filtrado)} de {len(df_inc)} inconsistência(s).")
+            _mostrar_resumo_por_tipo(df_filtrado, "inc_geral")
+            st.divider()
             for _, row in df_filtrado.iterrows():
                 _card_inconsistencia(session, row, csts_disponiveis)
 

@@ -144,7 +144,7 @@ def _cache_historico_ajustes(_session, competencia_id):
     return [dict(r) for r in carregar_historico_ajustes(_session, competencia_id)]
 
 
-def _card_inconsistencia(session, row, csts_disponiveis):
+def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
     """Card de inconsistência — estrutura equivalente à do módulo ICMS normal (pedido do usuário em
     18/08/2026): título com selo de quantidade (grupo = mesmo erro repetido N vezes), badge 🔁 quando
     resolvido automaticamente por uma exceção aprendida, formulário de Revisar/Ignorar/Só salvar
@@ -153,7 +153,17 @@ def _card_inconsistencia(session, row, csts_disponiveis):
     PIS/COFINS — não existe equivalente no ICMS) para quem quiser registrar direto qual seria o CST certo.
     Este card é para revisão que precisa de JULGAMENTO (justificar, decidir se replica) — para uma correção
     rápida e óbvia de CFOP/NCM/valor errado, use a grade editável nas abas Entrada/Saída (mais rápido,
-    menos passos, mas sem justificativa nem "replicar")."""
+    menos passos, mas sem justificativa nem "replicar").
+
+    `key_prefix` (achado em produção em 18/08/2026, mais tarde: StreamlitDuplicateElementKey) — a mesma
+    inconsistência (mesmo `row['id']`) pode aparecer em mais de uma seção da tela ao mesmo tempo: na aba
+    Entrada OU Saída ("Inconsistências desta operação", filtro padrão inclui pendentes) E na aba
+    Inconsistências geral (filtro padrão também inclui pendentes) — e como o Streamlit roda o script inteiro
+    a cada interação (ver seção de cache no topo do arquivo), as duas seções renderizam no mesmo run. Sem um
+    prefixo diferente por seção, as duas cópias do card geravam a mesma `key` de widget (ex.: `rev_123` duas
+    vezes) e o Streamlit derrubava a página inteira com `StreamlitDuplicateElementKey`. Cada chamador passa
+    um prefixo próprio (`f"inc_{tipo_operacao}"` nas abas Entrada/Saída, `"inc_geral"` na aba
+    Inconsistências) para que os widgets do mesmo `row['id']` em seções diferentes tenham `key`s distintas."""
     tem_grupo = pd.notna(row.get("chave_agrupamento")) and row.get("chave_agrupamento")
     qtd = int(row["quantidade"]) if pd.notna(row.get("quantidade")) else 1
     selo = f"{qtd}× " if qtd > 1 else ""
@@ -194,15 +204,15 @@ def _card_inconsistencia(session, row, csts_disponiveis):
             )
 
         if tem_grupo:
-            with st.form(f"form_inc_{row['id']}"):
+            with st.form(f"{key_prefix}_form_inc_{row['id']}"):
                 justificativa = st.text_area(
                     "Justificativa (opcional, mas obrigatória se marcar 'replicar')",
-                    value=row.get("justificativa") or "", key=f"just_{row['id']}",
+                    value=row.get("justificativa") or "", key=f"{key_prefix}_just_{row['id']}",
                 )
                 replicar = st.checkbox(
                     "🔁 Aplicar automaticamente nas próximas apurações desta filial (não perguntar de novo "
                     "este mesmo caso)",
-                    key=f"replicar_{row['id']}",
+                    key=f"{key_prefix}_replicar_{row['id']}",
                     help="Cria uma regra: da próxima vez que este mesmo grupo (mesmo CFOP/NCM × CST) "
                          "aparecer numa importação futura do 1096 desta filial, a inconsistência já nasce "
                          "revisada com esta justificativa, sem pedir revisão de novo.",
@@ -227,7 +237,7 @@ def _card_inconsistencia(session, row, csts_disponiveis):
                         _cache_excecoes.clear()
                     st.rerun()
         elif row["status"] == "pendente":
-            if st.button("Marcar revisado", key=f"rev_{row['id']}"):
+            if st.button("Marcar revisado", key=f"{key_prefix}_rev_{row['id']}"):
                 resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
                 _cache_inconsistencias.clear()
                 st.rerun()
@@ -244,12 +254,12 @@ def _card_inconsistencia(session, row, csts_disponiveis):
                 "CST correto", opcoes_cst,
                 format_func=lambda cod: f"{cod} — "
                                          f"{next((c['descricao'] for c in csts_disponiveis if c['codigo'] == cod), '')}",
-                key=f"cst_novo_{row['id']}",
+                key=f"{key_prefix}_cst_novo_{row['id']}",
             )
             observacao_ajuste = st.text_input(
-                "Observação (opcional)", key=f"obs_ajuste_{row['id']}"
+                "Observação (opcional)", key=f"{key_prefix}_obs_ajuste_{row['id']}"
             )
-            if st.button("Registrar ajuste de CST", key=f"ajustar_{row['id']}"):
+            if st.button("Registrar ajuste de CST", key=f"{key_prefix}_ajustar_{row['id']}"):
                 registrar_ajuste_cst(
                     session, row["id"], cst_corrigido,
                     observacao_ajuste or None, usuario_atual(),
@@ -326,7 +336,7 @@ def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponi
     _mostrar_resumo_por_tipo(df_filtrado, key_prefix)
     st.divider()
     for _, row in df_filtrado.iterrows():
-        _card_inconsistencia(session, row, csts_disponiveis)
+        _card_inconsistencia(session, row, csts_disponiveis, key_prefix)
 
 
 def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc, csts_disponiveis):
@@ -1018,7 +1028,7 @@ with aba_inconsist:
             _mostrar_resumo_por_tipo(df_filtrado, "inc_geral")
             st.divider()
             for _, row in df_filtrado.iterrows():
-                _card_inconsistencia(session, row, csts_disponiveis)
+                _card_inconsistencia(session, row, csts_disponiveis, "inc_geral")
 
     st.divider()
     st.subheader("Histórico de ajustes manuais de CST")

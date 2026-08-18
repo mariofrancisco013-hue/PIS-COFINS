@@ -17,7 +17,10 @@ from lib.calculo_pis_cofins_lucro_real import (
     conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
     SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
-from lib.cst_regras_pc import registrar_ajuste_cst, carregar_historico_ajustes, TIPOS_REGRA
+from lib.cst_regras_pc import (
+    registrar_ajuste_cst, carregar_historico_ajustes, TIPOS_REGRA, registrar_revisao, carregar_excecoes,
+    definir_excecao_ativa,
+)
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual (log-only — ver
 # cst_regras_pc.registrar_ajuste_cst). cfop_sem_grupo não tem CST associado, então fica de fora.
@@ -25,55 +28,139 @@ TIPOS_COM_CST_AJUSTAVEL = {"cst_nao_mapeado", "cst_regra_cfop", "cst_regra_ncm",
 
 
 def _card_inconsistencia(session, row, csts_disponiveis):
-    """Um card de inconsistência com a ação 'Ajustar CST' (log-only) — usado tanto na aba Inconsistências
-    quanto nas abas Saída/Entrada (pedido do usuário em 18/08/2026: as informações do 1096 e os ajustes
-    precisam estar visíveis também nas abas de Saída/Entrada, não só numa aba separada, pra fechar o ciclo
-    'analisei aqui, ajusto aqui mesmo')."""
-    with st.container(border=True):
-        c1, c2 = st.columns([4, 1])
-        c1.markdown(f"**{row['descricao']}**")
+    """Card de inconsistência — estrutura equivalente à do módulo ICMS normal (pedido do usuário em
+    18/08/2026): título com selo de quantidade (grupo = mesmo erro repetido N vezes), badge 🔁 quando
+    resolvido automaticamente por uma exceção aprendida, formulário de Revisar/Ignorar/Só salvar
+    justificativa com opção "replicar nas próximas apurações" (grava em excecoes_inconsistencia_pc — ver
+    cst_regras_pc.registrar_revisao). Além disso, mantém a ação 'Ajustar CST' (log-only, específica do
+    PIS/COFINS — não existe equivalente no ICMS) para quem quiser registrar direto qual seria o CST certo."""
+    tem_grupo = pd.notna(row.get("chave_agrupamento")) and row.get("chave_agrupamento")
+    qtd = int(row["quantidade"]) if pd.notna(row.get("quantidade")) else 1
+    selo = f"{qtd}× " if qtd > 1 else ""
+    marca_auto = " 🔁" if row.get("aplicada_por_excecao") else ""
+    descricao_curta = row["descricao"] if len(row["descricao"]) <= 90 else row["descricao"][:90] + "..."
+    titulo = f"{selo}[{row['tipo']}] {descricao_curta}{marca_auto}"
+
+    with st.expander(titulo):
+        st.write(row["descricao"])
         legenda = (
-            f"Tipo: {row['tipo']} • Operação: {row['tipo_operacao'] or '-'} • "
-            f"Fonte: {row['fonte']} • Filial: {row['filial']} • Status: {row['status']}"
+            f"Operação: {row['tipo_operacao'] or '-'} • Fonte: {row['fonte']} • Filial: {row['filial']} • "
+            f"Status: {row['status']}"
         )
         if row["ncm"]:
             legenda += f" • NCM: {row['ncm']}"
-        c1.caption(legenda)
+        st.caption(legenda)
+        if qtd > 1:
+            st.caption(
+                f"Esse mesmo erro se repete em {qtd} itens do Relatório 1096 nesta filial/competência "
+                f"(agrupado numa linha só) — revisar/ignorar/justificar aqui vale para os {qtd} de uma vez."
+            )
+
+        if row.get("aplicada_por_excecao"):
+            st.info(
+                f"🔁 Aplicado automaticamente — bateu com uma exceção conhecida cadastrada numa competência "
+                f"anterior. Justificativa: {row['justificativa']}"
+            )
+        elif pd.notna(row.get("justificativa")) and row.get("justificativa"):
+            st.info(f"Justificativa: {row['justificativa']}")
+
         if row["status"] == "ajustado" and pd.notna(row["ultimo_ajuste_cst"]):
             obs = f" — {row['ultimo_ajuste_obs']}" if row["ultimo_ajuste_obs"] else ""
             cst_atual = int(row["cst"]) if pd.notna(row["cst"]) else "?"
-            c1.info(
-                f"Ajuste registrado: CST {cst_atual} → **{int(row['ultimo_ajuste_cst'])}** "
+            st.info(
+                f"Ajuste de CST registrado: CST {cst_atual} → **{int(row['ultimo_ajuste_cst'])}** "
                 f"em {row['ultimo_ajuste_em']:%d/%m/%Y %H:%M}{obs} "
                 f"(só histórico — não altera o cálculo nem o item importado)."
             )
-        if row["status"] == "pendente":
-            if c2.button("Marcar revisado", key=f"rev_{row['id']}"):
+
+        if tem_grupo:
+            with st.form(f"form_inc_{row['id']}"):
+                justificativa = st.text_area(
+                    "Justificativa (opcional, mas obrigatória se marcar 'replicar')",
+                    value=row.get("justificativa") or "", key=f"just_{row['id']}",
+                )
+                replicar = st.checkbox(
+                    "🔁 Aplicar automaticamente nas próximas apurações desta filial (não perguntar de novo "
+                    "este mesmo caso)",
+                    key=f"replicar_{row['id']}",
+                    help="Cria uma regra: da próxima vez que este mesmo grupo (mesmo CFOP/NCM × CST) "
+                         "aparecer numa importação futura do 1096 desta filial, a inconsistência já nasce "
+                         "revisada com esta justificativa, sem pedir revisão de novo.",
+                )
+                fc1, fc2, fc3 = st.columns(3)
+                revisar = fc1.form_submit_button("✅ Marcar como revisado")
+                ignorar = fc2.form_submit_button("🚫 Ignorar")
+                salvar_just = fc3.form_submit_button("💾 Só salvar justificativa")
+
+            if revisar or ignorar or salvar_just:
+                if replicar and not justificativa.strip():
+                    st.error("Para replicar nas próximas apurações, escreva a justificativa antes.")
+                else:
+                    novo_status = "revisado" if revisar else ("ignorado" if ignorar else None)
+                    registrar_revisao(
+                        session, row["id"], row["empresa_id"], row["tipo"], row["chave_agrupamento"],
+                        row["ncm"], row["cfop"], row["tipo_operacao"], novo_status, justificativa,
+                        replicar, usuario_atual(),
+                    )
+                    st.rerun()
+        elif row["status"] == "pendente":
+            if st.button("Marcar revisado", key=f"rev_{row['id']}"):
                 resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
                 st.rerun()
 
         if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
-            with st.expander("Ajustar CST (registrar correção para o Winthor)"):
-                st.caption(
-                    "Isso NÃO recalcula nada nem altera o item importado — fica só como "
-                    "histórico/checklist do que precisa ser corrigido na origem (Winthor)."
+            st.divider()
+            st.caption(
+                "Ou, se preferir, registre direto qual CST deveria ter sido usado — isso NÃO recalcula "
+                "nada nem altera o item importado, fica só como histórico/checklist do que precisa ser "
+                "corrigido na origem (Winthor):"
+            )
+            opcoes_cst = [c["codigo"] for c in csts_disponiveis]
+            cst_corrigido = st.selectbox(
+                "CST correto", opcoes_cst,
+                format_func=lambda cod: f"{cod} — "
+                                         f"{next((c['descricao'] for c in csts_disponiveis if c['codigo'] == cod), '')}",
+                key=f"cst_novo_{row['id']}",
+            )
+            observacao_ajuste = st.text_input(
+                "Observação (opcional)", key=f"obs_ajuste_{row['id']}"
+            )
+            if st.button("Registrar ajuste de CST", key=f"ajustar_{row['id']}"):
+                registrar_ajuste_cst(
+                    session, row["id"], cst_corrigido,
+                    observacao_ajuste or None, usuario_atual(),
                 )
-                opcoes_cst = [c["codigo"] for c in csts_disponiveis]
-                cst_corrigido = st.selectbox(
-                    "CST correto", opcoes_cst,
-                    format_func=lambda cod: f"{cod} — "
-                                             f"{next((c['descricao'] for c in csts_disponiveis if c['codigo'] == cod), '')}",
-                    key=f"cst_novo_{row['id']}",
-                )
-                observacao_ajuste = st.text_input(
-                    "Observação (opcional)", key=f"obs_ajuste_{row['id']}"
-                )
-                if st.button("Registrar ajuste", key=f"ajustar_{row['id']}"):
-                    registrar_ajuste_cst(
-                        session, row["id"], cst_corrigido,
-                        observacao_ajuste or None, usuario_atual(),
-                    )
-                    st.rerun()
+                st.rerun()
+
+
+def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix):
+    """Bloco de inconsistências + ajuste de CST, filtrado por operação (saida/entrada) — usado nas abas
+    Saída/Entrada. Pedido do usuário em 18/08/2026: filtro igual ao da aba Inconsistências (Status/Tipo/
+    Filial), só que já pré-filtrado pela operação da aba (não precisa repetir Operação aqui)."""
+    df_op = df_inc[df_inc["tipo_operacao"] == tipo_operacao]
+    if df_op.empty:
+        st.caption(f"Nenhuma inconsistência registrada para esta operação nesta competência.")
+        return
+
+    f1, f2, f3 = st.columns(3)
+    status_disp = sorted(df_op["status"].unique())
+    default_status = [s for s in status_disp if s != "ajustado"] or status_disp
+    f_status = f1.multiselect("Status", status_disp, default=default_status, key=f"{key_prefix}_f_status")
+    tipo_disp = sorted(df_op["tipo"].unique())
+    f_tipo = f2.multiselect("Tipo", tipo_disp, default=tipo_disp, key=f"{key_prefix}_f_tipo")
+    filial_disp = sorted(df_op["filial"].unique())
+    f_filial = f3.multiselect("Filial", filial_disp, default=filial_disp, key=f"{key_prefix}_f_filial")
+
+    df_filtrado = df_op[
+        df_op["status"].isin(f_status) & df_op["tipo"].isin(f_tipo) & df_op["filial"].isin(f_filial)
+    ]
+    if df_filtrado.empty:
+        st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
+        return
+    st.caption(f"Mostrando {len(df_filtrado)} de {len(df_op)} inconsistência(s) desta operação.")
+    for _, row in df_filtrado.iterrows():
+        _card_inconsistencia(session, row, csts_disponiveis)
+
 
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")
 require_login()
@@ -150,12 +237,7 @@ with aba_saida:
     # Pedido do usuário em 18/08/2026: os ajustes de CST identificados na análise do 1096 devem poder ser
     # registrados aqui mesmo, junto com o detalhe da Saída, não só numa aba separada de Inconsistências.
     st.subheader("Inconsistências desta operação (regras de CST do 1096 — Saída)")
-    df_inc_saida = df_inc[(df_inc["tipo_operacao"] == "saida") & (df_inc["status"] != "ajustado")]
-    if df_inc_saida.empty:
-        st.caption("Nenhuma inconsistência pendente de Saída para esta competência.")
-    else:
-        for _, row in df_inc_saida.iterrows():
-            _card_inconsistencia(session, row, csts_disponiveis)
+    _secao_inconsistencias_operacao(session, df_inc, "saida", csts_disponiveis, "inc_saida")
 
 # ---------------------------------------------------------------------------------------------- Entrada
 # A pedido do usuário em 18/08/2026: esta aba mostra só o Relatório 1096 (análise) — o resumo da Rotina 1024
@@ -184,12 +266,7 @@ with aba_entrada:
     # Pedido do usuário em 18/08/2026: os ajustes de CST identificados na análise do 1096 devem poder ser
     # registrados aqui mesmo, junto com o detalhe da Entrada, não só numa aba separada de Inconsistências.
     st.subheader("Inconsistências desta operação (regras de CST do 1096 — Entrada)")
-    df_inc_entrada = df_inc[(df_inc["tipo_operacao"] == "entrada") & (df_inc["status"] != "ajustado")]
-    if df_inc_entrada.empty:
-        st.caption("Nenhuma inconsistência pendente de Entrada para esta competência.")
-    else:
-        for _, row in df_inc_entrada.iterrows():
-            _card_inconsistencia(session, row, csts_disponiveis)
+    _secao_inconsistencias_operacao(session, df_inc, "entrada", csts_disponiveis, "inc_entrada")
 
 # ---------------------------------------------------------------------------------------------- Ajustes Manuais
 with aba_ajustes:
@@ -507,3 +584,34 @@ with aba_inconsist:
             file_name=f"ajustes_cst_pc_{competencia_id}.csv",
             mime="text/csv",
         )
+
+    st.divider()
+    # Estrutura igual ao módulo ICMS normal (pedido do usuário em 18/08/2026): lista de exceções
+    # "aprendidas" (marcadas com 'replicar' num card acima) — o analista pode desativar aqui se a situação
+    # mudar e quiser voltar a ser avisado sobre aquele mesmo caso.
+    with st.expander("🔁 Exceções conhecidas (regras aplicadas automaticamente nas próximas apurações)"):
+        st.caption(
+            "Quando você marca 'replicar nas próximas apurações' num card de inconsistência acima, a regra "
+            "entra aqui — escopada por filial. Desative se a situação mudar e você quiser voltar a ser "
+            "avisado sobre esse mesmo caso."
+        )
+        empresa_ids_grupo = sorted(df_inc["empresa_id"].dropna().unique().tolist()) if not df_inc.empty else []
+        excecoes = carregar_excecoes(session, empresa_ids_grupo)
+        if not excecoes:
+            st.caption("Nenhuma exceção cadastrada ainda para este grupo.")
+        # st.container (não st.expander) aqui dentro — expanders não podem ser aninhados no Streamlit, e
+        # este bloco já está dentro do expander "Exceções conhecidas" acima.
+        for exc in excecoes:
+            status_txt = "🟢 ativa" if exc["ativa"] else "⚪ desativada"
+            with st.container(border=True):
+                st.markdown(f"**[{exc['tipo']}] {exc['chave_agrupamento']}** — {exc['filial']} — {status_txt}")
+                st.write(exc["justificativa"])
+                st.caption(f"Criada por {exc['criado_por_email'] or '?'} em {exc['created_at']:%d/%m/%Y %H:%M}")
+                if exc["ativa"]:
+                    if st.button("Desativar (voltar a sinalizar este caso)", key=f"desativar_exc_{exc['id']}"):
+                        definir_excecao_ativa(session, exc["id"], False)
+                        st.rerun()
+                else:
+                    if st.button("Reativar", key=f"reativar_exc_{exc['id']}"):
+                        definir_excecao_ativa(session, exc["id"], True)
+                        st.rerun()

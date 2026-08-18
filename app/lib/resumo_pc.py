@@ -105,14 +105,18 @@ def carregar_itens(session, competencia_id, tipo_operacao, cfop_filtro=None, ncm
 def carregar_inconsistencias(session, competencia_id):
     # fonte/empresa_id existem desde a migração 002 (multifilial) — podem vir nulas em registros antigos,
     # criados antes dessas colunas existirem (por isso o coalesce pra não quebrar o filtro na tela). ncm
-    # existe desde a 004 (regras CST × CFOP/NCM). O left join com ajustes_cst_pc traz o último ajuste manual
-    # registrado (se houver) — só para exibição/histórico, não influencia cálculo nenhum (ver
-    # cst_regras_pc.registrar_ajuste_cst: é log-only).
+    # existe desde a 004 (regras CST × CFOP/NCM). chave_agrupamento/quantidade/justificativa/
+    # aplicada_por_excecao existem desde a 005 (agrupamento + aprendizado, estrutura igual ao módulo ICMS
+    # normal) — coalesce(quantidade, 1) pra registros antigos sem agrupamento. O left join com ajustes_cst_pc
+    # traz o último ajuste manual de CST registrado (se houver) — só para exibição/histórico, não influencia
+    # cálculo nenhum (ver cst_regras_pc.registrar_ajuste_cst: é log-only).
     rows = session.execute(text("""
         select i.id, i.tipo, i.cst, i.cfop, i.ncm, i.tipo_operacao, i.descricao, i.status, i.created_at,
                coalesce(i.fonte, '(não identificada)') as fonte,
                i.empresa_id,
                coalesce(e.filial_winthor, '(não identificada)') as filial,
+               i.chave_agrupamento, coalesce(i.quantidade, 1) as quantidade, i.justificativa,
+               coalesce(i.aplicada_por_excecao, false) as aplicada_por_excecao,
                aj.cst_corrigido as ultimo_ajuste_cst, aj.observacao as ultimo_ajuste_obs,
                aj.ajustado_em as ultimo_ajuste_em
         from inconsistencias_pc i
@@ -125,11 +129,13 @@ def carregar_inconsistencias(session, competencia_id):
             limit 1
         ) aj on true
         where i.competencia_id = :cid
-        order by (i.status = 'pendente') desc, i.tipo, i.cst, i.cfop
+        order by (i.status = 'pendente') desc, coalesce(i.quantidade, 1) desc, i.tipo, i.cst, i.cfop
     """), {"cid": competencia_id}).mappings().all()
     return pd.DataFrame(rows, columns=["id", "tipo", "cst", "cfop", "ncm", "tipo_operacao", "descricao",
                                         "status", "created_at", "fonte", "empresa_id", "filial",
-                                        "ultimo_ajuste_cst", "ultimo_ajuste_obs", "ultimo_ajuste_em"])
+                                        "chave_agrupamento", "quantidade", "justificativa",
+                                        "aplicada_por_excecao", "ultimo_ajuste_cst", "ultimo_ajuste_obs",
+                                        "ultimo_ajuste_em"])
 
 
 def marcar_inconsistencia(session, inconsistencia_id, status, usuario=None):

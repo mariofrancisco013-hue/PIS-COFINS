@@ -178,20 +178,45 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
         order by ri.cfop, ri.cst
     """), params).mappings().all()
 
+    # Duas situações bem diferentes, tratadas separadas — pedido do usuário em 18/08/2026 ("agrupar os NCMs
+    # por erro em um único alerta", aplicado aqui também por simetria/consistência, ver _checar_regra_ncm):
+    # 1) O CFOP TEM regra e o CST bateu errado: fica um grupo por CFOP (faz sentido — cada CFOP tem um CST
+    #    esperado diferente, agrupar CFOPs diferentes aqui misturaria coisas diferentes).
+    # 2) O CFOP NÃO tem regra, mas o CST em si É um dos regrados nessa direção — antes virava um card por
+    #    CFOP repetindo a mesma frase ("esse CST só é esperado em CFOPs específicos"); agora todos os CFOPs
+    #    com esse mesmo CST fora da lista entram num alerta só, por CST + operação (a lista de CFOPs
+    #    afetados fica na descrição). Ver planilha_pc.carregar_itens_editavel — o casamento da coluna
+    #    "⚠️ Inconsistência" da grade foi ajustado para aceitar `cfop is null` neste caso.
     for a in achados:
+        if a["cst_esperado"] is None:
+            continue
         chave = f'cfop:{a["cfop"]}|cst:{a["cst"]}|op:{a["tipo_operacao"]}'
-        if a["cst_esperado"] is not None:
-            descricao = (
-                f'CFOP {a["cfop"]} deveria estar com CST {a["cst_esperado"]} (regra CFOP × CST) mas veio '
-                f'com CST {a["cst"]} no Relatório 1096 — confira o cadastro do produto/operação no Winthor.'
-            )
-        else:
-            descricao = (
-                f'CST {a["cst"]} apareceu no CFOP {a["cfop"]} no Relatório 1096, mas esse CST só é esperado '
-                f'em CFOPs específicos (regra CFOP × CST) — confira se o CFOP está certo para esse item.'
-            )
+        descricao = (
+            f'CFOP {a["cfop"]} deveria estar com CST {a["cst_esperado"]} (regra CFOP × CST) mas veio '
+            f'com CST {a["cst"]} no Relatório 1096 — confira o cadastro do produto/operação no Winthor.'
+        )
         _inserir_grupo(session, competencia_id, empresa_id, "cst_regra_cfop", a["cst"], a["cfop"], None,
                        a["tipo_operacao"], descricao, chave, a["quantidade"], excecoes)
+
+    por_cst = {}
+    for a in achados:
+        if a["cst_esperado"] is not None:
+            continue
+        g = por_cst.setdefault((a["cst"], a["tipo_operacao"]), {"cfops": [], "quantidade": 0})
+        g["cfops"].append(a["cfop"])
+        g["quantidade"] += a["quantidade"]
+    for (cst, tipo_operacao), g in por_cst.items():
+        chave = f'cst:{cst}|op:{tipo_operacao}'
+        cfops_unicos = sorted(set(g["cfops"]))
+        n = len(cfops_unicos)
+        amostra = ", ".join(str(c) for c in cfops_unicos[:8]) + (f" e mais {n - 8}" if n > 8 else "")
+        descricao = (
+            f'CST {cst} apareceu no Relatório 1096 em {n} CFOP(s) diferente(s) ({amostra}), mas esse CST só '
+            f'é esperado em CFOPs específicos (regra CFOP × CST) — confira se o CFOP está certo para esses '
+            f'itens.'
+        )
+        _inserir_grupo(session, competencia_id, empresa_id, "cst_regra_cfop", cst, None, None,
+                       tipo_operacao, descricao, chave, g["quantidade"], excecoes)
 
 
 def _checar_regra_ncm(session, competencia_id, empresa_id):
@@ -218,22 +243,46 @@ def _checar_regra_ncm(session, competencia_id, empresa_id):
         order by ri.ncm, ri.cst
     """), params).mappings().all()
 
+    # Mesma distinção de duas situações explicada em _checar_regra_cfop (pedido do usuário em 18/08/2026,
+    # "agrupar os NCMs por erro em um único alerta" — este é exatamente o caso que motivou o pedido, com o
+    # screenshot mostrando um card por NCM repetindo a mesma frase para o mesmo CST 74 fora da lista):
+    # 1) O NCM TEM regra e o CST bateu errado: continua um grupo por NCM (cada NCM pode esperar um CST
+    #    diferente, agrupar NCMs diferentes aqui misturaria coisas diferentes).
+    # 2) O NCM NÃO tem regra, mas o CST em si É um dos regrados nessa direção: agora todos os NCMs com esse
+    #    mesmo CST fora da lista entram num alerta só, por CST + operação (lista de NCMs afetados na
+    #    descrição). Ver planilha_pc.carregar_itens_editavel — o casamento da coluna "⚠️ Inconsistência" da
+    #    grade foi ajustado para aceitar `ncm is null` neste caso.
     for a in achados:
+        if a["cst_esperado"] is None:
+            continue
         chave = f'ncm:{a["ncm"]}|cst:{a["cst"]}|op:{a["tipo_operacao"]}'
         cfops_nota = f' (CFOP {a["cfop_repr"]})' if a["n_cfops"] == 1 else f' ({a["n_cfops"]} CFOPs diferentes)'
-        if a["cst_esperado"] is not None:
-            descricao = (
-                f'NCM {a["ncm"]} deveria estar com CST {a["cst_esperado"]} (regra NCM × CST) mas veio com '
-                f'CST {a["cst"]} no Relatório 1096{cfops_nota} — confira o cadastro do produto no Winthor.'
-            )
-        else:
-            descricao = (
-                f'CST {a["cst"]} apareceu no NCM {a["ncm"]}{cfops_nota} no Relatório 1096, mas esse CST só '
-                f'é esperado em NCMs específicos (regra NCM × CST) — confira se o NCM está certo para esse '
-                f'item.'
-            )
+        descricao = (
+            f'NCM {a["ncm"]} deveria estar com CST {a["cst_esperado"]} (regra NCM × CST) mas veio com '
+            f'CST {a["cst"]} no Relatório 1096{cfops_nota} — confira o cadastro do produto no Winthor.'
+        )
         _inserir_grupo(session, competencia_id, empresa_id, "cst_regra_ncm", a["cst"], a["cfop_repr"],
                        a["ncm"], a["tipo_operacao"], descricao, chave, a["quantidade"], excecoes)
+
+    por_cst = {}
+    for a in achados:
+        if a["cst_esperado"] is not None:
+            continue
+        g = por_cst.setdefault((a["cst"], a["tipo_operacao"]), {"ncms": [], "quantidade": 0})
+        g["ncms"].append(a["ncm"])
+        g["quantidade"] += a["quantidade"]
+    for (cst, tipo_operacao), g in por_cst.items():
+        chave = f'cst:{cst}|op:{tipo_operacao}'
+        ncms_unicos = sorted(set(g["ncms"]))
+        n = len(ncms_unicos)
+        amostra = ", ".join(str(c) for c in ncms_unicos[:8]) + (f" e mais {n - 8}" if n > 8 else "")
+        descricao = (
+            f'CST {cst} apareceu no Relatório 1096 em {n} NCM(s) diferente(s) ({amostra}), mas esse CST só '
+            f'é esperado em NCMs específicos (regra NCM × CST) — confira se o NCM está certo para esses '
+            f'itens.'
+        )
+        _inserir_grupo(session, competencia_id, empresa_id, "cst_regra_ncm", cst, None, None,
+                       tipo_operacao, descricao, chave, g["quantidade"], excecoes)
 
 
 def _checar_alerta(session, competencia_id, empresa_id):

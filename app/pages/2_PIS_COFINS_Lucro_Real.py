@@ -27,6 +27,122 @@ from lib.cst_regras_pc import (
 # cst_regras_pc.registrar_ajuste_cst). cfop_sem_grupo não tem CST associado, então fica de fora.
 TIPOS_COM_CST_AJUSTAVEL = {"cst_nao_mapeado", "cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta"}
 
+# ================================================================================================
+# Cache de leitura (18/08/2026, mais tarde — pedido do usuário: "está muito lento, consegue ajustar o
+# código para dar mais agilidade").
+#
+# Causa raiz: st.tabs() não evita execução — o Streamlit roda o script inteiro de cima a baixo a cada
+# interação (clicar em QUALQUER filtro/botão/checkbox em QUALQUER aba), então toda consulta usada para
+# montar as 8 abas rodava de novo a cada clique, mesmo nas abas que a pessoa nem estava olhando: as duas
+# grades de Entrada E Saída (cada uma com uma consulta LEFT JOIN LATERAL de até 500 linhas), mais os 3
+# resumos de cada uma, mais as 3 grades de "Regras de CST", mais Conferência 1024×1096 — tudo de novo a
+# cada clique, em série (uma consulta de rede por vez).
+#
+# Sem tocar a lógica de negócio (as funções em lib/ continuam iguais, sem depender de Streamlit, testáveis
+# fora dele igual antes), as consultas somente-leitura mais pesadas/repetidas passam por st.cache_data
+# aqui na página. Duas coisas para quem for mexer aqui de novo:
+# 1) O primeiro parâmetro leva "_" (convenção do Streamlit para "não tenta gerar hash disto") porque uma
+#    Session do SQLAlchemy não é um objeto hasheável de forma estável.
+# 2) TTL é só uma rede de segurança (contra esquecer de limpar em algum canto) — a invalidação de verdade
+#    é explícita: toda ação que grava (salvar grade, salvar regra, revisar inconsistência, ajustar CST,
+#    marcar CFOP sem checagem, ativar/desativar exceção) chama .clear() na(s) função(ões) cacheada(s)
+#    certa(s) logo depois de gravar, antes do st.rerun(). Adicionar uma nova escrita nesta página sem
+#    também limpar o cache correspondente é o jeito mais fácil de reintroduzir dado desatualizado na tela.
+_TTL_ESTATICO = 300  # grupos/filiais/tabela de CST — não muda durante a sessão de trabalho
+_TTL_LEITURA = 30    # resumos/grades/listas de regra — invalidados explicitamente ao salvar; TTL é reforço
+
+
+@st.cache_data(ttl=_TTL_ESTATICO, show_spinner=False)
+def _cache_listar_grupos(_session):
+    return importacao_pc.listar_grupos(_session)
+
+
+@st.cache_data(ttl=_TTL_ESTATICO, show_spinner=False)
+def _cache_listar_filiais_grupo(_session, cnpj_raiz):
+    return importacao_pc.listar_filiais_grupo(_session, cnpj_raiz)
+
+
+@st.cache_data(ttl=_TTL_ESTATICO, show_spinner=False)
+def _cache_csts_disponiveis(_session):
+    rows = _session.execute(text("select codigo, descricao from cst_pis_cofins order by codigo")).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_inconsistencias(_session, competencia_id):
+    return resumo_pc.carregar_inconsistencias(_session, competencia_id)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_resumo_1024_por_cfop(_session, competencia_id, tipo_operacao):
+    return resumo_pc.resumo_1024_por_cfop(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_resumo_por_cfop(_session, competencia_id, tipo_operacao):
+    return resumo_pc.resumo_por_cfop(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_resumo_por_cst(_session, competencia_id, tipo_operacao):
+    return resumo_pc.resumo_por_cst(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_itens_editavel(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
+                           busca, tipos_inc, limite):
+    return planilha_pc.carregar_itens_editavel(
+        _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro, busca, tipos_inc,
+        limite,
+    )
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_totalizador(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro):
+    return planilha_pc.carregar_totalizador(
+        _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
+    )
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_historico_edicoes(_session, competencia_id, tipo_operacao):
+    return planilha_pc.carregar_historico_edicoes(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_regras_cfop(_session):
+    return [dict(r) for r in listar_regras_cfop(_session)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_regras_ncm(_session):
+    return [dict(r) for r in listar_regras_ncm(_session)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_regras_alerta(_session):
+    return [dict(r) for r in listar_regras_alerta(_session)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_cfops_sem_checagem(_session, empresa_id):
+    return [dict(r) for r in listar_cfops_sem_checagem(_session, empresa_id)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_conferencia(_session, competencia_id):
+    return conferencia_1024_x_1096(_session, competencia_id)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_excecoes(_session, empresa_ids):
+    return [dict(r) for r in carregar_excecoes(_session, empresa_ids)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_historico_ajustes(_session, competencia_id):
+    return [dict(r) for r in carregar_historico_ajustes(_session, competencia_id)]
+
 
 def _card_inconsistencia(session, row, csts_disponiveis):
     """Card de inconsistência — estrutura equivalente à do módulo ICMS normal (pedido do usuário em
@@ -106,10 +222,14 @@ def _card_inconsistencia(session, row, csts_disponiveis):
                         row["ncm"], row["cfop"], row["tipo_operacao"], novo_status, justificativa,
                         replicar, usuario_atual(),
                     )
+                    _cache_inconsistencias.clear()
+                    if replicar:
+                        _cache_excecoes.clear()
                     st.rerun()
         elif row["status"] == "pendente":
             if st.button("Marcar revisado", key=f"rev_{row['id']}"):
                 resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
+                _cache_inconsistencias.clear()
                 st.rerun()
 
         if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
@@ -134,6 +254,8 @@ def _card_inconsistencia(session, row, csts_disponiveis):
                     session, row["id"], cst_corrigido,
                     observacao_ajuste or None, usuario_atual(),
                 )
+                _cache_inconsistencias.clear()
+                _cache_historico_ajustes.clear()
                 st.rerun()
 
 
@@ -239,7 +361,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     # O dropdown de filtro é sobre os CFOPs que aparecem no PRÓPRIO Relatório 1096 (o que a grade abaixo
     # mostra) — não sobre os CFOPs da Rotina 1024 (que é o "Resumo por CFOP — Rotina 1024" exibido mais
     # abaixo, uma fonte diferente, com um conjunto de CFOPs que pode não ser idêntico).
-    resumo_1096_cfop = resumo_pc.resumo_por_cfop(session, competencia_id, tipo_operacao)
+    resumo_1096_cfop = _cache_resumo_por_cfop(session, competencia_id, tipo_operacao)
     cfops_disponiveis = (["(todos)"] + sorted(resumo_1096_cfop["cfop"].tolist())) if not resumo_1096_cfop.empty else ["(todos)"]
     cfop_sel = c1.selectbox("Filtrar por CFOP", cfops_disponiveis, key=f"cfop_{tipo_operacao}")
     cfop_filtro = None if cfop_sel == "(todos)" else int(cfop_sel)
@@ -251,8 +373,8 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     if sintetica:
         limite = c3.number_input("Máx. linhas na tela", min_value=50, max_value=5000, value=500, step=50,
                                   key=f"limite_{tipo_operacao}")
-        tot = planilha_pc.carregar_totalizador(session, competencia_id, tipo_operacao, empresa_ids,
-                                                cfop_filtro, ncm_filtro or None)
+        tot = _cache_totalizador(session, competencia_id, tipo_operacao, empresa_ids,
+                                  cfop_filtro, ncm_filtro or None)
         st.caption(f"{len(tot)} combinação(ões) de Filial + Produto + CST"
                    f"{' para este CFOP/NCM' if (cfop_filtro or ncm_filtro) else ''}.")
         st.dataframe(
@@ -283,7 +405,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                  "com aquele erro específico pendente.",
         )
 
-        df, total = planilha_pc.carregar_itens_editavel(
+        df, total = _cache_itens_editavel(
             session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro or None,
             busca or None, tipos_inc_sel or None, limite,
         )
@@ -338,6 +460,16 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
             if n:
                 with st.spinner("Recalculando inconsistências..."):
                     planilha_pc.recalcular_inconsistencias_apos_edicao(session, competencia_id, empresas_afetadas)
+                # Edição na grade muda relatorio_pc_itens (cfop/ncm/valores) e as inconsistências CST ×
+                # CFOP/NCM daquelas filiais — limpa todo cache derivado desses dados antes do rerun, senão
+                # a tela mostraria valor antigo até o TTL expirar (ver bloco de cache no topo do arquivo).
+                _cache_itens_editavel.clear()
+                _cache_totalizador.clear()
+                _cache_resumo_por_cfop.clear()
+                _cache_resumo_por_cst.clear()
+                _cache_historico_edicoes.clear()
+                _cache_inconsistencias.clear()
+                _cache_conferencia.clear()
                 st.success(
                     f"{n} linha(s) atualizada(s), {len(empresas_afetadas)} filial(is) recalculada(s) — o "
                     f"que foi corrigido já some da coluna ⚠️ Inconsistência aqui na grade e da aba "
@@ -348,7 +480,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
             st.rerun()
 
     with st.expander("📝 Histórico de edições desta grade (mais recentes primeiro)"):
-        hist = planilha_pc.carregar_historico_edicoes(session, competencia_id, tipo_operacao)
+        hist = _cache_historico_edicoes(session, competencia_id, tipo_operacao)
         if hist.empty:
             st.caption("Nenhuma edição registrada ainda nesta grade, para esta competência.")
         else:
@@ -372,11 +504,11 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     c_res1, c_res2 = st.columns(2)
     with c_res1:
         st.subheader("Resumo por CFOP — Rotina 1024 (usado na Apuração)")
-        resumo_1024_cfop = resumo_pc.resumo_1024_por_cfop(session, competencia_id, tipo_operacao)
+        resumo_1024_cfop = _cache_resumo_1024_por_cfop(session, competencia_id, tipo_operacao)
         st.dataframe(resumo_1024_cfop, use_container_width=True, hide_index=True)
     with c_res2:
         st.subheader("Resumo por CST — Relatório 1096")
-        st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, tipo_operacao), use_container_width=True,
+        st.dataframe(_cache_resumo_por_cst(session, competencia_id, tipo_operacao), use_container_width=True,
                      hide_index=True)
 
     st.markdown("---")
@@ -406,7 +538,7 @@ def _aba_regras_cst(session):
 
     with sub_cfop:
         st.caption("CST esperado quando este CFOP aparecer no Relatório 1096, nesta direção (entrada/saída).")
-        df_cfop = pd.DataFrame(listar_regras_cfop(session))
+        df_cfop = pd.DataFrame(_cache_regras_cfop(session))
         if df_cfop.empty:
             df_cfop = pd.DataFrame(columns=["id", "cst", "cfop", "tipo_operacao", "observacao", "created_at"])
         df_cfop_editado = st.data_editor(
@@ -424,13 +556,14 @@ def _aba_regras_cst(session):
         )
         if st.button("💾 Salvar regras por CFOP"):
             resultado = salvar_regras_cfop(session, df_cfop, df_cfop_editado)
+            _cache_regras_cfop.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s).")
             st.rerun()
 
     with sub_ncm:
         st.caption("CST esperado quando este NCM aparecer no Relatório 1096, nesta direção (entrada/saída).")
-        df_ncm = pd.DataFrame(listar_regras_ncm(session))
+        df_ncm = pd.DataFrame(_cache_regras_ncm(session))
         if df_ncm.empty:
             df_ncm = pd.DataFrame(columns=["id", "cst", "ncm", "tipo_operacao", "observacao", "created_at"])
         df_ncm_editado = st.data_editor(
@@ -448,6 +581,7 @@ def _aba_regras_cst(session):
         )
         if st.button("💾 Salvar regras por NCM"):
             resultado = salvar_regras_ncm(session, df_ncm, df_ncm_editado)
+            _cache_regras_ncm.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s).")
             st.rerun()
@@ -457,7 +591,7 @@ def _aba_regras_cst(session):
             "CST que deve sempre gerar um alerta informativo ao aparecer no Relatório 1096 (nesta direção), "
             "mas nunca bloqueia nada — sem CFOP/NCM associado, é qualquer ocorrência do CST."
         )
-        df_alerta = pd.DataFrame(listar_regras_alerta(session))
+        df_alerta = pd.DataFrame(_cache_regras_alerta(session))
         if df_alerta.empty:
             df_alerta = pd.DataFrame(columns=["id", "cst", "tipo_operacao", "observacao", "created_at"])
         df_alerta_editado = st.data_editor(
@@ -474,6 +608,7 @@ def _aba_regras_cst(session):
         )
         if st.button("💾 Salvar regras sempre-alerta"):
             resultado = salvar_regras_alerta(session, df_alerta, df_alerta_editado)
+            _cache_regras_alerta.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s).")
             st.rerun()
@@ -497,7 +632,7 @@ def _aba_cfops_sem_checagem(session, filiais_grupo):
     filial_sel = st.selectbox("Filial", filiais_grupo, format_func=rotulo_empresa, key="cfop_sv_filial")
     empresa_id = filial_sel["id"]
 
-    df_sv = pd.DataFrame(listar_cfops_sem_checagem(session, empresa_id))
+    df_sv = pd.DataFrame(_cache_cfops_sem_checagem(session, empresa_id))
     if df_sv.empty:
         df_sv = pd.DataFrame(columns=["id", "cfop", "descricao", "motivo", "criado_por_email", "created_at"])
     st.caption(f"{len(df_sv)} CFOP(s) marcado(s) como sem checagem para esta filial.")
@@ -518,6 +653,7 @@ def _aba_cfops_sem_checagem(session, filiais_grupo):
                "clique em Salvar.")
     if st.button("💾 Salvar CFOPs sem checagem", key=f"salvar_cfop_sv_{empresa_id}"):
         resultado = salvar_cfops_sem_checagem(session, empresa_id, df_sv, df_sv_editado, usuario_atual())
+        _cache_cfops_sem_checagem.clear()
         st.success(f"{resultado['incluidos']} incluído(s), {resultado['removidos']} removido(s). Salve "
                    f"qualquer edição na grade Entrada/Saída desta filial para as checagens refletirem a "
                    f"mudança.")
@@ -530,7 +666,7 @@ logout_button()
 st.title("PIS/COFINS — Lucro Real")
 
 session = get_session()
-grupos = importacao_pc.listar_grupos(session)
+grupos = _cache_listar_grupos(session)
 if not grupos:
     st.warning("Nenhuma empresa em regime Lucro Real cadastrada ainda.")
     st.stop()
@@ -552,16 +688,14 @@ comp_row = session.execute(text("select status from competencias where id = :id"
 status = status_competencia(session, competencia_id, comp_row["status"])
 getattr(st, status["nivel"])(status["texto"])
 
-filiais_grupo = importacao_pc.listar_filiais_grupo(session, grupo["cnpj_raiz"])
+filiais_grupo = _cache_listar_filiais_grupo(session, grupo["cnpj_raiz"])
 empresa_ids_grupo = [f["id"] for f in filiais_grupo]
 
 # Carregados uma vez, usados na aba Inconsistências e também nas abas Entrada/Saída (os ajustes de CST feitos
 # após a análise do 1096 podem ser registrados direto nas abas de Entrada/Saída, junto com o detalhe do 1096,
 # não só numa aba separada).
-df_inc = resumo_pc.carregar_inconsistencias(session, competencia_id)
-csts_disponiveis = session.execute(
-    text("select codigo, descricao from cst_pis_cofins order by codigo")
-).mappings().all()
+df_inc = _cache_inconsistencias(session, competencia_id)
+csts_disponiveis = _cache_csts_disponiveis(session)
 
 # Ordem das abas revista em 18/08/2026 (à noite), a pedido do usuário — "quero mais ou menos essa estrutura"
 # mostrando a tela do módulo ICMS Normal inteira (grade editável tipo planilha, abas de cadastro de regra,
@@ -803,7 +937,7 @@ with aba_conferencia:
         "calculado. Diferenças acima de R$ 1,00 aparecem como 'Divergente'; CFOPs que só aparecem em uma "
         "das duas fontes também são sinalizados."
     )
-    linhas_conf = conferencia_1024_x_1096(session, competencia_id)
+    linhas_conf = _cache_conferencia(session, competencia_id)
     if not linhas_conf:
         st.info("Nenhum dado de Rotina 1024 nem de Relatório 1096 importado ainda para este grupo/período.")
     else:
@@ -892,7 +1026,7 @@ with aba_inconsist:
         "Lista de correções registradas nesta tela — use como checklist para corrigir de fato no Winthor. "
         "Registrar aqui não muda nenhum valor calculado."
     )
-    historico = carregar_historico_ajustes(session, competencia_id)
+    historico = _cache_historico_ajustes(session, competencia_id)
     if not historico:
         st.caption("Nenhum ajuste registrado ainda nesta competência.")
     else:
@@ -918,7 +1052,7 @@ with aba_inconsist:
             "entra aqui — escopada por filial. Desative se a situação mudar e você quiser voltar a ser "
             "avisado sobre esse mesmo caso."
         )
-        excecoes = carregar_excecoes(session, empresa_ids_grupo)
+        excecoes = _cache_excecoes(session, empresa_ids_grupo)
         if not excecoes:
             st.caption("Nenhuma exceção cadastrada ainda para este grupo.")
         # st.container (não st.expander) aqui dentro — expanders não podem ser aninhados no Streamlit, e
@@ -932,8 +1066,10 @@ with aba_inconsist:
                 if exc["ativa"]:
                     if st.button("Desativar (voltar a sinalizar este caso)", key=f"desativar_exc_{exc['id']}"):
                         definir_excecao_ativa(session, exc["id"], False)
+                        _cache_excecoes.clear()
                         st.rerun()
                 else:
                     if st.button("Reativar", key=f"reativar_exc_{exc['id']}"):
                         definir_excecao_ativa(session, exc["id"], True)
+                        _cache_excecoes.clear()
                         st.rerun()

@@ -105,8 +105,12 @@ def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids,
             where i2.competencia_id = ri.competencia_id and i2.empresa_id = ri.empresa_id
               and i2.status = 'pendente' and i2.fonte = 'relatorio_1096' and i2.tipo in ({tipos_sql})
               and (
-                  (i2.tipo = 'cst_regra_cfop' and i2.cfop = ri.cfop and i2.cst = ri.cst)
-                  or (i2.tipo = 'cst_regra_ncm' and i2.ncm = ri.ncm and i2.cst = ri.cst)
+                  -- cfop/ncm is null = alerta consolidado por CST (achado "esse CST está fora da lista de
+                  -- regras" — ver cst_regras_pc._checar_regra_cfop/_checar_regra_ncm, 18/08/2026: "agrupar
+                  -- os NCMs/CFOPs por erro em um único alerta"); casa com QUALQUER item deste CST/operação,
+                  -- não só um CFOP/NCM específico, por isso o "or i2.cfop is null" / "or i2.ncm is null".
+                  (i2.tipo = 'cst_regra_cfop' and i2.cst = ri.cst and (i2.cfop = ri.cfop or i2.cfop is null))
+                  or (i2.tipo = 'cst_regra_ncm' and i2.cst = ri.cst and (i2.ncm = ri.ncm or i2.ncm is null))
                   or (i2.tipo = 'cst_regra_alerta' and i2.cst = ri.cst)
                   or (i2.tipo = 'cst_nao_mapeado' and i2.cst = ri.cst)
                   or (i2.tipo = 'cfop_sem_grupo' and i2.cfop = ri.cfop)
@@ -131,8 +135,10 @@ def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids,
             where i.competencia_id = ri.competencia_id and i.empresa_id = ri.empresa_id
               and i.status = 'pendente' and i.fonte = 'relatorio_1096'
               and (
-                  (i.tipo = 'cst_regra_cfop' and i.cfop = ri.cfop and i.cst = ri.cst)
-                  or (i.tipo = 'cst_regra_ncm' and i.ncm = ri.ncm and i.cst = ri.cst)
+                  -- mesmo ajuste do bloco de tipos_inconsistencia acima: alerta consolidado (cfop/ncm null)
+                  -- casa com qualquer item deste CST/operação.
+                  (i.tipo = 'cst_regra_cfop' and i.cst = ri.cst and (i.cfop = ri.cfop or i.cfop is null))
+                  or (i.tipo = 'cst_regra_ncm' and i.cst = ri.cst and (i.ncm = ri.ncm or i.ncm is null))
                   or (i.tipo = 'cst_regra_alerta' and i.cst = ri.cst)
                   or (i.tipo = 'cst_nao_mapeado' and i.cst = ri.cst)
                   or (i.tipo = 'cfop_sem_grupo' and i.cfop = ri.cfop)

@@ -17,7 +17,7 @@ from lib.calculo_pis_cofins_lucro_real import (
     conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
     SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
-from lib.cst_regras_pc import registrar_ajuste_cst, carregar_historico_ajustes
+from lib.cst_regras_pc import registrar_ajuste_cst, carregar_historico_ajustes, TIPOS_REGRA
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual (log-only — ver
 # cst_regras_pc.registrar_ajuste_cst). cfop_sem_grupo não tem CST associado, então fica de fora.
@@ -51,15 +51,15 @@ comp_row = session.execute(text("select status from competencias where id = :id"
 status = status_competencia(session, competencia_id, comp_row["status"])
 getattr(st, status["nivel"])(status["texto"])
 
-# Ordem das abas a pedido do usuário em 18/08/2026: a primeira coisa que a tela mostra é a análise do
-# Relatório 1096 (Conferência 1024×1096 + Inconsistências) — só depois vêm as telas de Saída/Entrada
-# (resumo por CFOP da Rotina 1024, já usado na apuração) e por último a Apuração em si. A ideia é revisar/
-# resolver o que aparecer na conferência e nas inconsistências do 1096 antes de olhar os números que vão
-# para o cálculo. Isso é só ordem de exibição das abas — não trava o cálculo, que continua disponível a
-# qualquer momento independente do que esteja pendente no 1096 (ver metodologia: 1096 é conferência, não
-# bloqueia).
-aba_conferencia, aba_inconsist, aba_saida, aba_entrada, aba_ajustes, aba_apuracao = st.tabs(
-    ["Conferência 1024×1096", "Inconsistências", "Saída (Débito)", "Entrada (Crédito)",
+# Ordem das abas a pedido do usuário em 18/08/2026, refinada no mesmo dia: a primeira análise é só com base
+# nas regras de CST × CFOP/NCM criadas para o Relatório 1096 (entrada e saída — aba Inconsistências, ver
+# TIPOS_COM_CST_AJUSTAVEL/filtro de Tipo abaixo), DEPOIS vem a comparação com a Rotina 1024 (Conferência
+# 1024×1096), só depois as telas de Saída/Entrada (resumo por CFOP da Rotina 1024, já usado na apuração) e
+# por último a Apuração em si. Isso é só ordem de exibição das abas — não trava o cálculo, que continua
+# disponível a qualquer momento independente do que esteja pendente no 1096 (ver metodologia: 1096 é
+# conferência, não bloqueia).
+aba_inconsist, aba_conferencia, aba_saida, aba_entrada, aba_ajustes, aba_apuracao = st.tabs(
+    ["Inconsistências", "Conferência 1024×1096", "Saída (Débito)", "Entrada (Crédito)",
      "Ajustes Manuais", "Apuração"]
 )
 
@@ -387,7 +387,16 @@ with aba_inconsist:
         f_status = fi1.multiselect("Status", status_disp, default=["pendente"] if "pendente" in status_disp
                                     else status_disp, key="inc_f_status")
         tipo_disp = sorted(df_inc["tipo"].unique())
-        f_tipo = fi2.multiselect("Tipo", tipo_disp, default=tipo_disp, key="inc_f_tipo")
+        # Pedido do usuário em 18/08/2026: a primeira análise é só com base nas regras de CST × CFOP/NCM
+        # criadas para o 1096 (entrada e saída) — por isso o filtro de Tipo já abre marcado só nesses 3
+        # tipos (cst_regra_cfop/cst_regra_ncm/cst_regra_alerta), se existir algum. cst_nao_mapeado/
+        # cfop_sem_grupo continuam disponíveis pra marcar manualmente, só não vêm pré-selecionados aqui.
+        tipos_regra_presentes = [t for t in tipo_disp if t in TIPOS_REGRA]
+        default_tipo = tipos_regra_presentes if tipos_regra_presentes else tipo_disp
+        f_tipo = fi2.multiselect("Tipo", tipo_disp, default=default_tipo, key="inc_f_tipo",
+                                  help="Por padrão mostra só as regras de CST × CFOP/NCM criadas para o "
+                                       "1096 (entrada/saída) — marque os outros tipos se quiser ver "
+                                       "cst_nao_mapeado/cfop_sem_grupo também.")
         operacao_disp = sorted(v for v in df_inc["tipo_operacao"].unique() if v)
         f_operacao = fi3.multiselect("Operação", operacao_disp, default=operacao_disp, key="inc_f_operacao")
         fonte_disp = sorted(df_inc["fonte"].unique())

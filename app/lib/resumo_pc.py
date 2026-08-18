@@ -14,12 +14,14 @@ ALIQ_COFINS = 0.0760
 
 def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
     """Resumo por CFOP a partir da Rotina 1024 (fonte primária da apuração) — soma todas as filiais da
-    competência (grupo). base = valor_contabil - valor_icms; pis/cofins = base × alíquota, só para leitura
-    (o cálculo oficial da apuração está em calculo_pis_cofins_lucro_real.calcular_apuracao_pc)."""
+    competência (grupo). base = valor_contabil - valor_icms - valor_isentas_nao_tributadas; pis/cofins =
+    base × alíquota, só para leitura (o cálculo oficial da apuração está em
+    calculo_pis_cofins_lucro_real.calcular_apuracao_pc — mesma fórmula, mantidas em sincronia)."""
     rows = session.execute(text("""
         select r.cfop, coalesce(cpe.grupo, '(sem grupo)') as grupo, cp.descricao,
                count(distinct r.empresa_id) as n_filiais,
-               sum(r.valor_contabil) as valor_contabil, sum(r.valor_icms) as valor_icms
+               sum(r.valor_contabil) as valor_contabil, sum(r.valor_icms) as valor_icms,
+               sum(r.valor_isentas_nao_tributadas) as valor_isentas_nao_tributadas
         from resumo_1024_pc r
         left join cfop_pis_cofins_efetivo cpe on cpe.codigo = r.cfop
         left join cfop_pis_cofins cp on cp.codigo = r.cfop
@@ -27,13 +29,16 @@ def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
         group by r.cfop, cpe.grupo, cp.descricao
         order by r.cfop
     """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
-    df = pd.DataFrame(rows, columns=["cfop", "grupo", "descricao", "n_filiais", "valor_contabil", "valor_icms"])
+    df = pd.DataFrame(rows, columns=["cfop", "grupo", "descricao", "n_filiais", "valor_contabil", "valor_icms",
+                                      "valor_isentas_nao_tributadas"])
     if not df.empty:
         # sum(numeric) no Postgres volta como decimal.Decimal (via psycopg2), não float — Decimal * float
         # (ALIQ_PIS/ALIQ_COFINS) explode com TypeError dentro do pandas. Converte pra float antes de operar.
         df["valor_contabil"] = pd.to_numeric(df["valor_contabil"], errors="coerce").fillna(0.0)
         df["valor_icms"] = pd.to_numeric(df["valor_icms"], errors="coerce").fillna(0.0)
-        df["base"] = df["valor_contabil"] - df["valor_icms"]
+        df["valor_isentas_nao_tributadas"] = pd.to_numeric(
+            df["valor_isentas_nao_tributadas"], errors="coerce").fillna(0.0)
+        df["base"] = df["valor_contabil"] - df["valor_icms"] - df["valor_isentas_nao_tributadas"]
         df["valor_pis"] = (df["base"] * ALIQ_PIS).round(2)
         df["valor_cofins"] = (df["base"] * ALIQ_COFINS).round(2)
     return df
@@ -102,19 +107,32 @@ def carregar_itens(session, competencia_id, tipo_operacao, cfop_filtro=None, ncm
 
 def carregar_inconsistencias(session, competencia_id):
     # fonte/empresa_id existem desde a migração 002 (multifilial) — podem vir nulas em registros antigos,
-    # criados antes dessas colunas existirem (por isso o coalesce pra não quebrar o filtro na tela).
+    # criados antes dessas colunas existirem (por isso o coalesce pra não quebrar o filtro na tela). ncm
+    # existe desde a 004 (regras CST × CFOP/NCM). O left join com ajustes_cst_pc traz o último ajuste manual
+    # registrado (se houver) — só para exibição/histórico, não influencia cálculo nenhum (ver
+    # cst_regras_pc.registrar_ajuste_cst: é log-only).
     rows = session.execute(text("""
-        select i.id, i.tipo, i.cst, i.cfop, i.tipo_operacao, i.descricao, i.status, i.created_at,
+        select i.id, i.tipo, i.cst, i.cfop, i.ncm, i.tipo_operacao, i.descricao, i.status, i.created_at,
                coalesce(i.fonte, '(não identificada)') as fonte,
                i.empresa_id,
-               coalesce(e.filial_winthor, '(não identificada)') as filial
+               coalesce(e.filial_winthor, '(não identificada)') as filial,
+               aj.cst_corrigido as ultimo_ajuste_cst, aj.observacao as ultimo_ajuste_obs,
+               aj.ajustado_em as ultimo_ajuste_em
         from inconsistencias_pc i
         left join empresas e on e.id = i.empresa_id
+        left join lateral (
+            select a.cst_corrigido, a.observacao, a.ajustado_em
+            from ajustes_cst_pc a
+            where a.inconsistencia_id = i.id
+            order by a.ajustado_em desc
+            limit 1
+        ) aj on true
         where i.competencia_id = :cid
         order by (i.status = 'pendente') desc, i.tipo, i.cst, i.cfop
     """), {"cid": competencia_id}).mappings().all()
-    return pd.DataFrame(rows, columns=["id", "tipo", "cst", "cfop", "tipo_operacao", "descricao", "status",
-                                        "created_at", "fonte", "empresa_id", "filial"])
+    return pd.DataFrame(rows, columns=["id", "tipo", "cst", "cfop", "ncm", "tipo_operacao", "descricao",
+                                        "status", "created_at", "fonte", "empresa_id", "filial",
+                                        "ultimo_ajuste_cst", "ultimo_ajuste_obs", "ultimo_ajuste_em"])
 
 
 def marcar_inconsistencia(session, inconsistencia_id, status, usuario=None):

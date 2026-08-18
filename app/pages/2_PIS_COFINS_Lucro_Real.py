@@ -17,6 +17,11 @@ from lib.calculo_pis_cofins_lucro_real import (
     conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
     SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
+from lib.cst_regras_pc import registrar_ajuste_cst, carregar_historico_ajustes
+
+# Tipos de inconsistência que carregam um CST passível de ajuste manual (log-only — ver
+# cst_regras_pc.registrar_ajuste_cst). cfop_sem_grupo não tem CST associado, então fica de fora.
+TIPOS_COM_CST_AJUSTAVEL = {"cst_nao_mapeado", "cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta"}
 
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")
 require_login()
@@ -397,15 +402,75 @@ with aba_inconsist:
             st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
         else:
             st.caption(f"Mostrando {len(df_filtrado)} de {len(df_inc)} inconsistência(s).")
+            csts_disponiveis = session.execute(
+                text("select codigo, descricao from cst_pis_cofins order by codigo")
+            ).mappings().all()
+
             for _, row in df_filtrado.iterrows():
                 with st.container(border=True):
                     c1, c2 = st.columns([4, 1])
                     c1.markdown(f"**{row['descricao']}**")
-                    c1.caption(
+                    legenda = (
                         f"Tipo: {row['tipo']} • Operação: {row['tipo_operacao'] or '-'} • "
                         f"Fonte: {row['fonte']} • Filial: {row['filial']} • Status: {row['status']}"
                     )
+                    if row["ncm"]:
+                        legenda += f" • NCM: {row['ncm']}"
+                    c1.caption(legenda)
+                    if row["status"] == "ajustado" and pd.notna(row["ultimo_ajuste_cst"]):
+                        obs = f" — {row['ultimo_ajuste_obs']}" if row["ultimo_ajuste_obs"] else ""
+                        cst_atual = int(row["cst"]) if pd.notna(row["cst"]) else "?"
+                        c1.info(
+                            f"Ajuste registrado: CST {cst_atual} → **{int(row['ultimo_ajuste_cst'])}** "
+                            f"em {row['ultimo_ajuste_em']:%d/%m/%Y %H:%M}{obs} "
+                            f"(só histórico — não altera o cálculo nem o item importado)."
+                        )
                     if row["status"] == "pendente":
                         if c2.button("Marcar revisado", key=f"rev_{row['id']}"):
                             resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
                             st.rerun()
+
+                    if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
+                        with st.expander("Ajustar CST (registrar correção para o Winthor)"):
+                            st.caption(
+                                "Isso NÃO recalcula nada nem altera o item importado — fica só como "
+                                "histórico/checklist do que precisa ser corrigido na origem (Winthor)."
+                            )
+                            opcoes_cst = [c["codigo"] for c in csts_disponiveis]
+                            cst_corrigido = st.selectbox(
+                                "CST correto", opcoes_cst,
+                                format_func=lambda cod: f"{cod} — "
+                                                         f"{next((c['descricao'] for c in csts_disponiveis if c['codigo'] == cod), '')}",
+                                key=f"cst_novo_{row['id']}",
+                            )
+                            observacao_ajuste = st.text_input(
+                                "Observação (opcional)", key=f"obs_ajuste_{row['id']}"
+                            )
+                            if st.button("Registrar ajuste", key=f"ajustar_{row['id']}"):
+                                registrar_ajuste_cst(
+                                    session, row["id"], cst_corrigido,
+                                    observacao_ajuste or None, usuario_atual(),
+                                )
+                                st.rerun()
+
+    st.divider()
+    st.subheader("Histórico de ajustes manuais de CST")
+    st.caption(
+        "Lista de correções registradas nesta tela — use como checklist para corrigir de fato no Winthor. "
+        "Registrar aqui não muda nenhum valor calculado."
+    )
+    historico = carregar_historico_ajustes(session, competencia_id)
+    if not historico:
+        st.caption("Nenhum ajuste registrado ainda nesta competência.")
+    else:
+        df_hist = pd.DataFrame(historico, columns=["id", "inconsistencia_id", "cst_original", "cst_corrigido",
+                                                     "observacao", "ajustado_em", "cfop", "ncm",
+                                                     "tipo_operacao", "descricao", "filial"])
+        df_hist = df_hist.drop(columns=["id", "inconsistencia_id"])
+        st.dataframe(df_hist, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Baixar histórico (CSV)",
+            df_hist.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"ajustes_cst_pc_{competencia_id}.csv",
+            mime="text/csv",
+        )

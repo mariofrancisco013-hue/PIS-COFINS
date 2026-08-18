@@ -15,6 +15,8 @@ impresso/agrupado por bloco de NF traz isso.
 import pandas as pd
 from sqlalchemy import text
 
+from lib.cst_regras_pc import registrar_inconsistencias_cst_regras
+
 COLS = [
     "produto_codigo", "ncm", "cst", "cfop", "quantidade", "valor_contabil", "valor_desconto",
     "valor_itens", "valor_tributado", "aliq_pis", "valor_pis", "aliq_cofins", "valor_cofins",
@@ -268,6 +270,7 @@ def importar_1096(session, empresa_id, competencia_id, arquivo_entrada=None, arq
         partes.append(f"Saída: {n} itens importados.")
 
     _registrar_inconsistencias_1096(session, competencia_id, empresa_id)
+    registrar_inconsistencias_cst_regras(session, competencia_id, empresa_id)
     session.execute(text("update competencias set status = 'importada' where id = :cid"), {"cid": competencia_id})
     session.commit()
     return " ".join(partes)

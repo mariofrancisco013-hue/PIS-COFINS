@@ -18,11 +18,15 @@ Layout do PDF: cada CFOP aparece como uma linha de texto simples nas seções "E
     │ └─ CFOP ("Fiscal")
     └─ Código "Contabil" (sempre 0 nos arquivos vistos até agora)
 
-Confirmado com o usuário em 14/08/2026: a base do PIS/COFINS é `Valores Contábeis − Imposto Creditado/
-Debitado (ICMS destacado)` — não o valor bruto contábil puro nem a Base de Cálculo do ICMS (que já é líquida
-de ICMS ST/outras exclusões específicas do ICMS, não aplicáveis aqui). tipo_operacao (entrada/saída) não vem
-explícito por linha no texto extraído — é derivado do próprio CFOP (1xxx-3xxx = entrada, 5xxx-7xxx = saída,
-convenção padrão da Nota Técnica de CFOP), a mesma lógica usada em app/lib/calculo_icms_pe.py do módulo ICMS.
+Confirmado com o usuário em 14/08/2026 (e revisado no mesmo dia, à noite, depois de comparar a Conferência
+1024×1096 e ver divergência sistemática): a base do PIS/COFINS é `Valores Contábeis − Imposto Creditado/
+Debitado (ICMS destacado) − Isentas/Não Tributadas` — não só "Valores Contábeis − ICMS destacado" como na
+primeira versão. O valor de "Isentas/Não Tributadas" (5ª coluna numérica da linha) também precisa sair da
+base, senão CFOPs com venda/compra isenta misturada com tributada ficam com base inflada e a apuração não
+bate com o Relatório 1096 (que já exclui isentos item a item via CST). "Outras" (6ª coluna) é guardada só
+para referência — não entra na base nesta versão. tipo_operacao (entrada/saída) não vem explícito por linha
+no texto extraído — é derivado do próprio CFOP (1xxx-3xxx = entrada, 5xxx-7xxx = saída, convenção padrão da
+Nota Técnica de CFOP), a mesma lógica usada em app/lib/calculo_icms_pe.py do módulo ICMS.
 """
 import re
 from decimal import Decimal
@@ -50,9 +54,10 @@ def _tipo_operacao(cfop: int) -> str:
 
 def parse_rotina_1024(arquivo) -> list[dict]:
     """`arquivo` é um caminho ou um buffer tipo st.file_uploader (PDF do RAICMS Modelo P9). Devolve uma
-    lista de dicts {cfop, tipo_operacao, valor_contabil, valor_base_icms, valor_icms} — um por CFOP
-    encontrado nas seções de Entradas e Saídas (ignora linhas de "Sub Totais"/"Totais"). Lança ValueError se
-    nenhuma linha reconhecível for encontrada (arquivo no layout errado)."""
+    lista de dicts {cfop, tipo_operacao, valor_contabil, valor_base_icms, valor_icms,
+    valor_isentas_nao_tributadas, valor_outras} — um por CFOP encontrado nas seções de Entradas e Saídas
+    (ignora linhas de "Sub Totais"/"Totais"). Lança ValueError se nenhuma linha reconhecível for encontrada
+    (arquivo no layout errado)."""
     resultado = []
     with pdfplumber.open(arquivo) as pdf:
         for page in pdf.pages:
@@ -70,6 +75,8 @@ def parse_rotina_1024(arquivo) -> list[dict]:
                     "valor_contabil": _para_decimal(m.group(2)),
                     "valor_base_icms": _para_decimal(m.group(3)),
                     "valor_icms": _para_decimal(m.group(4)),
+                    "valor_isentas_nao_tributadas": _para_decimal(m.group(5)),
+                    "valor_outras": _para_decimal(m.group(6)),
                 })
     if not resultado:
         raise ValueError(
@@ -114,15 +121,19 @@ def importar_1024(session, empresa_id, competencia_id, arquivo_pdf, substituir=F
     for l in linhas:
         session.execute(text("""
             insert into resumo_1024_pc
-                (competencia_id, empresa_id, tipo_operacao, cfop, valor_contabil, valor_base_icms, valor_icms)
-            values (:cid, :eid, :tipo, :cfop, :vc, :vb, :vi)
+                (competencia_id, empresa_id, tipo_operacao, cfop, valor_contabil, valor_base_icms, valor_icms,
+                 valor_isentas_nao_tributadas, valor_outras)
+            values (:cid, :eid, :tipo, :cfop, :vc, :vb, :vi, :vin, :vo)
             on conflict (competencia_id, empresa_id, cfop) do update
                 set tipo_operacao = excluded.tipo_operacao, valor_contabil = excluded.valor_contabil,
                     valor_base_icms = excluded.valor_base_icms, valor_icms = excluded.valor_icms,
+                    valor_isentas_nao_tributadas = excluded.valor_isentas_nao_tributadas,
+                    valor_outras = excluded.valor_outras,
                     importado_em = now()
         """), {
             "cid": competencia_id, "eid": empresa_id, "tipo": l["tipo_operacao"], "cfop": l["cfop"],
             "vc": str(l["valor_contabil"]), "vb": str(l["valor_base_icms"]), "vi": str(l["valor_icms"]),
+            "vin": str(l["valor_isentas_nao_tributadas"]), "vo": str(l["valor_outras"]),
         })
 
     cfops_ruins = session.execute(text("""

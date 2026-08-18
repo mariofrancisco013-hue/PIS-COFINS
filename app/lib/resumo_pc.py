@@ -101,14 +101,20 @@ def carregar_itens(session, competencia_id, tipo_operacao, cfop_filtro=None, ncm
 
 
 def carregar_inconsistencias(session, competencia_id):
+    # fonte/empresa_id existem desde a migração 002 (multifilial) — podem vir nulas em registros antigos,
+    # criados antes dessas colunas existirem (por isso o coalesce pra não quebrar o filtro na tela).
     rows = session.execute(text("""
-        select id, tipo, cst, cfop, tipo_operacao, descricao, status, created_at
-        from inconsistencias_pc
-        where competencia_id = :cid
-        order by (status = 'pendente') desc, tipo, cst, cfop
+        select i.id, i.tipo, i.cst, i.cfop, i.tipo_operacao, i.descricao, i.status, i.created_at,
+               coalesce(i.fonte, '(não identificada)') as fonte,
+               i.empresa_id,
+               coalesce(e.filial_winthor, '(não identificada)') as filial
+        from inconsistencias_pc i
+        left join empresas e on e.id = i.empresa_id
+        where i.competencia_id = :cid
+        order by (i.status = 'pendente') desc, i.tipo, i.cst, i.cfop
     """), {"cid": competencia_id}).mappings().all()
     return pd.DataFrame(rows, columns=["id", "tipo", "cst", "cfop", "tipo_operacao", "descricao", "status",
-                                        "created_at"])
+                                        "created_at", "fonte", "empresa_id", "filial"])
 
 
 def marcar_inconsistencia(session, inconsistencia_id, status, usuario=None):

@@ -26,7 +26,20 @@ normal"), replicando o padrão de sql/008 e sql/009 daquele projeto:
   e marca "replicar nas próximas apurações", isso vira uma exceção ativa por (empresa_id, tipo,
   chave_agrupamento). Da próxima vez que o mesmo grupo aparecer nesta filial, a inconsistência já nasce
   com status='revisado' e a justificativa preenchida (aplicada_por_excecao=true) — não pede revisão de novo.
+
+ESTRUTURA (18/08/2026, à noite — segundo pedido do mesmo dia: "quero mais ou menos essa estrutura",
+mostrando a tela do ICMS Normal inteira, com banner de status, abas de cadastro e "CFOPs sem Validação"),
+mais dois complementos, ver sql/006_planilha_editavel_pc.sql:
+- "CFOPs sem checagem de CST" (cfops_sem_checagem_cst_pc, por filial): equivalente a cfops_sem_validacao do
+  ICMS Normal — marca um CFOP inteiro como "não precisa checar CST" para uma filial, e as 3 funções
+  _checar_* abaixo passam a ignorar itens desse CFOP. Diferença para as exceções por chave_agrupamento
+  acima: aqui é "não checar mais este CFOP", lá é "não avisar de novo sobre este erro específico" — os dois
+  mecanismos convivem, um não substitui o outro.
+- CRUD das tabelas de regra (cst_regra_cfop_pc/cst_regra_ncm_pc/cst_regra_alerta_pc) pela própria tela, em
+  vez de só por `insert` direto no banco — ver `listar_regras_*`/`salvar_regras_*` mais abaixo. As regras
+  continuam GLOBAIS (não por filial), diferente do cadastro de CFOPs sem checagem.
 """
+import pandas as pd
 from sqlalchemy import text
 
 TIPOS_REGRA = ("cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta")
@@ -59,11 +72,77 @@ def _inserir_grupo(session, competencia_id, empresa_id, tipo, cst, cfop, ncm, ti
     })
 
 
+def cfops_excluidos_checagem(session, empresa_id):
+    """Lista de códigos de CFOP marcados como "sem checagem de CST" para esta filial — usada pelas 3 funções
+    _checar_* abaixo para ignorar itens desses CFOPs."""
+    return session.execute(text(
+        "select cfop from cfops_sem_checagem_cst_pc where empresa_id = :eid"
+    ), {"eid": empresa_id}).scalars().all()
+
+
+def _clausula_cfops_excluidos(session, empresa_id, alias, params, prefix="cfx"):
+    """Monta `and not (<alias>.cfop in (...))` com placeholders dinâmicos (mesma convenção do resto do
+    projeto — ver nota em planilha_pc._where_empresas) para os CFOPs marcados como "sem checagem" desta
+    filial. Sem CFOP marcado, devolve string vazia (não filtra nada)."""
+    cfops = cfops_excluidos_checagem(session, empresa_id)
+    if not cfops:
+        return ""
+    placeholders = ", ".join(f":{prefix}{i}" for i in range(len(cfops)))
+    for i, c in enumerate(cfops):
+        params[f"{prefix}{i}"] = c
+    return f" and not ({alias}.cfop in ({placeholders}))"
+
+
+def listar_cfops_sem_checagem(session, empresa_id):
+    rows = session.execute(text("""
+        select c.id, c.cfop, cp.descricao, c.motivo, c.criado_por_email, c.created_at
+        from cfops_sem_checagem_cst_pc c
+        left join cfop_pis_cofins cp on cp.codigo = c.cfop
+        where c.empresa_id = :eid
+        order by c.cfop
+    """), {"eid": empresa_id}).mappings().all()
+    return rows
+
+
+def salvar_cfops_sem_checagem(session, empresa_id, df_original, df_editado, usuario=None):
+    """Grade editável com `num_rows='dynamic'` — linha nova (sem id) insere, linha removida na grade
+    exclui. Mesmo padrão de `ncm_tributado.py`/`cfops_sem_validacao.py` do módulo ICMS Normal."""
+    ids_originais = set(df_original["id"].dropna().astype(int)) if not df_original.empty else set()
+    ids_editados = set(df_editado["id"].dropna().astype(int)) if "id" in df_editado.columns else set()
+
+    removidos = ids_originais - ids_editados
+    for cfop_id in removidos:
+        session.execute(text("delete from cfops_sem_checagem_cst_pc where id = :id"), {"id": int(cfop_id)})
+
+    incluidos = 0
+    novas = df_editado[df_editado["id"].isna()] if "id" in df_editado.columns else df_editado
+    usuario = usuario or {}
+    for _, row in novas.iterrows():
+        cfop_raw = row.get("cfop")
+        if pd.isna(cfop_raw):
+            continue
+        session.execute(text("""
+            insert into cfops_sem_checagem_cst_pc (empresa_id, cfop, motivo, criado_por, criado_por_email)
+            values (:eid, :cfop, :motivo, :uid, :email)
+            on conflict (empresa_id, cfop) do update
+                set motivo = excluded.motivo, criado_por = excluded.criado_por,
+                    criado_por_email = excluded.criado_por_email
+        """), {
+            "eid": empresa_id, "cfop": int(cfop_raw), "motivo": row.get("motivo") or None,
+            "uid": usuario.get("id"), "email": usuario.get("email"),
+        })
+        incluidos += 1
+
+    session.commit()
+    return {"incluidos": incluidos, "removidos": len(removidos)}
+
+
 def registrar_inconsistencias_cst_regras(session, competencia_id, empresa_id):
     """Roda as 3 checagens (CFOP, NCM, alerta) para os itens do 1096 desta filial nesta competência.
     Escopado por empresa_id, mesmo padrão do resto do módulo: recria do zero só os achados desta filial,
     sem tocar em outras filiais do mesmo grupo. Chame depois de importar_arquivo (dentro de
-    importacao_pc.importar_1096, junto com _registrar_inconsistencias_1096)."""
+    importacao_pc.importar_1096, junto com _registrar_inconsistencias_1096) e também depois de salvar
+    edições na grade de Saída/Entrada (ver planilha_pc.recalcular_inconsistencias_apos_edicao)."""
     session.execute(text(f"""
         delete from inconsistencias_pc
         where competencia_id = :cid and empresa_id = :eid
@@ -78,7 +157,9 @@ def registrar_inconsistencias_cst_regras(session, competencia_id, empresa_id):
 
 def _checar_regra_cfop(session, competencia_id, empresa_id):
     excecoes = _buscar_excecoes_ativas(session, empresa_id, "cst_regra_cfop")
-    achados = session.execute(text("""
+    params = {"cid": competencia_id, "eid": empresa_id}
+    clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
+    achados = session.execute(text(f"""
         select ri.cfop, ri.cst, ri.tipo_operacao, count(*) as quantidade,
                (select r.cst from cst_regra_cfop_pc r
                 where r.cfop = ri.cfop and r.tipo_operacao = ri.tipo_operacao) as cst_esperado
@@ -92,9 +173,10 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
           )
           and not exists (select 1 from cst_regra_cfop_pc r
                            where r.cfop = ri.cfop and r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao)
+          {clausula_excluidos}
         group by ri.cfop, ri.cst, ri.tipo_operacao
         order by ri.cfop, ri.cst
-    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
+    """), params).mappings().all()
 
     for a in achados:
         chave = f'cfop:{a["cfop"]}|cst:{a["cst"]}|op:{a["tipo_operacao"]}'
@@ -114,7 +196,9 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
 
 def _checar_regra_ncm(session, competencia_id, empresa_id):
     excecoes = _buscar_excecoes_ativas(session, empresa_id, "cst_regra_ncm")
-    achados = session.execute(text("""
+    params = {"cid": competencia_id, "eid": empresa_id}
+    clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
+    achados = session.execute(text(f"""
         select ri.ncm, ri.cst, ri.tipo_operacao, count(*) as quantidade,
                min(ri.cfop) as cfop_repr, count(distinct ri.cfop) as n_cfops,
                (select r.cst from cst_regra_ncm_pc r
@@ -129,9 +213,10 @@ def _checar_regra_ncm(session, competencia_id, empresa_id):
           )
           and not exists (select 1 from cst_regra_ncm_pc r
                            where r.ncm = ri.ncm and r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao)
+          {clausula_excluidos}
         group by ri.ncm, ri.cst, ri.tipo_operacao
         order by ri.ncm, ri.cst
-    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
+    """), params).mappings().all()
 
     for a in achados:
         chave = f'ncm:{a["ncm"]}|cst:{a["cst"]}|op:{a["tipo_operacao"]}'
@@ -153,15 +238,18 @@ def _checar_regra_ncm(session, competencia_id, empresa_id):
 
 def _checar_alerta(session, competencia_id, empresa_id):
     excecoes = _buscar_excecoes_ativas(session, empresa_id, "cst_regra_alerta")
-    achados = session.execute(text("""
+    params = {"cid": competencia_id, "eid": empresa_id}
+    clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
+    achados = session.execute(text(f"""
         select ri.cst, ri.tipo_operacao, count(*) as quantidade,
                min(ri.cfop) as cfop_repr, count(distinct ri.cfop) as n_cfops
         from relatorio_pc_itens ri
         join cst_regra_alerta_pc r on r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao
         where ri.competencia_id = :cid and ri.empresa_id = :eid
+          {clausula_excluidos}
         group by ri.cst, ri.tipo_operacao
         order by ri.cst
-    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
+    """), params).mappings().all()
 
     for a in achados:
         chave = f'cst:{a["cst"]}|op:{a["tipo_operacao"]}'
@@ -267,6 +355,148 @@ def registrar_ajuste_cst(session, inconsistencia_id, cst_corrigido, observacao=N
         where id = :id
     """), {"id": inconsistencia_id, "por": usuario.get("id")})
     session.commit()
+
+
+# --------------------------------------------------------------------------------------- Cadastro de regras
+# (18/08/2026, à noite) — CRUD pela tela das tabelas cst_regra_cfop_pc/cst_regra_ncm_pc/cst_regra_alerta_pc
+# (ver sql/004_regras_cst_pc.sql), em vez de só `insert` direto no banco. GLOBAIS (não por filial, diferente
+# do cadastro de CFOPs sem checagem acima) — mesmo padrão de grade editável `num_rows='dynamic'` do módulo
+# ICMS Normal (linha nova insere, linha removida na grade exclui; o CFOP/NCM/CST em si não é editável depois
+# de criado, só a observação — mais simples que suportar edição in-place).
+def listar_regras_cfop(session):
+    rows = session.execute(text("""
+        select r.id, r.cst, r.cfop, r.tipo_operacao, r.observacao, r.created_at
+        from cst_regra_cfop_pc r order by r.tipo_operacao, r.cfop
+    """)).mappings().all()
+    return rows
+
+
+def salvar_regras_cfop(session, df_original, df_editado):
+    # colunas_conflito = só (cfop, tipo_operacao) — é ISSO que a unique constraint da tabela cobre (ver
+    # sql/004_regras_cst_pc.sql: unique(cfop, tipo_operacao)), não as 3 colunas de colunas_chave. "cst" é o
+    # VALOR da regra (o CST esperado), não faz parte da identidade dela — daí um CFOP só poder ter UM CST
+    # esperado por direção, que é literalmente o que a regra representa.
+    return _salvar_regra_generica(
+        session, "cst_regra_cfop_pc", ["cst", "cfop", "tipo_operacao"], ["cfop", "tipo_operacao"],
+        df_original, df_editado,
+    )
+
+
+def listar_regras_ncm(session):
+    rows = session.execute(text("""
+        select r.id, r.cst, r.ncm, r.tipo_operacao, r.observacao, r.created_at
+        from cst_regra_ncm_pc r order by r.tipo_operacao, r.ncm
+    """)).mappings().all()
+    return rows
+
+
+def salvar_regras_ncm(session, df_original, df_editado):
+    # Mesmo raciocínio de salvar_regras_cfop: a unique constraint é (ncm, tipo_operacao), não as 3 colunas.
+    return _salvar_regra_generica(
+        session, "cst_regra_ncm_pc", ["cst", "ncm", "tipo_operacao"], ["ncm", "tipo_operacao"],
+        df_original, df_editado,
+    )
+
+
+def listar_regras_alerta(session):
+    rows = session.execute(text("""
+        select r.id, r.cst, r.tipo_operacao, r.observacao, r.created_at
+        from cst_regra_alerta_pc r order by r.tipo_operacao, r.cst
+    """)).mappings().all()
+    return rows
+
+
+def salvar_regras_alerta(session, df_original, df_editado):
+    # Aqui SIM colunas_chave e colunas_conflito coincidem: a identidade da regra "sempre-alerta" é
+    # (cst, tipo_operacao) — não há um "valor esperado" separado do CST, como nas outras duas.
+    return _salvar_regra_generica(
+        session, "cst_regra_alerta_pc", ["cst", "tipo_operacao"], ["cst", "tipo_operacao"],
+        df_original, df_editado,
+    )
+
+
+def _int_ou_valor(col, v):
+    return int(v) if col in ("cst", "cfop") else v
+
+
+def _salvar_regra_generica(session, tabela, colunas_chave, colunas_conflito, df_original, df_editado):
+    """Linha nova (sem id) insere; linha removida na grade exclui; qualquer coluna de uma linha EXISTENTE
+    que tiver mudado (inclusive o próprio CST/CFOP/NCM digitado na grade, não só a observação) é atualizada
+    por id. Retorna {"incluidos", "removidos", "atualizados"}. Não recalcula inconsistências sozinha — como
+    as regras são globais (afetam todas as filiais), quem chama decide se quer rodar
+    `registrar_inconsistencias_cst_regras` de novo (a tela mostra um aviso pedindo para recalcular
+    manualmente, mesmo padrão de "Calcular apuração" do restante do app).
+
+    `colunas_chave` (validação de linha nova) e `colunas_conflito` (o que a unique constraint da tabela
+    realmente cobre — ver sql/004_regras_cst_pc.sql) são conjuntos DIFERENTES para cst_regra_cfop_pc/
+    cst_regra_ncm_pc: a unique é só (cfop, tipo_operacao) / (ncm, tipo_operacao) — "cst" é o VALOR da regra,
+    não faz parte da identidade dela. Achado na revisão antes da entrega: usar colunas_chave como alvo do
+    `on conflict` gerava `on conflict (cst, cfop, tipo_operacao)`, que não bate com NENHUMA unique/exclusion
+    constraint real da tabela — o Postgres rejeita isso com erro ("no unique or exclusion constraint
+    matching the ON CONFLICT specification"), quebrando a tela ao tentar incluir qualquer regra nova."""
+    ids_originais = set(df_original["id"].dropna().astype(int)) if not df_original.empty else set()
+    ids_editados = set(df_editado["id"].dropna().astype(int)) if "id" in df_editado.columns else set()
+
+    removidos = ids_originais - ids_editados
+    for rid in removidos:
+        session.execute(text(f"delete from {tabela} where id = :id"), {"id": int(rid)})
+
+    atualizados = 0
+    colunas_editaveis = colunas_chave + ["observacao"]
+    if not df_original.empty:
+        orig = df_original.set_index("id")
+        for rid in (ids_originais & ids_editados):
+            linha_edit = df_editado[df_editado["id"] == rid]
+            if linha_edit.empty:
+                continue
+            linha_edit = linha_edit.iloc[0]
+            valores, mudou = {}, False
+            for col in colunas_editaveis:
+                v_orig = orig.loc[rid, col] if col in orig.columns else None
+                v_edit = linha_edit.get(col)
+                v_orig_norm = None if pd.isna(v_orig) else v_orig
+                v_edit_norm = None if pd.isna(v_edit) else v_edit
+                if v_orig_norm != v_edit_norm:
+                    mudou = True
+                valores[col] = _int_ou_valor(col, v_edit_norm) if v_edit_norm is not None else None
+            if mudou:
+                sets_sql = ", ".join(f"{c} = :{c}" for c in colunas_editaveis)
+                session.execute(text(f"update {tabela} set {sets_sql} where id = :id"),
+                                 {**valores, "id": int(rid)})
+                atualizados += 1
+
+    incluidos = 0
+    novas = df_editado[df_editado["id"].isna()] if "id" in df_editado.columns else df_editado
+    colunas_sql = ", ".join(colunas_chave + ["observacao"])
+    placeholders_sql = ", ".join(f":{c}" for c in colunas_chave) + ", :obs"
+    conflito_sql = ", ".join(colunas_conflito)
+    # No conflito, atualiza toda coluna de colunas_chave que NÃO faz parte da identidade (ex: "cst" em
+    # cst_regra_cfop_pc/cst_regra_ncm_pc) — reinserir a mesma combinação CFOP+operação com um CST diferente
+    # deve atualizar qual CST é esperado, não só a observação.
+    sets_conflito = ", ".join(
+        f"{c} = excluded.{c}" for c in colunas_chave if c not in colunas_conflito
+    )
+    sets_conflito = (sets_conflito + ", " if sets_conflito else "") + "observacao = excluded.observacao"
+    for _, row in novas.iterrows():
+        valores = {}
+        valido = True
+        for col in colunas_chave:
+            v = row.get(col)
+            if pd.isna(v) or (isinstance(v, str) and not v.strip()):
+                valido = False
+                break
+            valores[col] = _int_ou_valor(col, v)
+        if not valido:
+            continue
+        valores["obs"] = row.get("observacao") or None
+        session.execute(text(f"""
+            insert into {tabela} ({colunas_sql}) values ({placeholders_sql})
+            on conflict ({conflito_sql}) do update set {sets_conflito}
+        """), valores)
+        incluidos += 1
+
+    session.commit()
+    return {"incluidos": incluidos, "removidos": len(removidos), "atualizados": atualizados}
 
 
 def carregar_historico_ajustes(session, competencia_id):

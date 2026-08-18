@@ -11,7 +11,7 @@ from lib.auth import require_login, logout_button, usuario_atual
 from lib.db import get_session
 from lib.formatacao import rotulo_empresa, formatar_moeda, coluna_moeda
 from lib.status_apuracao_pc import status_competencia
-from lib import importacao_pc, resumo_pc, lancamentos_manuais_pc as lmpc
+from lib import importacao_pc, resumo_pc, planilha_pc, lancamentos_manuais_pc as lmpc
 from lib.calculo_pis_cofins_lucro_real import (
     calcular_apuracao_pc, salvar_apuracao_pc, ordenar_linhas_para_exibicao, LAYOUT_LINHAS, ORDEM_SECOES,
     conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
@@ -19,7 +19,8 @@ from lib.calculo_pis_cofins_lucro_real import (
 )
 from lib.cst_regras_pc import (
     registrar_ajuste_cst, carregar_historico_ajustes, TIPOS_REGRA, registrar_revisao, carregar_excecoes,
-    definir_excecao_ativa,
+    definir_excecao_ativa, listar_cfops_sem_checagem, salvar_cfops_sem_checagem, listar_regras_cfop,
+    salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm, listar_regras_alerta, salvar_regras_alerta,
 )
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual (log-only — ver
@@ -33,7 +34,10 @@ def _card_inconsistencia(session, row, csts_disponiveis):
     resolvido automaticamente por uma exceção aprendida, formulário de Revisar/Ignorar/Só salvar
     justificativa com opção "replicar nas próximas apurações" (grava em excecoes_inconsistencia_pc — ver
     cst_regras_pc.registrar_revisao). Além disso, mantém a ação 'Ajustar CST' (log-only, específica do
-    PIS/COFINS — não existe equivalente no ICMS) para quem quiser registrar direto qual seria o CST certo."""
+    PIS/COFINS — não existe equivalente no ICMS) para quem quiser registrar direto qual seria o CST certo.
+    Este card é para revisão que precisa de JULGAMENTO (justificar, decidir se replica) — para uma correção
+    rápida e óbvia de CFOP/NCM/valor errado, use a grade editável nas abas Entrada/Saída (mais rápido,
+    menos passos, mas sem justificativa nem "replicar")."""
     tem_grupo = pd.notna(row.get("chave_agrupamento")) and row.get("chave_agrupamento")
     qtd = int(row["quantidade"]) if pd.notna(row.get("quantidade")) else 1
     selo = f"{qtd}× " if qtd > 1 else ""
@@ -135,11 +139,11 @@ def _card_inconsistencia(session, row, csts_disponiveis):
 
 def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix):
     """Bloco de inconsistências + ajuste de CST, filtrado por operação (saida/entrada) — usado nas abas
-    Saída/Entrada. Pedido do usuário em 18/08/2026: filtro igual ao da aba Inconsistências (Status/Tipo/
-    Filial), só que já pré-filtrado pela operação da aba (não precisa repetir Operação aqui)."""
+    Entrada/Saída. Filtro igual ao da aba Inconsistências (Status/Tipo/Filial), já pré-filtrado pela
+    operação da aba (não precisa repetir Operação aqui)."""
     df_op = df_inc[df_inc["tipo_operacao"] == tipo_operacao]
     if df_op.empty:
-        st.caption(f"Nenhuma inconsistência registrada para esta operação nesta competência.")
+        st.caption("Nenhuma inconsistência registrada para esta operação nesta competência.")
         return
 
     f1, f2, f3 = st.columns(3)
@@ -160,6 +164,323 @@ def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponi
     st.caption(f"Mostrando {len(df_filtrado)} de {len(df_op)} inconsistência(s) desta operação.")
     for _, row in df_filtrado.iterrows():
         _card_inconsistencia(session, row, csts_disponiveis)
+
+
+def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc, csts_disponiveis):
+    """Aba Entrada/Saída no padrão "planilha" do módulo ICMS Normal (pedido do usuário em 18/08/2026: "quero
+    mais ou menos essa estrutura") — grade editável (st.data_editor) sobre os itens do Relatório 1096,
+    visão Analítica (item a item) ou Sintética (totalizada por Filial + Produto + CST), filtros de CFOP/NCM/
+    busca/tipo de inconsistência, e histórico de edições.
+
+    AVISO CRÍTICO, mostrado também na tela: editar aqui NUNCA muda a Apuração (que roda 100% sobre a Rotina
+    1024) — só recalcula as inconsistências de CST × CFOP/NCM e a Conferência 1024×1096. Ver docstring de
+    lib/planilha_pc.py para o raciocínio completo."""
+    st.info(
+        "⚠️ Esta grade edita o **Relatório 1096** (conferência) — os valores da **Apuração** (linhas "
+        "1.x-11.x, aba Apuração) continuam vindo 100% da **Rotina 1024** e NÃO mudam com uma edição aqui. "
+        "O que muda ao salvar: as ⚠️ Inconsistências de CST × CFOP/NCM desta filial são recalculadas na hora, "
+        "e a Conferência 1024×1096 reflete o novo valor na próxima vez que você abrir aquela aba."
+    )
+    st.caption(
+        "Ajuste diretamente na grade (igual planilha) se algum código de produto, NCM, CFOP ou valor "
+        "estiver errado no relatório original. O CST não é editável aqui de propósito — use os cards de "
+        "'Inconsistências desta operação', mais abaixo, ou a aba ⚠️ Inconsistências (fluxo com "
+        "justificativa/histórico dedicado para CST)."
+    )
+
+    visao = st.radio(
+        "Visão", ["Analítica (item a item)", "Sintética (totalizada por Filial, Produto e CST)"],
+        horizontal=True, key=f"visao_{tipo_operacao}",
+    )
+    sintetica = visao.startswith("Sintética")
+
+    c1, c_ncm, c2, c3 = st.columns([2, 2, 3, 2])
+    # O dropdown de filtro é sobre os CFOPs que aparecem no PRÓPRIO Relatório 1096 (o que a grade abaixo
+    # mostra) — não sobre os CFOPs da Rotina 1024 (que é o "Resumo por CFOP — Rotina 1024" exibido mais
+    # abaixo, uma fonte diferente, com um conjunto de CFOPs que pode não ser idêntico).
+    resumo_1096_cfop = resumo_pc.resumo_por_cfop(session, competencia_id, tipo_operacao)
+    cfops_disponiveis = (["(todos)"] + sorted(resumo_1096_cfop["cfop"].tolist())) if not resumo_1096_cfop.empty else ["(todos)"]
+    cfop_sel = c1.selectbox("Filtrar por CFOP", cfops_disponiveis, key=f"cfop_{tipo_operacao}")
+    cfop_filtro = None if cfop_sel == "(todos)" else int(cfop_sel)
+    ncm_filtro = c_ncm.text_input(
+        "Filtrar por NCM", key=f"ncm_{tipo_operacao}", placeholder="ex: 8213 ou 82130000",
+        help="Filtra por prefixo — '8213' pega qualquer NCM que comece com 8213, não só o código exato.",
+    )
+
+    if sintetica:
+        limite = c3.number_input("Máx. linhas na tela", min_value=50, max_value=5000, value=500, step=50,
+                                  key=f"limite_{tipo_operacao}")
+        tot = planilha_pc.carregar_totalizador(session, competencia_id, tipo_operacao, empresa_ids,
+                                                cfop_filtro, ncm_filtro or None)
+        st.caption(f"{len(tot)} combinação(ões) de Filial + Produto + CST"
+                   f"{' para este CFOP/NCM' if (cfop_filtro or ncm_filtro) else ''}.")
+        st.dataframe(
+            tot.head(limite), use_container_width=True, height=420, hide_index=True,
+            column_config={
+                "filial": st.column_config.TextColumn("Filial"),
+                "produto_codigo": st.column_config.TextColumn("Código Produto"),
+                "cst": st.column_config.NumberColumn("CST"),
+                "n_itens": st.column_config.NumberColumn("Nº itens"),
+                "valor_contabil": coluna_moeda("Valor Contábil", disabled=True),
+                "valor_tributado": coluna_moeda("Valor Tributado", disabled=True),
+                "valor_pis": coluna_moeda("Valor PIS", disabled=True),
+                "valor_cofins": coluna_moeda("Valor COFINS", disabled=True),
+            },
+        )
+    else:
+        busca = c2.text_input("Buscar por código do produto", key=f"busca_{tipo_operacao}",
+                               help="Nem o 1096 nem a Rotina 1024 trazem número de NF ou nome do "
+                                    "fornecedor/cliente — a busca aqui é só pelo código do produto.")
+        limite = c3.number_input("Máx. linhas na tela", min_value=50, max_value=5000, value=500, step=50,
+                                  key=f"limite_{tipo_operacao}")
+        tipos_inc_sel = st.multiselect(
+            "⚠️ Filtrar por tipo de inconsistência pendente",
+            options=list(planilha_pc.LABELS_INCONSISTENCIA.keys()),
+            format_func=lambda t: planilha_pc.LABELS_INCONSISTENCIA[t],
+            key=f"tipos_inc_{tipo_operacao}",
+            help="Deixe vazio para mostrar todos os itens. Escolha um ou mais tipos para ver só os itens "
+                 "com aquele erro específico pendente.",
+        )
+
+        df, total = planilha_pc.carregar_itens_editavel(
+            session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro or None,
+            busca or None, tipos_inc_sel or None, limite,
+        )
+
+        if total > len(df):
+            st.warning(f"Mostrando {len(df)} de {total} itens (refine o filtro ou aumente o limite acima — "
+                       f"grades muito grandes deixam o navegador lento).")
+        else:
+            st.caption(f"{total} itens.")
+
+        editado = st.data_editor(
+            df, use_container_width=True, height=420, num_rows="fixed", key=f"editor_pc_{tipo_operacao}",
+            column_order=["id", "filial", "inconsistencia", "produto_codigo", "ncm", "cst", "cfop",
+                          "quantidade", "valor_contabil", "valor_desconto", "valor_itens", "valor_tributado",
+                          "aliq_pis", "valor_pis", "aliq_cofins", "valor_cofins", "valor_nao_tributado"],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "empresa_id": st.column_config.NumberColumn("Empresa ID", disabled=True),
+                "filial": st.column_config.TextColumn("Filial", disabled=True),
+                "inconsistencia": st.column_config.TextColumn(
+                    "⚠️ Inconsistência", disabled=True, width="medium",
+                    help="Sinaliza inconsistência(s) PENDENTE(s) de CST × CFOP/NCM ligada(s) a este item. Em "
+                         "branco não é garantia de que está tudo certo — só que nenhuma das checagens "
+                         "automáticas pegou nada nesta linha. Descrição completa e opção de "
+                         "revisar/ignorar/replicar: seção 'Inconsistências desta operação', mais abaixo."
+                ),
+                "cst": st.column_config.NumberColumn(
+                    "CST", disabled=True,
+                    help="Não editável aqui — use os cards de 'Inconsistências desta operação' (mais "
+                         "abaixo) ou a aba ⚠️ Inconsistências para corrigir CST, com histórico dedicado."
+                ),
+                "produto_codigo": st.column_config.TextColumn("Código Produto"),
+                "ncm": st.column_config.TextColumn("NCM"),
+                "cfop": st.column_config.NumberColumn("CFOP"),
+                "quantidade": st.column_config.NumberColumn("Quantidade", format="%.3f"),
+                "valor_contabil": coluna_moeda("Valor Contábil"),
+                "valor_desconto": coluna_moeda("Valor Desconto"),
+                "valor_itens": coluna_moeda("Valor Itens"),
+                "valor_tributado": coluna_moeda("Valor Tributado"),
+                "aliq_pis": st.column_config.NumberColumn("Alíq. PIS %", format="%.4f"),
+                "valor_pis": coluna_moeda("Valor PIS"),
+                "aliq_cofins": st.column_config.NumberColumn("Alíq. COFINS %", format="%.4f"),
+                "valor_cofins": coluna_moeda("Valor COFINS"),
+                "valor_nao_tributado": coluna_moeda("Valor Não Tributado"),
+            },
+        )
+        if st.button("💾 Salvar alterações", key=f"salvar_pc_{tipo_operacao}"):
+            n, empresas_afetadas = planilha_pc.salvar_itens_editados(
+                session, df, editado, competencia_id=competencia_id, tipo_operacao=tipo_operacao,
+                usuario=usuario_atual(),
+            )
+            if n:
+                with st.spinner("Recalculando inconsistências..."):
+                    planilha_pc.recalcular_inconsistencias_apos_edicao(session, competencia_id, empresas_afetadas)
+                st.success(
+                    f"{n} linha(s) atualizada(s), {len(empresas_afetadas)} filial(is) recalculada(s) — o "
+                    f"que foi corrigido já some da coluna ⚠️ Inconsistência aqui na grade e da aba "
+                    f"Inconsistências. A Apuração (Rotina 1024) não foi alterada."
+                )
+            else:
+                st.info("Nenhuma mudança detectada.")
+            st.rerun()
+
+    with st.expander("📝 Histórico de edições desta grade (mais recentes primeiro)"):
+        hist = planilha_pc.carregar_historico_edicoes(session, competencia_id, tipo_operacao)
+        if hist.empty:
+            st.caption("Nenhuma edição registrada ainda nesta grade, para esta competência.")
+        else:
+            st.dataframe(
+                hist, use_container_width=True, height=300, hide_index=True,
+                column_order=["item_id", "produto_codigo", "cfop", "campo", "valor_anterior", "valor_novo",
+                              "editado_por_email", "editado_em"],
+                column_config={
+                    "item_id": st.column_config.NumberColumn("ID Item"),
+                    "produto_codigo": st.column_config.TextColumn("Código Produto"),
+                    "cfop": st.column_config.NumberColumn("CFOP"),
+                    "campo": st.column_config.TextColumn("Campo alterado"),
+                    "valor_anterior": st.column_config.TextColumn("Valor anterior"),
+                    "valor_novo": st.column_config.TextColumn("Valor novo"),
+                    "editado_por_email": st.column_config.TextColumn("Editado por"),
+                    "editado_em": st.column_config.DatetimeColumn("Quando", format="DD/MM/YYYY HH:mm"),
+                },
+            )
+
+    st.markdown("---")
+    c_res1, c_res2 = st.columns(2)
+    with c_res1:
+        st.subheader("Resumo por CFOP — Rotina 1024 (usado na Apuração)")
+        resumo_1024_cfop = resumo_pc.resumo_1024_por_cfop(session, competencia_id, tipo_operacao)
+        st.dataframe(resumo_1024_cfop, use_container_width=True, hide_index=True)
+    with c_res2:
+        st.subheader("Resumo por CST — Relatório 1096")
+        st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, tipo_operacao), use_container_width=True,
+                     hide_index=True)
+
+    st.markdown("---")
+    st.subheader("Inconsistências desta operação (regras de CST do 1096)")
+    st.caption(
+        "Revisão com justificativa — para uma correção rápida e óbvia de CFOP/NCM/valor, use a grade "
+        "editável acima em vez de vir até aqui."
+    )
+    _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, f"inc_{tipo_operacao}")
+
+
+def _aba_regras_cst(session):
+    st.markdown(
+        "**Para que serve esta aba:** cadastro das regras de CST × CFOP/NCM usadas pelas 3 checagens "
+        "automáticas do Relatório 1096 (ver aba ⚠️ Inconsistências) — antes só dava para incluir com um "
+        "`insert` direto no banco (ver `sql/004_regras_cst_pc.sql`); agora dá para gerenciar por aqui. "
+        "Regras são **globais** (valem para todas as filiais do grupo), diferente da aba 🚫 CFOPs sem "
+        "Checagem de CST, que é por filial."
+    )
+    st.warning(
+        "Depois de incluir, editar ou remover uma regra, as inconsistências só refletem a mudança na "
+        "próxima vez que o Relatório 1096 for reimportado, ou quando você salvar qualquer edição na grade "
+        "das abas Entrada/Saída (que recalcula as inconsistências daquela filial)."
+    )
+
+    sub_cfop, sub_ncm, sub_alerta = st.tabs(["Por CFOP", "Por NCM", "Sempre-alerta (por CST)"])
+
+    with sub_cfop:
+        st.caption("CST esperado quando este CFOP aparecer no Relatório 1096, nesta direção (entrada/saída).")
+        df_cfop = pd.DataFrame(listar_regras_cfop(session))
+        if df_cfop.empty:
+            df_cfop = pd.DataFrame(columns=["id", "cst", "cfop", "tipo_operacao", "observacao", "created_at"])
+        df_cfop_editado = st.data_editor(
+            df_cfop, use_container_width=True, num_rows="dynamic", key="editor_regras_cfop",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "cst": st.column_config.NumberColumn("CST esperado", required=True),
+                "cfop": st.column_config.NumberColumn("CFOP", required=True),
+                "tipo_operacao": st.column_config.SelectboxColumn(
+                    "Operação", options=["entrada", "saida"], required=True),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["cst", "cfop", "tipo_operacao", "observacao", "created_at", "id"],
+        )
+        if st.button("💾 Salvar regras por CFOP"):
+            resultado = salvar_regras_cfop(session, df_cfop, df_cfop_editado)
+            st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
+                       f"{resultado['removidos']} removida(s).")
+            st.rerun()
+
+    with sub_ncm:
+        st.caption("CST esperado quando este NCM aparecer no Relatório 1096, nesta direção (entrada/saída).")
+        df_ncm = pd.DataFrame(listar_regras_ncm(session))
+        if df_ncm.empty:
+            df_ncm = pd.DataFrame(columns=["id", "cst", "ncm", "tipo_operacao", "observacao", "created_at"])
+        df_ncm_editado = st.data_editor(
+            df_ncm, use_container_width=True, num_rows="dynamic", key="editor_regras_ncm",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "cst": st.column_config.NumberColumn("CST esperado", required=True),
+                "ncm": st.column_config.TextColumn("NCM", required=True),
+                "tipo_operacao": st.column_config.SelectboxColumn(
+                    "Operação", options=["entrada", "saida"], required=True),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["cst", "ncm", "tipo_operacao", "observacao", "created_at", "id"],
+        )
+        if st.button("💾 Salvar regras por NCM"):
+            resultado = salvar_regras_ncm(session, df_ncm, df_ncm_editado)
+            st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
+                       f"{resultado['removidos']} removida(s).")
+            st.rerun()
+
+    with sub_alerta:
+        st.caption(
+            "CST que deve sempre gerar um alerta informativo ao aparecer no Relatório 1096 (nesta direção), "
+            "mas nunca bloqueia nada — sem CFOP/NCM associado, é qualquer ocorrência do CST."
+        )
+        df_alerta = pd.DataFrame(listar_regras_alerta(session))
+        if df_alerta.empty:
+            df_alerta = pd.DataFrame(columns=["id", "cst", "tipo_operacao", "observacao", "created_at"])
+        df_alerta_editado = st.data_editor(
+            df_alerta, use_container_width=True, num_rows="dynamic", key="editor_regras_alerta",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "cst": st.column_config.NumberColumn("CST", required=True),
+                "tipo_operacao": st.column_config.SelectboxColumn(
+                    "Operação", options=["entrada", "saida"], required=True),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["cst", "tipo_operacao", "observacao", "created_at", "id"],
+        )
+        if st.button("💾 Salvar regras sempre-alerta"):
+            resultado = salvar_regras_alerta(session, df_alerta, df_alerta_editado)
+            st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
+                       f"{resultado['removidos']} removida(s).")
+            st.rerun()
+
+
+def _aba_cfops_sem_checagem(session, filiais_grupo):
+    st.markdown(
+        "**Para que serve esta aba:** se um CFOP dispara inconsistência de CST recorrente por um motivo que "
+        "você já conhece e não é erro de verdade, marque ele aqui em vez de justificar a mesma inconsistência "
+        "todo mês — igual à aba 'CFOPs sem Validação' do módulo ICMS Normal."
+    )
+    st.caption(
+        "Itens desse CFOP deixam de entrar nas 3 checagens automáticas (regra por CFOP, regra por NCM, "
+        "sempre-alerta) para esta filial, tanto nesta competência quanto nas futuras, até você remover o "
+        "cadastro. Não afeta a grade Entrada/Saída nem a Apuração, só as checagens automáticas. Cadastro "
+        "por filial — diferente da aba 🔖 Regras de CST, que é global."
+    )
+    if not filiais_grupo:
+        st.info("Nenhuma filial cadastrada para este grupo.")
+        return
+    filial_sel = st.selectbox("Filial", filiais_grupo, format_func=rotulo_empresa, key="cfop_sv_filial")
+    empresa_id = filial_sel["id"]
+
+    df_sv = pd.DataFrame(listar_cfops_sem_checagem(session, empresa_id))
+    if df_sv.empty:
+        df_sv = pd.DataFrame(columns=["id", "cfop", "descricao", "motivo", "criado_por_email", "created_at"])
+    st.caption(f"{len(df_sv)} CFOP(s) marcado(s) como sem checagem para esta filial.")
+    df_sv_editado = st.data_editor(
+        df_sv, use_container_width=True, num_rows="dynamic", key=f"editor_cfop_sv_{empresa_id}",
+        column_config={
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "cfop": st.column_config.NumberColumn("CFOP", required=True),
+            "descricao": st.column_config.TextColumn("Descrição do CFOP", disabled=True, width="large"),
+            "motivo": st.column_config.TextColumn("Motivo (opcional)", width="large"),
+            "criado_por_email": st.column_config.TextColumn("Cadastrado por", disabled=True),
+            "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+        },
+        column_order=["cfop", "descricao", "motivo", "criado_por_email", "created_at", "id"],
+    )
+    st.caption("Para incluir: adicione uma linha nova (ícone + no final da grade) e digite o CFOP. Para "
+               "remover (volta a checar normalmente): selecione a linha e apague (ícone de lixeira). Depois "
+               "clique em Salvar.")
+    if st.button("💾 Salvar CFOPs sem checagem", key=f"salvar_cfop_sv_{empresa_id}"):
+        resultado = salvar_cfops_sem_checagem(session, empresa_id, df_sv, df_sv_editado, usuario_atual())
+        st.success(f"{resultado['incluidos']} incluído(s), {resultado['removidos']} removido(s). Salve "
+                   f"qualquer edição na grade Entrada/Saída desta filial para as checagens refletirem a "
+                   f"mudança.")
+        st.rerun()
 
 
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")
@@ -190,83 +511,42 @@ comp_row = session.execute(text("select status from competencias where id = :id"
 status = status_competencia(session, competencia_id, comp_row["status"])
 getattr(st, status["nivel"])(status["texto"])
 
-# Carregados uma vez, usados na aba Inconsistências e também nas abas Saída/Entrada (pedido do usuário em
-# 18/08/2026: os ajustes de CST feitos após a análise do 1096 devem poder ser registrados direto nas abas
-# de Saída/Entrada, junto com o detalhe do 1096, não só numa aba separada).
+filiais_grupo = importacao_pc.listar_filiais_grupo(session, grupo["cnpj_raiz"])
+empresa_ids_grupo = [f["id"] for f in filiais_grupo]
+
+# Carregados uma vez, usados na aba Inconsistências e também nas abas Entrada/Saída (os ajustes de CST feitos
+# após a análise do 1096 podem ser registrados direto nas abas de Entrada/Saída, junto com o detalhe do 1096,
+# não só numa aba separada).
 df_inc = resumo_pc.carregar_inconsistencias(session, competencia_id)
 csts_disponiveis = session.execute(
     text("select codigo, descricao from cst_pis_cofins order by codigo")
 ).mappings().all()
 
-# Ordem das abas a pedido do usuário em 18/08/2026, refinada no mesmo dia: a primeira análise é só com base
-# nas regras de CST × CFOP/NCM criadas para o Relatório 1096 (entrada e saída — aba Inconsistências, ver
-# TIPOS_COM_CST_AJUSTAVEL/filtro de Tipo abaixo), DEPOIS vem a comparação com a Rotina 1024 (Conferência
-# 1024×1096), só depois as telas de Saída/Entrada (resumo por CFOP da Rotina 1024, já usado na apuração) e
-# por último a Apuração em si. Isso é só ordem de exibição das abas — não trava o cálculo, que continua
-# disponível a qualquer momento independente do que esteja pendente no 1096 (ver metodologia: 1096 é
-# conferência, não bloqueia).
-aba_inconsist, aba_conferencia, aba_saida, aba_entrada, aba_ajustes, aba_apuracao = st.tabs(
-    ["Inconsistências", "Conferência 1024×1096", "Saída (Débito)", "Entrada (Crédito)",
-     "Ajustes Manuais", "Apuração"]
-)
+# Ordem das abas revista em 18/08/2026 (à noite), a pedido do usuário — "quero mais ou menos essa estrutura"
+# mostrando a tela do módulo ICMS Normal inteira (grade editável tipo planilha, abas de cadastro de regra,
+# banner de status já existente desde antes). Isso SUBSTITUI a ordem decidida mais cedo no mesmo dia (que
+# tinha Inconsistências primeiro — ver histórico no projeto Claude "PIS/COFINS"): Entrada/Saída (a grade)
+# primeiro, depois as abas de cadastro/regra, Ajustes Manuais, Apuração, Conferência e Inconsistências por
+# último — mesma lógica do ICMS Normal. Isso é só ordem de exibição — não trava nada: calcular a apuração
+# continua disponível a qualquer momento, independente do que esteja pendente no 1096 (o 1096 é conferência,
+# não bloqueia).
+(aba_entrada, aba_saida, aba_regras_cst, aba_cfop_sem_checagem, aba_ajustes, aba_apuracao, aba_conferencia,
+ aba_inconsist) = st.tabs([
+    "📥 Entrada (Crédito)", "📤 Saída (Débito)", "🔖 Regras de CST", "🚫 CFOPs sem Checagem de CST",
+    "🧮 Ajustes Manuais", "📋 Apuração", "📎 Conferência 1024×1096", "⚠️ Inconsistências",
+])
 
-# ---------------------------------------------------------------------------------------------- Saída
-# A pedido do usuário em 18/08/2026: esta aba mostra só o Relatório 1096 (análise) — o resumo da Rotina 1024
-# (fonte da apuração) saiu daqui, fica só na aba Conferência 1024×1096 e na Apuração.
-with aba_saida:
-    st.subheader("Resumo por CFOP — Saída (1096)")
-    df_cfop = resumo_pc.resumo_por_cfop(session, competencia_id, "saida")
-    st.dataframe(df_cfop, use_container_width=True, hide_index=True)
-
-    st.subheader("Resumo por CST — Saída")
-    st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, "saida"), use_container_width=True,
-                 hide_index=True)
-
-    c1, c2 = st.columns(2)
-    cfop_f = c1.text_input("Filtrar por CFOP", key="cfop_saida")
-    ncm_f = c2.text_input("Filtrar por prefixo de NCM", key="ncm_saida")
-    df_itens, total = resumo_pc.carregar_itens(
-        session, competencia_id, "saida",
-        cfop_filtro=int(cfop_f) if cfop_f.strip().isdigit() else None,
-        ncm_filtro=ncm_f or None,
-    )
-    if total > len(df_itens):
-        st.caption(f"Mostrando {len(df_itens)} de {total} itens — refine o filtro para ver o restante.")
-    st.dataframe(df_itens, use_container_width=True, hide_index=True)
-
-    # Pedido do usuário em 18/08/2026: os ajustes de CST identificados na análise do 1096 devem poder ser
-    # registrados aqui mesmo, junto com o detalhe da Saída, não só numa aba separada de Inconsistências.
-    st.subheader("Inconsistências desta operação (regras de CST do 1096 — Saída)")
-    _secao_inconsistencias_operacao(session, df_inc, "saida", csts_disponiveis, "inc_saida")
-
-# ---------------------------------------------------------------------------------------------- Entrada
-# A pedido do usuário em 18/08/2026: esta aba mostra só o Relatório 1096 (análise) — o resumo da Rotina 1024
-# (fonte da apuração) saiu daqui, fica só na aba Conferência 1024×1096 e na Apuração.
 with aba_entrada:
-    st.subheader("Resumo por CFOP — Entrada (1096)")
-    df_cfop_e = resumo_pc.resumo_por_cfop(session, competencia_id, "entrada")
-    st.dataframe(df_cfop_e, use_container_width=True, hide_index=True)
+    _aba_planilha_pc(session, competencia_id, "entrada", empresa_ids_grupo, df_inc, csts_disponiveis)
 
-    st.subheader("Resumo por CST — Entrada")
-    st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, "entrada"), use_container_width=True,
-                 hide_index=True)
+with aba_saida:
+    _aba_planilha_pc(session, competencia_id, "saida", empresa_ids_grupo, df_inc, csts_disponiveis)
 
-    c1, c2 = st.columns(2)
-    cfop_f = c1.text_input("Filtrar por CFOP", key="cfop_entrada")
-    ncm_f = c2.text_input("Filtrar por prefixo de NCM", key="ncm_entrada")
-    df_itens_e, total_e = resumo_pc.carregar_itens(
-        session, competencia_id, "entrada",
-        cfop_filtro=int(cfop_f) if cfop_f.strip().isdigit() else None,
-        ncm_filtro=ncm_f or None,
-    )
-    if total_e > len(df_itens_e):
-        st.caption(f"Mostrando {len(df_itens_e)} de {total_e} itens — refine o filtro para ver o restante.")
-    st.dataframe(df_itens_e, use_container_width=True, hide_index=True)
+with aba_regras_cst:
+    _aba_regras_cst(session)
 
-    # Pedido do usuário em 18/08/2026: os ajustes de CST identificados na análise do 1096 devem poder ser
-    # registrados aqui mesmo, junto com o detalhe da Entrada, não só numa aba separada de Inconsistências.
-    st.subheader("Inconsistências desta operação (regras de CST do 1096 — Entrada)")
-    _secao_inconsistencias_operacao(session, df_inc, "entrada", csts_disponiveis, "inc_entrada")
+with aba_cfop_sem_checagem:
+    _aba_cfops_sem_checagem(session, filiais_grupo)
 
 # ---------------------------------------------------------------------------------------------- Ajustes Manuais
 with aba_ajustes:
@@ -529,10 +809,10 @@ with aba_inconsist:
         f_status = fi1.multiselect("Status", status_disp, default=["pendente"] if "pendente" in status_disp
                                     else status_disp, key="inc_f_status")
         tipo_disp = sorted(df_inc["tipo"].unique())
-        # Pedido do usuário em 18/08/2026: a primeira análise é só com base nas regras de CST × CFOP/NCM
-        # criadas para o 1096 (entrada e saída) — por isso o filtro de Tipo já abre marcado só nesses 3
-        # tipos (cst_regra_cfop/cst_regra_ncm/cst_regra_alerta), se existir algum. cst_nao_mapeado/
-        # cfop_sem_grupo continuam disponíveis pra marcar manualmente, só não vêm pré-selecionados aqui.
+        # A primeira análise costuma ser só com base nas regras de CST × CFOP/NCM criadas para o 1096
+        # (entrada e saída) — por isso o filtro de Tipo já abre marcado só nesses 3 tipos
+        # (cst_regra_cfop/cst_regra_ncm/cst_regra_alerta), se existir algum. cst_nao_mapeado/cfop_sem_grupo
+        # continuam disponíveis pra marcar manualmente, só não vêm pré-selecionados aqui.
         tipos_regra_presentes = [t for t in tipo_disp if t in TIPOS_REGRA]
         default_tipo = tipos_regra_presentes if tipos_regra_presentes else tipo_disp
         f_tipo = fi2.multiselect("Tipo", tipo_disp, default=default_tipo, key="inc_f_tipo",
@@ -586,16 +866,15 @@ with aba_inconsist:
         )
 
     st.divider()
-    # Estrutura igual ao módulo ICMS normal (pedido do usuário em 18/08/2026): lista de exceções
-    # "aprendidas" (marcadas com 'replicar' num card acima) — o analista pode desativar aqui se a situação
-    # mudar e quiser voltar a ser avisado sobre aquele mesmo caso.
+    # Estrutura igual ao módulo ICMS normal: lista de exceções "aprendidas" (marcadas com 'replicar' num
+    # card acima) — o analista pode desativar aqui se a situação mudar e quiser voltar a ser avisado sobre
+    # aquele mesmo caso.
     with st.expander("🔁 Exceções conhecidas (regras aplicadas automaticamente nas próximas apurações)"):
         st.caption(
             "Quando você marca 'replicar nas próximas apurações' num card de inconsistência acima, a regra "
             "entra aqui — escopada por filial. Desative se a situação mudar e você quiser voltar a ser "
             "avisado sobre esse mesmo caso."
         )
-        empresa_ids_grupo = sorted(df_inc["empresa_id"].dropna().unique().tolist()) if not df_inc.empty else []
         excecoes = carregar_excecoes(session, empresa_ids_grupo)
         if not excecoes:
             st.caption("Nenhuma exceção cadastrada ainda para este grupo.")

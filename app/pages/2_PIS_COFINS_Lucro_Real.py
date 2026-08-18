@@ -51,9 +51,14 @@ comp_row = session.execute(text("select status from competencias where id = :id"
 status = status_competencia(session, competencia_id, comp_row["status"])
 getattr(st, status["nivel"])(status["texto"])
 
-aba_saida, aba_entrada, aba_ajustes, aba_apuracao, aba_conferencia, aba_inconsist = st.tabs(
-    ["Saída (Débito)", "Entrada (Crédito)", "Ajustes Manuais", "Apuração", "Conferência 1024×1096",
-     "Inconsistências"]
+# Ordem das abas a pedido do usuário em 18/08/2026: primeiro a análise do Relatório 1096 (Conferência
+# 1024×1096 + Inconsistências), só depois a Apuração — a ideia é revisar/resolver o que aparecer na
+# conferência e nas inconsistências do 1096 antes de olhar o resultado final calculado (que roda sobre o
+# 1024). Isso é só ordem de exibição das abas — não trava o cálculo, que continua disponível a qualquer
+# momento independente do que esteja pendente no 1096 (ver metodologia: 1096 é conferência, não bloqueia).
+aba_saida, aba_entrada, aba_ajustes, aba_conferencia, aba_inconsist, aba_apuracao = st.tabs(
+    ["Saída (Débito)", "Entrada (Crédito)", "Ajustes Manuais", "Conferência 1024×1096",
+     "Inconsistências", "Apuração"]
 )
 
 # ---------------------------------------------------------------------------------------------- Saída

@@ -331,15 +331,35 @@ with aba_conferencia:
     if not linhas_conf:
         st.info("Nenhum dado de Rotina 1024 nem de Relatório 1096 importado ainda para este grupo/período.")
     else:
-        df_conf = pd.DataFrame(linhas_conf)
-        for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins"):
-            df_conf[col] = df_conf[col].apply(lambda v: formatar_moeda(v) if v is not None else "—")
+        fc1, fc2, fc3 = st.columns([1.3, 1.7, 1.5])
+        f_operacao = fc1.selectbox("Operação", ["Todas", "entrada", "saida"], key="conf_f_operacao")
+        situacoes_disponiveis = sorted({l["situacao"] for l in linhas_conf})
+        f_situacao = fc2.multiselect("Situação", situacoes_disponiveis, default=situacoes_disponiveis,
+                                      key="conf_f_situacao")
+        f_cfop = fc3.text_input("Filtrar por CFOP", key="conf_f_cfop")
+
+        linhas_filtradas = [
+            l for l in linhas_conf
+            if (f_operacao == "Todas" or l["tipo_operacao"] == f_operacao)
+            and l["situacao"] in f_situacao
+            and (not f_cfop.strip() or str(l["cfop"]).startswith(f_cfop.strip()))
+        ]
+
         n_div = sum(1 for l in linhas_conf if l["situacao"] not in ("OK",))
         if n_div:
-            st.warning(f"{n_div} CFOP(s) com divergência ou presentes em só uma das fontes.")
+            st.warning(f"{n_div} CFOP(s) com divergência ou presentes em só uma das fontes (no total, sem "
+                       f"considerar o filtro acima).")
         else:
             st.success("Todos os CFOPs batem entre Rotina 1024 e Relatório 1096 (dentro da tolerância).")
-        st.dataframe(df_conf, use_container_width=True, hide_index=True)
+
+        if not linhas_filtradas:
+            st.info("Nenhum CFOP corresponde aos filtros selecionados.")
+        else:
+            st.caption(f"Mostrando {len(linhas_filtradas)} de {len(linhas_conf)} CFOP(s).")
+            df_conf = pd.DataFrame(linhas_filtradas)
+            for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins"):
+                df_conf[col] = df_conf[col].apply(lambda v: formatar_moeda(v) if v is not None else "—")
+            st.dataframe(df_conf, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------------------------- Inconsistências
 with aba_inconsist:
@@ -349,12 +369,43 @@ with aba_inconsist:
     else:
         pendentes = df_inc[df_inc["status"] == "pendente"]
         st.caption(f"{len(pendentes)} pendente(s) de {len(df_inc)} no total.")
-        for _, row in df_inc.iterrows():
-            with st.container(border=True):
-                c1, c2 = st.columns([4, 1])
-                c1.markdown(f"**{row['descricao']}**")
-                c1.caption(f"Tipo: {row['tipo']} • Operação: {row['tipo_operacao'] or '-'} • Status: {row['status']}")
-                if row["status"] == "pendente":
-                    if c2.button("Marcar revisado", key=f"rev_{row['id']}"):
-                        resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
-                        st.rerun()
+
+        fi1, fi2, fi3, fi4, fi5 = st.columns(5)
+        status_disp = sorted(df_inc["status"].unique())
+        f_status = fi1.multiselect("Status", status_disp, default=["pendente"] if "pendente" in status_disp
+                                    else status_disp, key="inc_f_status")
+        tipo_disp = sorted(df_inc["tipo"].unique())
+        f_tipo = fi2.multiselect("Tipo", tipo_disp, default=tipo_disp, key="inc_f_tipo")
+        operacao_disp = sorted(v for v in df_inc["tipo_operacao"].unique() if v)
+        f_operacao = fi3.multiselect("Operação", operacao_disp, default=operacao_disp, key="inc_f_operacao")
+        fonte_disp = sorted(df_inc["fonte"].unique())
+        f_fonte = fi4.multiselect("Fonte", fonte_disp, default=fonte_disp, key="inc_f_fonte",
+                                   help="rotina_1024 = bloqueia o CFOP na apuração • relatorio_1096 = só "
+                                        "conferência, não afeta o valor calculado.")
+        filial_disp = sorted(df_inc["filial"].unique())
+        f_filial = fi5.multiselect("Filial", filial_disp, default=filial_disp, key="inc_f_filial")
+
+        df_filtrado = df_inc[
+            df_inc["status"].isin(f_status)
+            & df_inc["tipo"].isin(f_tipo)
+            & (df_inc["tipo_operacao"].isin(f_operacao) | df_inc["tipo_operacao"].isna())
+            & df_inc["fonte"].isin(f_fonte)
+            & df_inc["filial"].isin(f_filial)
+        ]
+
+        if df_filtrado.empty:
+            st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
+        else:
+            st.caption(f"Mostrando {len(df_filtrado)} de {len(df_inc)} inconsistência(s).")
+            for _, row in df_filtrado.iterrows():
+                with st.container(border=True):
+                    c1, c2 = st.columns([4, 1])
+                    c1.markdown(f"**{row['descricao']}**")
+                    c1.caption(
+                        f"Tipo: {row['tipo']} • Operação: {row['tipo_operacao'] or '-'} • "
+                        f"Fonte: {row['fonte']} • Filial: {row['filial']} • Status: {row['status']}"
+                    )
+                    if row["status"] == "pendente":
+                        if c2.button("Marcar revisado", key=f"rev_{row['id']}"):
+                            resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
+                            st.rerun()

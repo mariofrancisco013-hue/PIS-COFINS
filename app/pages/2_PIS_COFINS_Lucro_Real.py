@@ -23,6 +23,58 @@ from lib.cst_regras_pc import registrar_ajuste_cst, carregar_historico_ajustes, 
 # cst_regras_pc.registrar_ajuste_cst). cfop_sem_grupo não tem CST associado, então fica de fora.
 TIPOS_COM_CST_AJUSTAVEL = {"cst_nao_mapeado", "cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta"}
 
+
+def _card_inconsistencia(session, row, csts_disponiveis):
+    """Um card de inconsistência com a ação 'Ajustar CST' (log-only) — usado tanto na aba Inconsistências
+    quanto nas abas Saída/Entrada (pedido do usuário em 18/08/2026: as informações do 1096 e os ajustes
+    precisam estar visíveis também nas abas de Saída/Entrada, não só numa aba separada, pra fechar o ciclo
+    'analisei aqui, ajusto aqui mesmo')."""
+    with st.container(border=True):
+        c1, c2 = st.columns([4, 1])
+        c1.markdown(f"**{row['descricao']}**")
+        legenda = (
+            f"Tipo: {row['tipo']} • Operação: {row['tipo_operacao'] or '-'} • "
+            f"Fonte: {row['fonte']} • Filial: {row['filial']} • Status: {row['status']}"
+        )
+        if row["ncm"]:
+            legenda += f" • NCM: {row['ncm']}"
+        c1.caption(legenda)
+        if row["status"] == "ajustado" and pd.notna(row["ultimo_ajuste_cst"]):
+            obs = f" — {row['ultimo_ajuste_obs']}" if row["ultimo_ajuste_obs"] else ""
+            cst_atual = int(row["cst"]) if pd.notna(row["cst"]) else "?"
+            c1.info(
+                f"Ajuste registrado: CST {cst_atual} → **{int(row['ultimo_ajuste_cst'])}** "
+                f"em {row['ultimo_ajuste_em']:%d/%m/%Y %H:%M}{obs} "
+                f"(só histórico — não altera o cálculo nem o item importado)."
+            )
+        if row["status"] == "pendente":
+            if c2.button("Marcar revisado", key=f"rev_{row['id']}"):
+                resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
+                st.rerun()
+
+        if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
+            with st.expander("Ajustar CST (registrar correção para o Winthor)"):
+                st.caption(
+                    "Isso NÃO recalcula nada nem altera o item importado — fica só como "
+                    "histórico/checklist do que precisa ser corrigido na origem (Winthor)."
+                )
+                opcoes_cst = [c["codigo"] for c in csts_disponiveis]
+                cst_corrigido = st.selectbox(
+                    "CST correto", opcoes_cst,
+                    format_func=lambda cod: f"{cod} — "
+                                             f"{next((c['descricao'] for c in csts_disponiveis if c['codigo'] == cod), '')}",
+                    key=f"cst_novo_{row['id']}",
+                )
+                observacao_ajuste = st.text_input(
+                    "Observação (opcional)", key=f"obs_ajuste_{row['id']}"
+                )
+                if st.button("Registrar ajuste", key=f"ajustar_{row['id']}"):
+                    registrar_ajuste_cst(
+                        session, row["id"], cst_corrigido,
+                        observacao_ajuste or None, usuario_atual(),
+                    )
+                    st.rerun()
+
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")
 require_login()
 logout_button()
@@ -51,6 +103,14 @@ comp_row = session.execute(text("select status from competencias where id = :id"
 status = status_competencia(session, competencia_id, comp_row["status"])
 getattr(st, status["nivel"])(status["texto"])
 
+# Carregados uma vez, usados na aba Inconsistências e também nas abas Saída/Entrada (pedido do usuário em
+# 18/08/2026: os ajustes de CST feitos após a análise do 1096 devem poder ser registrados direto nas abas
+# de Saída/Entrada, junto com o detalhe do 1096, não só numa aba separada).
+df_inc = resumo_pc.carregar_inconsistencias(session, competencia_id)
+csts_disponiveis = session.execute(
+    text("select codigo, descricao from cst_pis_cofins order by codigo")
+).mappings().all()
+
 # Ordem das abas a pedido do usuário em 18/08/2026, refinada no mesmo dia: a primeira análise é só com base
 # nas regras de CST × CFOP/NCM criadas para o Relatório 1096 (entrada e saída — aba Inconsistências, ver
 # TIPOS_COM_CST_AJUSTAVEL/filtro de Tipo abaixo), DEPOIS vem a comparação com a Rotina 1024 (Conferência
@@ -64,66 +124,72 @@ aba_inconsist, aba_conferencia, aba_saida, aba_entrada, aba_ajustes, aba_apuraca
 )
 
 # ---------------------------------------------------------------------------------------------- Saída
+# A pedido do usuário em 18/08/2026: esta aba mostra só o Relatório 1096 (análise) — o resumo da Rotina 1024
+# (fonte da apuração) saiu daqui, fica só na aba Conferência 1024×1096 e na Apuração.
 with aba_saida:
-    st.subheader("Resumo por CFOP — Saída (Rotina 1024, usado na apuração)")
-    st.caption("Soma de todas as filiais do grupo já importadas neste período.")
-    df_cfop_1024_s = resumo_pc.resumo_1024_por_cfop(session, competencia_id, "saida")
-    st.dataframe(df_cfop_1024_s, use_container_width=True, hide_index=True)
-    if not df_cfop_1024_s.empty and (df_cfop_1024_s["grupo"] == "(sem grupo)").any():
-        st.warning("Há CFOPs de Saída (Rotina 1024) sem grupo cadastrado (ficam de fora do cálculo) — veja "
-                   "a aba Inconsistências ou cadastre em CFOP/CST.")
+    st.subheader("Resumo por CFOP — Saída (1096)")
+    df_cfop = resumo_pc.resumo_por_cfop(session, competencia_id, "saida")
+    st.dataframe(df_cfop, use_container_width=True, hide_index=True)
 
-    with st.expander("Detalhe do Relatório 1096 (só conferência — não entra na apuração)"):
-        st.subheader("Resumo por CFOP — Saída (1096)")
-        df_cfop = resumo_pc.resumo_por_cfop(session, competencia_id, "saida")
-        st.dataframe(df_cfop, use_container_width=True, hide_index=True)
+    st.subheader("Resumo por CST — Saída")
+    st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, "saida"), use_container_width=True,
+                 hide_index=True)
 
-        st.subheader("Resumo por CST — Saída")
-        st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, "saida"), use_container_width=True,
-                     hide_index=True)
+    c1, c2 = st.columns(2)
+    cfop_f = c1.text_input("Filtrar por CFOP", key="cfop_saida")
+    ncm_f = c2.text_input("Filtrar por prefixo de NCM", key="ncm_saida")
+    df_itens, total = resumo_pc.carregar_itens(
+        session, competencia_id, "saida",
+        cfop_filtro=int(cfop_f) if cfop_f.strip().isdigit() else None,
+        ncm_filtro=ncm_f or None,
+    )
+    if total > len(df_itens):
+        st.caption(f"Mostrando {len(df_itens)} de {total} itens — refine o filtro para ver o restante.")
+    st.dataframe(df_itens, use_container_width=True, hide_index=True)
 
-        c1, c2 = st.columns(2)
-        cfop_f = c1.text_input("Filtrar por CFOP", key="cfop_saida")
-        ncm_f = c2.text_input("Filtrar por prefixo de NCM", key="ncm_saida")
-        df_itens, total = resumo_pc.carregar_itens(
-            session, competencia_id, "saida",
-            cfop_filtro=int(cfop_f) if cfop_f.strip().isdigit() else None,
-            ncm_filtro=ncm_f or None,
-        )
-        if total > len(df_itens):
-            st.caption(f"Mostrando {len(df_itens)} de {total} itens — refine o filtro para ver o restante.")
-        st.dataframe(df_itens, use_container_width=True, hide_index=True)
+    # Pedido do usuário em 18/08/2026: os ajustes de CST identificados na análise do 1096 devem poder ser
+    # registrados aqui mesmo, junto com o detalhe da Saída, não só numa aba separada de Inconsistências.
+    st.subheader("Inconsistências desta operação (regras de CST do 1096 — Saída)")
+    df_inc_saida = df_inc[(df_inc["tipo_operacao"] == "saida") & (df_inc["status"] != "ajustado")]
+    if df_inc_saida.empty:
+        st.caption("Nenhuma inconsistência pendente de Saída para esta competência.")
+    else:
+        for _, row in df_inc_saida.iterrows():
+            _card_inconsistencia(session, row, csts_disponiveis)
 
 # ---------------------------------------------------------------------------------------------- Entrada
+# A pedido do usuário em 18/08/2026: esta aba mostra só o Relatório 1096 (análise) — o resumo da Rotina 1024
+# (fonte da apuração) saiu daqui, fica só na aba Conferência 1024×1096 e na Apuração.
 with aba_entrada:
-    st.subheader("Resumo por CFOP — Entrada (Rotina 1024, usado na apuração)")
-    st.caption("Soma de todas as filiais do grupo já importadas neste período.")
-    df_cfop_1024_e = resumo_pc.resumo_1024_por_cfop(session, competencia_id, "entrada")
-    st.dataframe(df_cfop_1024_e, use_container_width=True, hide_index=True)
-    if not df_cfop_1024_e.empty and (df_cfop_1024_e["grupo"] == "(sem grupo)").any():
-        st.warning("Há CFOPs de Entrada (Rotina 1024) sem grupo cadastrado (ficam de fora do cálculo) — "
-                   "veja a aba Inconsistências ou cadastre em CFOP/CST.")
+    st.subheader("Resumo por CFOP — Entrada (1096)")
+    df_cfop_e = resumo_pc.resumo_por_cfop(session, competencia_id, "entrada")
+    st.dataframe(df_cfop_e, use_container_width=True, hide_index=True)
 
-    with st.expander("Detalhe do Relatório 1096 (só conferência — não entra na apuração)"):
-        st.subheader("Resumo por CFOP — Entrada (1096)")
-        df_cfop_e = resumo_pc.resumo_por_cfop(session, competencia_id, "entrada")
-        st.dataframe(df_cfop_e, use_container_width=True, hide_index=True)
+    st.subheader("Resumo por CST — Entrada")
+    st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, "entrada"), use_container_width=True,
+                 hide_index=True)
 
-        st.subheader("Resumo por CST — Entrada")
-        st.dataframe(resumo_pc.resumo_por_cst(session, competencia_id, "entrada"), use_container_width=True,
-                     hide_index=True)
+    c1, c2 = st.columns(2)
+    cfop_f = c1.text_input("Filtrar por CFOP", key="cfop_entrada")
+    ncm_f = c2.text_input("Filtrar por prefixo de NCM", key="ncm_entrada")
+    df_itens_e, total_e = resumo_pc.carregar_itens(
+        session, competencia_id, "entrada",
+        cfop_filtro=int(cfop_f) if cfop_f.strip().isdigit() else None,
+        ncm_filtro=ncm_f or None,
+    )
+    if total_e > len(df_itens_e):
+        st.caption(f"Mostrando {len(df_itens_e)} de {total_e} itens — refine o filtro para ver o restante.")
+    st.dataframe(df_itens_e, use_container_width=True, hide_index=True)
 
-        c1, c2 = st.columns(2)
-        cfop_f = c1.text_input("Filtrar por CFOP", key="cfop_entrada")
-        ncm_f = c2.text_input("Filtrar por prefixo de NCM", key="ncm_entrada")
-        df_itens_e, total_e = resumo_pc.carregar_itens(
-            session, competencia_id, "entrada",
-            cfop_filtro=int(cfop_f) if cfop_f.strip().isdigit() else None,
-            ncm_filtro=ncm_f or None,
-        )
-        if total_e > len(df_itens_e):
-            st.caption(f"Mostrando {len(df_itens_e)} de {total_e} itens — refine o filtro para ver o restante.")
-        st.dataframe(df_itens_e, use_container_width=True, hide_index=True)
+    # Pedido do usuário em 18/08/2026: os ajustes de CST identificados na análise do 1096 devem poder ser
+    # registrados aqui mesmo, junto com o detalhe da Entrada, não só numa aba separada de Inconsistências.
+    st.subheader("Inconsistências desta operação (regras de CST do 1096 — Entrada)")
+    df_inc_entrada = df_inc[(df_inc["tipo_operacao"] == "entrada") & (df_inc["status"] != "ajustado")]
+    if df_inc_entrada.empty:
+        st.caption("Nenhuma inconsistência pendente de Entrada para esta competência.")
+    else:
+        for _, row in df_inc_entrada.iterrows():
+            _card_inconsistencia(session, row, csts_disponiveis)
 
 # ---------------------------------------------------------------------------------------------- Ajustes Manuais
 with aba_ajustes:
@@ -375,7 +441,6 @@ with aba_conferencia:
 
 # ---------------------------------------------------------------------------------------------- Inconsistências
 with aba_inconsist:
-    df_inc = resumo_pc.carregar_inconsistencias(session, competencia_id)
     if df_inc.empty:
         st.success("Nenhuma inconsistência registrada.")
     else:
@@ -418,56 +483,8 @@ with aba_inconsist:
             st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
         else:
             st.caption(f"Mostrando {len(df_filtrado)} de {len(df_inc)} inconsistência(s).")
-            csts_disponiveis = session.execute(
-                text("select codigo, descricao from cst_pis_cofins order by codigo")
-            ).mappings().all()
-
             for _, row in df_filtrado.iterrows():
-                with st.container(border=True):
-                    c1, c2 = st.columns([4, 1])
-                    c1.markdown(f"**{row['descricao']}**")
-                    legenda = (
-                        f"Tipo: {row['tipo']} • Operação: {row['tipo_operacao'] or '-'} • "
-                        f"Fonte: {row['fonte']} • Filial: {row['filial']} • Status: {row['status']}"
-                    )
-                    if row["ncm"]:
-                        legenda += f" • NCM: {row['ncm']}"
-                    c1.caption(legenda)
-                    if row["status"] == "ajustado" and pd.notna(row["ultimo_ajuste_cst"]):
-                        obs = f" — {row['ultimo_ajuste_obs']}" if row["ultimo_ajuste_obs"] else ""
-                        cst_atual = int(row["cst"]) if pd.notna(row["cst"]) else "?"
-                        c1.info(
-                            f"Ajuste registrado: CST {cst_atual} → **{int(row['ultimo_ajuste_cst'])}** "
-                            f"em {row['ultimo_ajuste_em']:%d/%m/%Y %H:%M}{obs} "
-                            f"(só histórico — não altera o cálculo nem o item importado)."
-                        )
-                    if row["status"] == "pendente":
-                        if c2.button("Marcar revisado", key=f"rev_{row['id']}"):
-                            resumo_pc.marcar_inconsistencia(session, row["id"], "revisado", usuario_atual())
-                            st.rerun()
-
-                    if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
-                        with st.expander("Ajustar CST (registrar correção para o Winthor)"):
-                            st.caption(
-                                "Isso NÃO recalcula nada nem altera o item importado — fica só como "
-                                "histórico/checklist do que precisa ser corrigido na origem (Winthor)."
-                            )
-                            opcoes_cst = [c["codigo"] for c in csts_disponiveis]
-                            cst_corrigido = st.selectbox(
-                                "CST correto", opcoes_cst,
-                                format_func=lambda cod: f"{cod} — "
-                                                         f"{next((c['descricao'] for c in csts_disponiveis if c['codigo'] == cod), '')}",
-                                key=f"cst_novo_{row['id']}",
-                            )
-                            observacao_ajuste = st.text_input(
-                                "Observação (opcional)", key=f"obs_ajuste_{row['id']}"
-                            )
-                            if st.button("Registrar ajuste", key=f"ajustar_{row['id']}"):
-                                registrar_ajuste_cst(
-                                    session, row["id"], cst_corrigido,
-                                    observacao_ajuste or None, usuario_atual(),
-                                )
-                                st.rerun()
+                _card_inconsistencia(session, row, csts_disponiveis)
 
     st.divider()
     st.subheader("Histórico de ajustes manuais de CST")

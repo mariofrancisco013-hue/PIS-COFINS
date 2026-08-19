@@ -144,6 +144,7 @@ def _somar_cst_isento_por_cfop(session, competencia_id):
         select cfop, sum(valor_contabil) as valor
         from relatorio_pc_itens
         where competencia_id = :cid and tipo_operacao = 'saida' and cst in ({placeholders})
+        group by cfop
     """), params).mappings().all()
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 

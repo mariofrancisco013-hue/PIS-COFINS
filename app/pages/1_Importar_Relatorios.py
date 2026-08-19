@@ -21,11 +21,24 @@ st.caption(
     "aba 'Report', .xlsx — usado só para comparação por CFOP, não entra mais direto na apuração)."
 )
 
+# Módulo (19/08/2026) — importação é a MESMA infraestrutura pros dois regimes (importacao_pc.py e
+# importar_1024_pc.py nunca foram específicos de regime, só aceitam `regime_like`/`modulo` como parâmetro),
+# só precisava de um seletor aqui pra escolher qual regime/competência está recebendo o upload. Lucro
+# Presumido soma só Saída (+ Devolução de Venda) na apuração, mas a IMPORTAÇÃO em si (1024 e 1096) é
+# idêntica nos dois — entrada e saída, todas as filiais — porque o 1096 de entrada ainda serve pra
+# conferência/checagem de CST mesmo não entrando na base do cálculo.
+MODULOS = {
+    "Lucro Real": ("Lucro Real%", "pis_cofins_lucro_real"),
+    "Lucro Presumido": ("Lucro Presumido%", "pis_cofins_lucro_presumido"),
+}
+modulo_nome = st.radio("Módulo", list(MODULOS.keys()), horizontal=True)
+regime_like, modulo = MODULOS[modulo_nome]
+
 session = get_session()
-grupos = importacao_pc.listar_grupos(session)
+grupos = importacao_pc.listar_grupos(session, regime_like=regime_like)
 if not grupos:
-    st.warning("Nenhuma empresa em regime Lucro Real cadastrada ainda. Cadastre/ajuste o regime em "
-               "**Empresas** antes de importar.")
+    st.warning(f"Nenhuma empresa em regime {modulo_nome} cadastrada ainda. Cadastre/ajuste o regime em "
+               f"**Empresas** antes de importar.")
     st.stop()
 
 col1, col2, col3 = st.columns(3)
@@ -36,7 +49,8 @@ grupo = col1.selectbox(
 ano = col2.number_input("Ano", min_value=2020, max_value=2100, value=2026, step=1)
 mes = col3.number_input("Mês", min_value=1, max_value=12, value=7, step=1)
 
-status_filiais, competencia_id = importacao_pc.status_filiais_grupo(session, grupo["cnpj_raiz"], ano, mes)
+status_filiais, competencia_id = importacao_pc.status_filiais_grupo(session, grupo["cnpj_raiz"], ano, mes,
+                                                                      modulo=modulo)
 
 st.markdown("---")
 st.subheader("Status das filiais do grupo neste período")
@@ -81,7 +95,7 @@ with aba_1024:
     if st.button("Importar Rotina 1024", type="primary", disabled=not arq_1024):
         with st.spinner("Lendo PDF..."):
             try:
-                cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes)
+                cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes, modulo=modulo)
                 resultado = importar_1024(session, filial["id"], cid, arq_1024, substituir_1024)
                 st.success(resultado)
                 st.rerun()
@@ -110,7 +124,7 @@ with aba_1096:
     if st.button("Importar Relatório 1096", type="primary", disabled=not (arq_entrada or arq_saida)):
         with st.spinner("Importando..."):
             try:
-                cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes)
+                cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes, modulo=modulo)
                 resultado = importacao_pc.importar_1096(
                     session, filial["id"], cid, arq_entrada, arq_saida, substituir_1096,
                 )

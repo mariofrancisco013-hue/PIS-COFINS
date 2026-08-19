@@ -4,7 +4,7 @@ filial_winthor,razao_social,cnpj,inscricao_estadual,inscricao_municipal,uf,regim
 4,Sodine Atacado Juazeiro,07.342.785/0011-00,06.370.384-0,109.024-9,CE,Lucro Real Trimestral,false
 5,Sodine Atacado Terezina,07.342.785/0012-82,19.471.136-6,,PI,Lucro Real Trimestral,false
 6,Super Supply Matriz,45.141.688/0001-68,07.047561-0,726.827-0,CE,Lucro Real Trimestral,false
-7,Teresina Distribuidora,48.288.160/0001-04,19.725.032-7,,PI,Lucro Presumido,false
+7,Teresina Distribuidora,48.288.160/0001-04,19.725.032-7,,PI,Lucro Presumido,true
 11,Sodine Varejo S. Dumont,07.342.785/0006-34,06.664.378-3,,CE,Lucro Real Trimestral,false
 16,Verde Comercio Matriz,38.119.369/0001-90,06.168895-9,560.728-0,CE,Lucro Real Trimestral,false
 17,Supplex Shopping Eusebio,29.404.299/0002-02,06.936378-1,20.001.732-3,CE,Lucro Presumido,false

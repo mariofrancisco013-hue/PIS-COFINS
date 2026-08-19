@@ -12,6 +12,10 @@ from lib.db import get_session
 from lib.formatacao import rotulo_empresa, formatar_moeda, coluna_moeda
 from lib.status_apuracao_pc import status_competencia
 from lib import importacao_pc, resumo_pc, planilha_pc, lancamentos_manuais_pc as lmpc
+from lib.receitas_financeiras_pc import (
+    TIPOS_RECEITA_FINANCEIRA, carregar_receitas_financeiras, salvar_receitas_financeiras,
+    calcular_pis_cofins as calcular_pis_cofins_financeiras,
+)
 from lib.calculo_pis_cofins_lucro_real import (
     calcular_apuracao_pc, salvar_apuracao_pc, ordenar_linhas_para_exibicao, LAYOUT_LINHAS, ORDEM_SECOES,
     conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
@@ -796,6 +800,35 @@ with aba_ajustes:
         st.success("Saldo anterior salvo.")
         st.rerun()
 
+    st.markdown("---")
+    st.subheader("Receitas Financeiras (linha 3 — alíquota reduzida 0,65%/4%, Lei 8.426/2015)")
+    st.caption(
+        "Débito (soma no que se paga, diferente dos créditos acima) — alíquota bem menor que a cheia usada "
+        "no resto da apuração (1,65%/7,60%). Mesmos 6 subitens da planilha antiga; a base da linha 3 é a "
+        "soma dos 6, calculada de novo toda vez que você clicar em 'Calcular apuração' na aba Apuração — "
+        "salvar aqui só grava os valores, não recalcula a apuração sozinho."
+    )
+    valores_fin_atuais = carregar_receitas_financeiras(session, competencia_id)
+    with st.form("form_receitas_financeiras_pc"):
+        novos_valores = {}
+        for tipo, rotulo in TIPOS_RECEITA_FINANCEIRA.items():
+            novos_valores[tipo] = st.number_input(
+                rotulo, value=float(valores_fin_atuais[tipo]), step=100.0, format="%.2f",
+                key=f"rf_{tipo}",
+            )
+        salvar_fin = st.form_submit_button("💾 Salvar Receitas Financeiras")
+    base_preview = sum((Decimal(str(v)) for v in novos_valores.values()), Decimal("0"))
+    pis_preview, cofins_preview = calcular_pis_cofins_financeiras(base_preview)
+    st.caption(
+        f"Base total: {formatar_moeda(base_preview)} → PIS (0,65%): {formatar_moeda(pis_preview)} • "
+        f"COFINS (4%): {formatar_moeda(cofins_preview)}"
+    )
+    if salvar_fin:
+        salvar_receitas_financeiras(session, competencia_id, novos_valores, usuario_atual())
+        st.success("Receitas Financeiras salvas — clique em 'Calcular apuração' (aba Apuração) para a "
+                    "linha 3 refletir esses valores no resultado final.")
+        st.rerun()
+
 # ---------------------------------------------------------------------------------------------- Apuração
 with aba_apuracao:
     if st.button("🔄 Calcular apuração", type="primary"):
@@ -935,8 +968,8 @@ with aba_apuracao:
             st.warning(
                 f"{n_pendentes_manual} linha(s) desta apuração ainda são manuais/pendentes (valor zerado) — "
                 f"ver 'Pontos em aberto' na metodologia do projeto. Se algum desses valores existir neste "
-                f"período (ex: receita de aluguel recebido, energia elétrica, receitas financeiras), "
-                f"considere isso ao ler o resultado final."
+                f"período (ex: receita de aluguel recebido, ICMS Substituição, Exportação, IPI), considere "
+                f"isso ao ler o resultado final."
             )
 
 # ---------------------------------------------------------------------------------------------- Conferência

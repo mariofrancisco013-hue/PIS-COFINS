@@ -26,9 +26,14 @@ Técnica de CFOP), a mesma lógica usada em app/lib/calculo_icms_pe.py do módul
 NOTA (18/08/2026): entre 14 e 18/08 esta versão chegou a excluir também a coluna "Isentas/Não Tributadas" da
 base (5ª coluna numérica da linha, ao lado do ICMS) — tentativa de bater a Conferência 1024×1096 quando
 apareceu divergência. O usuário decidiu reverter essa exclusão em 18/08/2026 ("não é necessária"); a base
-voltou a ser só Valor Contábil − ICMS destacado. O parser ainda precisa casar as 6 colunas numéricas da
-linha do PDF (senão o regex não bate), mas "Isentas/Não Tributadas" e "Outras" não são mais gravadas nem
-usadas em lugar nenhum.
+voltou a ser só Valor Contábil − ICMS destacado.
+
+NOTA (19/08/2026): a coluna "Outras" (6ª e última coluna numérica da linha) volta a ser capturada e gravada
+(`valor_outras`, migração `sql/007_exclusoes_e_receitas_financeiras_pc.sql`) — pedido do usuário para
+excluí-la da base junto com o ICMS (ver `calculo_pis_cofins_lucro_real.calcular_apuracao_pc`, linhas "2.5"/
+"6.7"). "Isentas/Não Tributadas" (5ª coluna) continua descartada — só essa foi revertida em 18/08. O regex
+sempre precisou casar as 6 colunas numéricas da linha (senão não bate), então capturar a 6ª é só adicionar
+parênteses em volta dela, sem mudar o que o regex reconhece.
 """
 import re
 from decimal import Decimal
@@ -37,7 +42,7 @@ import pdfplumber
 from sqlalchemy import text
 
 _LINHA_CFOP_RE = re.compile(
-    r"^\d+\s+(\d{4})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+[\d.]+,\d{2}\s+[\d.]+,\d{2}$"
+    r"^\d+\s+(\d{4})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+[\d.]+,\d{2}\s+([\d.]+,\d{2})$"
 )
 
 
@@ -56,9 +61,9 @@ def _tipo_operacao(cfop: int) -> str:
 
 def parse_rotina_1024(arquivo) -> list[dict]:
     """`arquivo` é um caminho ou um buffer tipo st.file_uploader (PDF do RAICMS Modelo P9). Devolve uma
-    lista de dicts {cfop, tipo_operacao, valor_contabil, valor_base_icms, valor_icms} — um por CFOP
-    encontrado nas seções de Entradas e Saídas (ignora linhas de "Sub Totais"/"Totais"). Lança ValueError se
-    nenhuma linha reconhecível for encontrada (arquivo no layout errado)."""
+    lista de dicts {cfop, tipo_operacao, valor_contabil, valor_base_icms, valor_icms, valor_outras} — um por
+    CFOP encontrado nas seções de Entradas e Saídas (ignora linhas de "Sub Totais"/"Totais"). Lança
+    ValueError se nenhuma linha reconhecível for encontrada (arquivo no layout errado)."""
     resultado = []
     with pdfplumber.open(arquivo) as pdf:
         for page in pdf.pages:
@@ -76,6 +81,7 @@ def parse_rotina_1024(arquivo) -> list[dict]:
                     "valor_contabil": _para_decimal(m.group(2)),
                     "valor_base_icms": _para_decimal(m.group(3)),
                     "valor_icms": _para_decimal(m.group(4)),
+                    "valor_outras": _para_decimal(m.group(5)),
                 })
     if not resultado:
         raise ValueError(
@@ -120,15 +126,17 @@ def importar_1024(session, empresa_id, competencia_id, arquivo_pdf, substituir=F
     for l in linhas:
         session.execute(text("""
             insert into resumo_1024_pc
-                (competencia_id, empresa_id, tipo_operacao, cfop, valor_contabil, valor_base_icms, valor_icms)
-            values (:cid, :eid, :tipo, :cfop, :vc, :vb, :vi)
+                (competencia_id, empresa_id, tipo_operacao, cfop, valor_contabil, valor_base_icms, valor_icms,
+                 valor_outras)
+            values (:cid, :eid, :tipo, :cfop, :vc, :vb, :vi, :vo)
             on conflict (competencia_id, empresa_id, cfop) do update
                 set tipo_operacao = excluded.tipo_operacao, valor_contabil = excluded.valor_contabil,
                     valor_base_icms = excluded.valor_base_icms, valor_icms = excluded.valor_icms,
-                    importado_em = now()
+                    valor_outras = excluded.valor_outras, importado_em = now()
         """), {
             "cid": competencia_id, "eid": empresa_id, "tipo": l["tipo_operacao"], "cfop": l["cfop"],
             "vc": str(l["valor_contabil"]), "vb": str(l["valor_base_icms"]), "vi": str(l["valor_icms"]),
+            "vo": str(l["valor_outras"]),
         })
 
     cfops_ruins = session.execute(text("""

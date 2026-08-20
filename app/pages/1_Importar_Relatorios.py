@@ -9,10 +9,12 @@ from lib.db import get_session
 from lib.formatacao import rotulo_empresa
 from lib import importacao_pc
 from lib.importar_1024_pc import importar_1024
+from lib.theme_sodine import inject_main_theme
 
 st.set_page_config(page_title="Importar Relatórios", layout="wide")
 require_login()
 logout_button()
+inject_main_theme()
 st.title("Importar Relatórios — PIS/COFINS")
 st.caption(
     "A apuração é feita por **grupo** (CNPJ raiz — matriz + filiais consolidadas). Para cada filial do "

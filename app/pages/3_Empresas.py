@@ -8,10 +8,12 @@ from lib.db import get_session
 from lib.formatacao import rotulo_empresa
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from lib.theme_sodine import inject_main_theme
 
 st.set_page_config(page_title="Empresas", layout="wide")
 require_login()
 logout_button()
+inject_main_theme()
 st.title("Empresas do Grupo")
 st.caption(
     "Mesmo cadastro do módulo ICMS. O campo **Regime** decide qual módulo de PIS/COFINS se aplica a cada "

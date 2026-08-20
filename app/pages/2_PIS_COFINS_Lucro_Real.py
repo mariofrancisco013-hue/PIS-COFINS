@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from lib.auth import require_login, logout_button, usuario_atual
 from lib.db import get_session
+from lib import theme_sodine
 from lib.formatacao import rotulo_empresa, formatar_moeda, coluna_moeda
 from lib.status_apuracao_pc import status_competencia
 from lib import importacao_pc, resumo_pc, planilha_pc, lancamentos_manuais_pc as lmpc
@@ -677,6 +678,7 @@ def _aba_cfops_sem_checagem(session, filiais_grupo):
 st.set_page_config(page_title="PIS/COFINS Lucro Real", layout="wide")
 require_login()
 logout_button()
+theme_sodine.inject_main_theme()
 st.title("PIS/COFINS — Lucro Real")
 
 session = get_session()

@@ -5,12 +5,16 @@ Login via Supabase Auth. Único ponto do app que depende do Supabase especificam
 Todos os usuários autenticados têm o mesmo nível de acesso (decisão do usuário em 05/08/2026) — este
 módulo só garante que existe uma sessão válida, não faz controle de permissão por papel/role.
 
-Tela de login com a mesma identidade visual do projeto "Agente de Retenções NFS-e" (pedido do usuário em
-10/08/2026) — fundo azul-marinho em gradiente, logo do grupo (Sodine/Super Supply/Ultra Supply/Verde) e
-botão "Entrar" em azul, cores extraídas por pixel do print da tela original pra ficar o mais parecido
-possível. As cores do arquivo .streamlit/config.toml (tema claro, usado no resto do app já logado) são as
-mesmas do outro projeto, mas essa tela de login usa um fundo escuro à parte, via CSS injetado abaixo — não
-dá pra fazer isso só com o config.toml porque ele não suporta gradiente nem estilizar uma tela específica.
+Tela de login — fundo azul-marinho em gradiente, logo do grupo (Sodine/Super Supply/Ultra Supply/Verde) e
+botão "Entrar" em azul, via CSS injetado abaixo (config.toml não suporta gradiente nem estilizar uma tela
+específica). Originalmente (10/08/2026) as cores foram extraídas por pixel do print da tela do projeto
+"Agente de Retenções NFS-e", pra manter a mesma identidade visual entre os dois apps.
+
+Atualizado em 20/08/2026: gradiente e cor de destaque trocados para a paleta "Sodine" do mockup HTML/
+Tailwind enviado pelo usuário (pedido "ajustar a identidade visual com base nesse código e html") —
+sodine.900 (#0B2545) → sodine.800 (#134074), no lugar do azul-marinho antigo (#1E2D59 → #1E3D68). Só os
+valores de cor mudaram; a estrutura do CSS (gradiente, campos, botão) é a mesma já validada antes. Ver
+app/lib/theme_sodine.py pra paleta completa (usada no restante do app, fora da tela de login/sidebar).
 
 Diferença proposital em relação ao original: os botões "Criar conta" e "Esqueci minha senha" não foram
 replicados aqui porque esse app não tem esses dois fluxos implementados (só login com e-mail/senha já
@@ -38,7 +42,7 @@ _LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "logos_grupo.pn
 _CSS_SIDEBAR = """
 <style>
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #1E2D59 0%, #1E3D68 100%);
+    background: linear-gradient(180deg, #0B2545 0%, #134074 100%);
 }
 [data-testid="stSidebarHeader"] { padding-bottom: 0; }
 [data-testid="stSidebarLogo"] { padding: 0.5rem 0 0.5rem 0.25rem; }
@@ -53,7 +57,7 @@ _CSS_SIDEBAR = """
 [data-testid="stSidebarNavLink"]:hover { background-color: rgba(255, 255, 255, 0.08); }
 /* página atual (o próprio Streamlit marca com aria-current="page") */
 [data-testid="stSidebarNavLink"][aria-current="page"] {
-    background-color: rgba(59, 130, 246, 0.25);
+    background-color: rgba(37, 99, 235, 0.28);
 }
 [data-testid="stSidebarNavLink"][aria-current="page"] span,
 [data-testid="stSidebarNavLink"][aria-current="page"] p {
@@ -66,7 +70,7 @@ _CSS_SIDEBAR = """
 [data-testid="stSidebarUserContent"] a { color: #7FB2F0; }
 .sidebar-user { display: flex; align-items: center; gap: 0.5rem; margin: 0.4rem 0 0.9rem 0; }
 .sidebar-user-avatar {
-    width: 2rem; height: 2rem; border-radius: 50%; background-color: #2DD4BF; color: #0B1E3D;
+    width: 2rem; height: 2rem; border-radius: 50%; background-color: #10B981; color: #0B2545;
     font-weight: 700; font-size: 0.9rem; display: flex; align-items: center; justify-content: center;
     flex-shrink: 0;
 }
@@ -87,7 +91,7 @@ _CSS_LOGIN = """
 /* sem menu lateral na tela de login — só aparece depois de autenticado */
 [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none; }
 [data-testid="stAppViewContainer"] {
-    background: linear-gradient(160deg, #1E2D59 0%, #1E3D68 100%);
+    background: linear-gradient(160deg, #0B2545 0%, #134074 100%);
 }
 /* centralizado de verdade: bloco comum (não-flex) com largura travada e margin:auto — sem o truque de
    st.columns() (deixava puxado pra direita) e sem display:flex no container todo (isso bagunçava a
@@ -120,12 +124,12 @@ _CSS_LOGIN = """
 div[data-testid="stForm"] button[kind="primaryFormSubmit"],
 div[data-testid="stForm"] button[kind="primary"],
 button[kind="primary"] {
-    background-color: #3B82F6 !important; border-color: #3B82F6 !important; color: #FFFFFF !important;
+    background-color: #2563EB !important; border-color: #2563EB !important; color: #FFFFFF !important;
 }
 div[data-testid="stForm"] button[kind="primaryFormSubmit"]:hover,
 div[data-testid="stForm"] button[kind="primary"]:hover,
 button[kind="primary"]:hover {
-    background-color: #2563EB !important; border-color: #2563EB !important;
+    background-color: #1D4ED8 !important; border-color: #1D4ED8 !important;
 }
 </style>
 """

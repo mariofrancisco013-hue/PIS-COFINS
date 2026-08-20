@@ -6,10 +6,12 @@ import streamlit as st
 from lib.auth import require_login, logout_button
 from lib.db import get_session
 from sqlalchemy import text
+from lib.theme_sodine import inject_main_theme
 
 st.set_page_config(page_title="CFOP/CST — PIS/COFINS", layout="wide")
 require_login()
 logout_button()
+inject_main_theme()
 st.title("CFOP × CST — Referência (PIS/COFINS)")
 
 session = get_session()

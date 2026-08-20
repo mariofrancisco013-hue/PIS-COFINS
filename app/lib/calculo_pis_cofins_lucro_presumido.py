@@ -378,8 +378,14 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
     # padrão de como a planilha antiga tratava essa linha (soma a mais só entre a Contribuição Apurada e o
     # Saldo Final). Alíquotas vêm por NCM da tabela (podem diferir NCM a NCM, embora hoje todos os
     # cadastrados usem a mesma: PIS 0,0650% / COFINS 0,30% — 1/10 da alíquota cheia do Presumido).
+    # ESCOPO RESTRITO A "1.1" (Faturamento Bruto) desde a sessão de continuação de 20/08/2026 — pedido do
+    # usuário ("somente CFOPs de venda"): "1.4" (Outras Saídas) inclui 3 CFOPs (5202, 6202, 5411) que a aba
+    # CONTABIL da planilha antiga rotula como devolução de compra, não venda de fato — não fazia sentido
+    # cobrar a incidência residual da LC 224/2025 sobre uma devolução. As linhas 2.1/2.3 (isentos/ICMS)
+    # continuam escopadas em 1.1|1.4 normalmente — só o 3.1 mudou, porque é a única linha que representa uma
+    # incidência tributária nova, não uma exclusão de base já existente.
     base_lc224, pis_lc224_bruto, cofins_lc224_bruto, detalhe_lc224_ncm = _calcular_lc224_escopado(
-        CFOPS_1_1 | CFOPS_1_4
+        CFOPS_1_1
     )
     pis_lc224 = _arred(pis_lc224_bruto) if base_lc224 > 0 else Decimal("0")
     cofins_lc224 = _arred(cofins_lc224_bruto) if base_lc224 > 0 else Decimal("0")
@@ -391,8 +397,10 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
             "nota": "Base = Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (já dentro da "
                     "exclusão '2.1') cujo NCM está cadastrado em ncms_lc224_pc (tabela editável no Supabase "
                     "desde 20/08/2026 — sql/009_ncms_lc224_pc.sql, substituiu a lista fixa que estava no "
-                    "código). Só conta CFOPs ativos na Rotina 1024 desta competência dentro de 1.1/1.4 "
-                    "(mesmo escopo das demais linhas 2.x/3.1).",
+                    "código). Só conta CFOPs ativos na Rotina 1024 desta competência dentro de \"1.1 — "
+                    "Faturamento Bruto\" (CORRIGIDO na sessão de continuação de 20/08/2026 — pedido do "
+                    "usuário: 'somente CFOPs de venda'; antes incluía também '1.4 Outras Saídas', que tem "
+                    "CFOPs de devolução de compra, não venda).",
             "base_por_ncm": {k: str(v) for k, v in detalhe_lc224_ncm.items()},
         },
     ))

@@ -499,10 +499,15 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     # de débito; é somado só no final (debito_pis_total/debito_cofins_total), do mesmo jeito que Receitas
     # Financeiras (linha "3") acima. Alíquotas vêm por NCM da tabela (hoje todas iguais: PIS 0,165% / COFINS
     # 0,76% — 1/10 da alíquota cheia do regime não-cumulativo).
+    # ESCOPO RESTRITO A "1.1" (Faturamento Bruto) desde a sessão de continuação de 20/08/2026 — pedido do
+    # usuário ("somente CFOPs de venda"), mesmo ajuste feito no Presumido (linha "3.1"): o escopo antigo
+    # (`grupo in GRUPOS_DEBITO`) cobria TODOS os grupos de débito, inclusive "1.2 Devolução de Mercadoria de
+    # Compra" e "1.4 Outras Saídas" (que tem CFOPs de devolução de compra, não venda de fato) — não fazia
+    # sentido cobrar a incidência residual da LC 224/2025 sobre uma devolução.
     ncms_lc224_lookup = _carregar_ncms_lc224(session)
     itens_lc224 = _somar_lc224_saida_por_cfop_ncm(session, competencia_id)
     cfops_debito_ativos = {
-        r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["grupo"] in GRUPOS_DEBITO
+        r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["grupo"] == "1.1"
     }
     base_lc224 = Decimal("0")
     pis_lc224 = Decimal("0")
@@ -532,8 +537,10 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
             "nota": "Base = Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (já dentro da "
                     "exclusão '2.7') cujo NCM está cadastrado em ncms_lc224_pc (tabela editável no Supabase "
                     "desde 20/08/2026 — sql/009_ncms_lc224_pc.sql, substituiu a lista fixa que estava no "
-                    "código). Só conta CFOPs ativos na Rotina 1024 desta competência dentro dos grupos de "
-                    "débito (1.1/1.2/1.4/1.6), mesmo escopo de 2.3/2.7.",
+                    "código). Só conta CFOPs ativos na Rotina 1024 desta competência dentro do grupo "
+                    "\"1.1 — Faturamento Bruto\" (CORRIGIDO na sessão de continuação de 20/08/2026 — pedido "
+                    "do usuário: 'somente CFOPs de venda'; antes cobria todos os grupos de débito "
+                    "1.1/1.2/1.4/1.6, inclusive devolução de compra).",
             "base_por_ncm": {k: str(v) for k, v in detalhe_lc224_ncm.items()},
         },
     ))

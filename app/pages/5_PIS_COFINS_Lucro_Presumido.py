@@ -6,8 +6,8 @@ distingue os dois desde o schema inicial (14/08/2026). O motor de cálculo está
 `lib/calculo_pis_cofins_lucro_presumido.py` — leia a docstring de lá antes de mexer aqui (ela documenta as
 diferenças de metodologia em relação ao Lucro Real e os pontos em aberto).
 
-Escopo inicial (19/08/2026): só Apuração + Conferência 1024×1096. Sem "Ajustes Manuais"/grade editável do
-Relatório 1096 — extensível depois, seguindo o mesmo padrão de arquivos.
+Escopo inicial (19/08/2026): só Apuração + Conferência 1024×1096 — extensível depois, seguindo o mesmo
+padrão de arquivos.
 
 REGRAS DE CST / CFOPS SEM CHECAGEM / INCONSISTÊNCIAS (20/08/2026): as 3 tabelas de regra (`cst_regra_cfop_
 pc`, `cst_regra_ncm_pc`, `cst_regra_alerta_pc`, migração `sql/004_regras_cst_pc.sql`) e a checagem
@@ -21,9 +21,16 @@ lá é específica de regime) e `lib/resumo_pc.py`/`lib/planilha_pc.LABELS_INCON
 (`_card_inconsistencia`, `_resumo_por_tipo`, `_mostrar_resumo_por_tipo`, `_aba_regras_cst`,
 `_aba_cfops_sem_checagem`) são cópias adaptadas das mesmas funções em `2_PIS_COFINS_Lucro_Real.py` — o
 Lucro Real NÃO foi tocado nesta mudança (arquivo em produção, já validado; risco desnecessário refatorar
-pra extrair um módulo compartilhado só por causa desta adição). Continua fora do escopo aqui: a grade
-editável (Entrada/Saída) do Relatório 1096 — não foi pedida, e as inconsistências continuam visíveis/
-gerenciáveis pela aba ⚠️ Inconsistências sem precisar dela.
+pra extrair um módulo compartilhado só por causa desta adição).
+
+GRADE EDITÁVEL ENTRADA/SAÍDA (sessão de continuação, 20/08/2026): pedido do usuário ("ainda não colocou a
+aba para que eu valide as inconsistencias da 1096", esclarecido como a grade item a item do Relatório 1096,
+que só o Lucro Real tinha até aqui). Abas 📥 Entrada / 📤 Saída, cópia adaptada de
+`2_PIS_COFINS_Lucro_Real.py::_aba_planilha_pc` — `lib/planilha_pc.py` já é 100% regime-agnóstico, não
+precisou de nenhuma mudança de backend. Confirmado com o usuário: na direção Entrada, só a Devolução de
+Venda (linha "1.2") é relevante para este regime cumulativo (sem crédito de entrada) — é normal a grade só
+trazer os CFOPs 1202/1411/2202/2411/3202; na direção Saída, a grade traz TODOS os CFOPs do Relatório 1096,
+sem restringir aos grupos "1.1"/"1.4" da apuração (mesmo comportamento do Lucro Real).
 """
 import sys
 from pathlib import Path
@@ -108,6 +115,47 @@ def _cache_excecoes(_session, empresa_ids):
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
 def _cache_historico_ajustes(_session, competencia_id):
     return [dict(r) for r in carregar_historico_ajustes(_session, competencia_id)]
+
+
+# Novos em 20/08/2026 (sessão de continuação — pedido do usuário: "ainda não colocou a aba para que eu
+# valide as inconsistencias da 1096" → esclarecido que faltava especificamente a grade editável Entrada/
+# Saída, não a aba ⚠️ Inconsistências consolidada, que já existia). Mesmas funções (mesmo nome/assinatura) de
+# `2_PIS_COFINS_Lucro_Real.py` — `lib/planilha_pc.py` e `lib/resumo_pc.py` já são 100% regime-agnósticos
+# (só dependem de competencia_id/tipo_operacao/empresa_ids), não precisaram de nenhuma mudança.
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_resumo_1024_por_cfop(_session, competencia_id, tipo_operacao):
+    return resumo_pc.resumo_1024_por_cfop(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_resumo_por_cfop(_session, competencia_id, tipo_operacao):
+    return resumo_pc.resumo_por_cfop(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_resumo_por_cst(_session, competencia_id, tipo_operacao):
+    return resumo_pc.resumo_por_cst(_session, competencia_id, tipo_operacao)
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_itens_editavel(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
+                           busca, tipos_inc, limite):
+    return planilha_pc.carregar_itens_editavel(
+        _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro, busca, tipos_inc,
+        limite,
+    )
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_totalizador(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro):
+    return planilha_pc.carregar_totalizador(
+        _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
+    )
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_historico_edicoes(_session, competencia_id, tipo_operacao):
+    return planilha_pc.carregar_historico_edicoes(_session, competencia_id, tipo_operacao)
 
 
 def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id=None):
@@ -277,6 +325,240 @@ def _mostrar_resumo_por_tipo(df, key_prefix):
             "pendentes": st.column_config.NumberColumn("Pendentes"),
         },
     )
+
+
+def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix,
+                                     competencia_id=None):
+    """Cópia de `2_PIS_COFINS_Lucro_Real.py::_secao_inconsistencias_operacao` — bloco de inconsistências +
+    ajuste de CST, filtrado por operação (saida/entrada), usado nas abas Entrada/Saída (20/08/2026, sessão
+    de continuação)."""
+    df_op = df_inc[df_inc["tipo_operacao"] == tipo_operacao]
+    if df_op.empty:
+        st.caption("Nenhuma inconsistência registrada para esta operação nesta competência.")
+        return
+
+    f1, f2, f3 = st.columns(3)
+    status_disp = sorted(df_op["status"].unique())
+    default_status = [s for s in status_disp if s != "ajustado"] or status_disp
+    f_status = f1.multiselect("Status", status_disp, default=default_status, key=f"{key_prefix}_f_status")
+    tipo_disp = sorted(df_op["tipo"].unique())
+    f_tipo = f2.multiselect("Tipo", tipo_disp, default=tipo_disp, key=f"{key_prefix}_f_tipo")
+    filial_disp = sorted(df_op["filial"].unique())
+    f_filial = f3.multiselect("Filial", filial_disp, default=filial_disp, key=f"{key_prefix}_f_filial")
+
+    df_filtrado = df_op[
+        df_op["status"].isin(f_status) & df_op["tipo"].isin(f_tipo) & df_op["filial"].isin(f_filial)
+    ]
+    if df_filtrado.empty:
+        st.info("Nenhuma inconsistência corresponde aos filtros selecionados.")
+        return
+    st.caption(f"Mostrando {len(df_filtrado)} de {len(df_op)} inconsistência(s) desta operação.")
+    _mostrar_resumo_por_tipo(df_filtrado, key_prefix)
+    st.divider()
+    for _, row in df_filtrado.iterrows():
+        _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id)
+
+
+def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc, csts_disponiveis):
+    """Cópia adaptada de `2_PIS_COFINS_Lucro_Real.py::_aba_planilha_pc` (20/08/2026, sessão de continuação —
+    pedido do usuário: "ainda não colocou a aba para que eu valide as inconsistencias da 1096", esclarecido
+    como a grade editável Entrada/Saída, que o Presumido nunca teve). `lib/planilha_pc.py` já é 100%
+    regime-agnóstico (só filtra por competencia_id/tipo_operacao/empresa_ids) — nenhuma mudança de backend
+    foi necessária, só esta função de UI (cópia, não extraída para módulo compartilhado — mesma decisão de
+    arquitetura já tomada para `_card_inconsistencia`/`_aba_regras_cst`/`_aba_cfops_sem_checagem`: não tocar
+    `2_PIS_COFINS_Lucro_Real.py`, arquivo em produção já validado).
+
+    NOTA ESPECÍFICA DO PRESUMIDO (confirmada com o usuário): na direção **Entrada**, a única movimentação que
+    entra na apuração deste regime é a Devolução de Venda (linha "1.2", CFOPs 1202/1411/2202/2411/3202 — ver
+    `CFOPS_1_2_DEVOLUCAO_VENDA` em `calculo_pis_cofins_lucro_presumido.py`) — não há crédito de entrada
+    (regime cumulativo). Na direção **Saída**, a grade mostra TODOS os CFOPs que aparecem no Relatório 1096,
+    sem restringir aos grupos "1.1"/"1.4" da apuração — mesmo comportamento já usado no Lucro Real (a grade
+    é sobre o 1096, que pode ter CFOPs fora dos grupos classificados, e a conferência/inconsistência precisa
+    enxergar todos eles, não só os que a apuração usa).
+
+    AVISO CRÍTICO, mostrado também na tela: editar aqui NUNCA muda a Apuração (que roda 100% sobre a Rotina
+    1024) — só recalcula as inconsistências de CST × CFOP/NCM e a Conferência 1024×1096. Ver docstring de
+    lib/planilha_pc.py para o raciocínio completo."""
+    st.info(
+        "⚠️ Esta grade edita o **Relatório 1096** (conferência) — os valores da **Apuração** (linhas "
+        "1.x-7.3, aba Apuração) continuam vindo 100% da **Rotina 1024** e NÃO mudam com uma edição aqui. "
+        "O que muda ao salvar: as ⚠️ Inconsistências de CST × CFOP/NCM desta filial são recalculadas na hora, "
+        "e a Conferência 1024×1096 reflete o novo valor na próxima vez que você abrir aquela aba."
+    )
+    if tipo_operacao == "entrada":
+        st.caption(
+            "Neste regime (cumulativo), só a Devolução de Venda (linha \"1.2\") vem do lado Entrada — não "
+            "há crédito de entrada. É normal esta grade só ter itens dos CFOPs 1202/1411/2202/2411/3202."
+        )
+    else:
+        st.caption(
+            "Ajuste diretamente na grade (igual planilha) se algum código de produto, NCM, CFOP ou valor "
+            "estiver errado no relatório original. O CST não é editável aqui de propósito — use os cards de "
+            "'Inconsistências desta operação', mais abaixo, ou a aba ⚠️ Inconsistências (fluxo com "
+            "justificativa/histórico dedicado para CST)."
+        )
+
+    visao = st.radio(
+        "Visão", ["Analítica (item a item)", "Sintética (totalizada por Filial, Produto e CST)"],
+        horizontal=True, key=f"pres_visao_{tipo_operacao}",
+    )
+    sintetica = visao.startswith("Sintética")
+
+    c1, c_ncm, c2, c3 = st.columns([2, 2, 3, 2])
+    resumo_1096_cfop = _cache_resumo_por_cfop(session, competencia_id, tipo_operacao)
+    cfops_disponiveis = (["(todos)"] + sorted(resumo_1096_cfop["cfop"].tolist())) if not resumo_1096_cfop.empty else ["(todos)"]
+    cfop_sel = c1.selectbox("Filtrar por CFOP", cfops_disponiveis, key=f"pres_cfop_{tipo_operacao}")
+    cfop_filtro = None if cfop_sel == "(todos)" else int(cfop_sel)
+    ncm_filtro = c_ncm.text_input(
+        "Filtrar por NCM", key=f"pres_ncm_{tipo_operacao}", placeholder="ex: 8213 ou 82130000",
+        help="Filtra por prefixo — '8213' pega qualquer NCM que comece com 8213, não só o código exato.",
+    )
+
+    if sintetica:
+        limite = c3.number_input("Máx. linhas na tela", min_value=50, max_value=5000, value=500, step=50,
+                                  key=f"pres_limite_{tipo_operacao}")
+        tot = _cache_totalizador(session, competencia_id, tipo_operacao, empresa_ids,
+                                  cfop_filtro, ncm_filtro or None)
+        st.caption(f"{len(tot)} combinação(ões) de Filial + Produto + CST"
+                   f"{' para este CFOP/NCM' if (cfop_filtro or ncm_filtro) else ''}.")
+        st.dataframe(
+            tot.head(limite), use_container_width=True, height=420, hide_index=True,
+            column_config={
+                "filial": st.column_config.TextColumn("Filial"),
+                "produto_codigo": st.column_config.TextColumn("Código Produto"),
+                "cst": st.column_config.NumberColumn("CST"),
+                "n_itens": st.column_config.NumberColumn("Nº itens"),
+                "valor_contabil": st.column_config.NumberColumn("Valor Contábil", format="R$ %.2f"),
+                "valor_tributado": st.column_config.NumberColumn("Valor Tributado", format="R$ %.2f"),
+                "valor_pis": st.column_config.NumberColumn("Valor PIS", format="R$ %.2f"),
+                "valor_cofins": st.column_config.NumberColumn("Valor COFINS", format="R$ %.2f"),
+            },
+        )
+    else:
+        busca = c2.text_input("Buscar por código do produto", key=f"pres_busca_{tipo_operacao}",
+                               help="Nem o 1096 nem a Rotina 1024 trazem número de NF ou nome do "
+                                    "fornecedor/cliente — a busca aqui é só pelo código do produto.")
+        limite = c3.number_input("Máx. linhas na tela", min_value=50, max_value=5000, value=500, step=50,
+                                  key=f"pres_limite_{tipo_operacao}")
+        tipos_inc_sel = st.multiselect(
+            "⚠️ Filtrar por tipo de inconsistência pendente",
+            options=list(planilha_pc.LABELS_INCONSISTENCIA.keys()),
+            format_func=lambda t: planilha_pc.LABELS_INCONSISTENCIA[t],
+            key=f"pres_tipos_inc_{tipo_operacao}",
+            help="Deixe vazio para mostrar todos os itens. Escolha um ou mais tipos para ver só os itens "
+                 "com aquele erro específico pendente.",
+        )
+
+        df, total = _cache_itens_editavel(
+            session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro or None,
+            busca or None, tipos_inc_sel or None, limite,
+        )
+
+        if total > len(df):
+            st.warning(f"Mostrando {len(df)} de {total} itens (refine o filtro ou aumente o limite acima — "
+                       f"grades muito grandes deixam o navegador lento).")
+        else:
+            st.caption(f"{total} itens.")
+
+        editado = st.data_editor(
+            df, use_container_width=True, height=420, num_rows="fixed", key=f"pres_editor_pc_{tipo_operacao}",
+            column_order=["id", "filial", "inconsistencia", "produto_codigo", "ncm", "cst", "cfop",
+                          "quantidade", "valor_contabil", "valor_desconto", "valor_itens", "valor_tributado",
+                          "aliq_pis", "valor_pis", "aliq_cofins", "valor_cofins", "valor_nao_tributado"],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "empresa_id": st.column_config.NumberColumn("Empresa ID", disabled=True),
+                "filial": st.column_config.TextColumn("Filial", disabled=True),
+                "inconsistencia": st.column_config.TextColumn(
+                    "⚠️ Inconsistência", disabled=True, width="medium",
+                    help="Sinaliza inconsistência(s) PENDENTE(s) de CST × CFOP/NCM ligada(s) a este item. Em "
+                         "branco não é garantia de que está tudo certo — só que nenhuma das checagens "
+                         "automáticas pegou nada nesta linha. Descrição completa e opção de "
+                         "revisar/ignorar/replicar: seção 'Inconsistências desta operação', mais abaixo."
+                ),
+                "cst": st.column_config.NumberColumn(
+                    "CST", disabled=True,
+                    help="Não editável aqui — use os cards de 'Inconsistências desta operação' (mais "
+                         "abaixo) ou a aba ⚠️ Inconsistências para corrigir CST, com histórico dedicado."
+                ),
+                "produto_codigo": st.column_config.TextColumn("Código Produto"),
+                "ncm": st.column_config.TextColumn("NCM"),
+                "cfop": st.column_config.NumberColumn("CFOP"),
+                "quantidade": st.column_config.NumberColumn("Quantidade", format="%.3f"),
+                "valor_contabil": st.column_config.NumberColumn("Valor Contábil", format="R$ %.2f"),
+                "valor_desconto": st.column_config.NumberColumn("Valor Desconto", format="R$ %.2f"),
+                "valor_itens": st.column_config.NumberColumn("Valor Itens", format="R$ %.2f"),
+                "valor_tributado": st.column_config.NumberColumn("Valor Tributado", format="R$ %.2f"),
+                "aliq_pis": st.column_config.NumberColumn("Alíq. PIS %", format="%.4f"),
+                "valor_pis": st.column_config.NumberColumn("Valor PIS", format="R$ %.2f"),
+                "aliq_cofins": st.column_config.NumberColumn("Alíq. COFINS %", format="%.4f"),
+                "valor_cofins": st.column_config.NumberColumn("Valor COFINS", format="R$ %.2f"),
+                "valor_nao_tributado": st.column_config.NumberColumn("Valor Não Tributado", format="R$ %.2f"),
+            },
+        )
+        if st.button("💾 Salvar alterações", key=f"pres_salvar_pc_{tipo_operacao}"):
+            n, empresas_afetadas = planilha_pc.salvar_itens_editados(
+                session, df, editado, competencia_id=competencia_id, tipo_operacao=tipo_operacao,
+                usuario=usuario_atual(),
+            )
+            if n:
+                with st.spinner("Recalculando inconsistências..."):
+                    planilha_pc.recalcular_inconsistencias_apos_edicao(session, competencia_id, empresas_afetadas)
+                _cache_itens_editavel.clear()
+                _cache_totalizador.clear()
+                _cache_resumo_por_cfop.clear()
+                _cache_resumo_por_cst.clear()
+                _cache_historico_edicoes.clear()
+                _cache_inconsistencias.clear()
+                st.success(
+                    f"{n} linha(s) atualizada(s), {len(empresas_afetadas)} filial(is) recalculada(s) — o "
+                    f"que foi corrigido já some da coluna ⚠️ Inconsistência aqui na grade e da aba "
+                    f"Inconsistências. A Apuração (Rotina 1024) não foi alterada."
+                )
+            else:
+                st.info("Nenhuma mudança detectada.")
+            st.rerun()
+
+    with st.expander("📝 Histórico de edições desta grade (mais recentes primeiro)"):
+        hist = _cache_historico_edicoes(session, competencia_id, tipo_operacao)
+        if hist.empty:
+            st.caption("Nenhuma edição registrada ainda nesta grade, para esta competência.")
+        else:
+            st.dataframe(
+                hist, use_container_width=True, height=300, hide_index=True,
+                column_order=["item_id", "produto_codigo", "cfop", "campo", "valor_anterior", "valor_novo",
+                              "editado_por_email", "editado_em"],
+                column_config={
+                    "item_id": st.column_config.NumberColumn("ID Item"),
+                    "produto_codigo": st.column_config.TextColumn("Código Produto"),
+                    "cfop": st.column_config.NumberColumn("CFOP"),
+                    "campo": st.column_config.TextColumn("Campo alterado"),
+                    "valor_anterior": st.column_config.TextColumn("Valor anterior"),
+                    "valor_novo": st.column_config.TextColumn("Valor novo"),
+                    "editado_por_email": st.column_config.TextColumn("Editado por"),
+                    "editado_em": st.column_config.DatetimeColumn("Quando", format="DD/MM/YYYY HH:mm"),
+                },
+            )
+
+    st.markdown("---")
+    c_res1, c_res2 = st.columns(2)
+    with c_res1:
+        st.subheader("Resumo por CFOP — Rotina 1024 (usado na Apuração)")
+        resumo_1024_cfop = _cache_resumo_1024_por_cfop(session, competencia_id, tipo_operacao)
+        st.dataframe(resumo_1024_cfop, use_container_width=True, hide_index=True)
+    with c_res2:
+        st.subheader("Resumo por CST — Relatório 1096")
+        st.dataframe(_cache_resumo_por_cst(session, competencia_id, tipo_operacao), use_container_width=True,
+                     hide_index=True)
+
+    st.markdown("---")
+    st.subheader("Inconsistências desta operação (regras de CST do 1096)")
+    st.caption(
+        "Revisão com justificativa — para uma correção rápida e óbvia de CFOP/NCM/valor, use a grade "
+        "editável acima em vez de vir até aqui."
+    )
+    _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, f"pres_inc_{tipo_operacao}",
+                                     competencia_id)
 
 
 def _aba_regras_cst(session):
@@ -467,10 +749,23 @@ empresa_ids_grupo = [f["id"] for f in filiais_grupo]
 df_inc = _cache_inconsistencias(session, competencia_id)
 csts_disponiveis = _cache_csts_disponiveis(session)
 
-(aba_ajustes, aba_apuracao, aba_conferencia, aba_regras_cst, aba_cfop_sem_checagem, aba_inconsist) = st.tabs([
-    "🧮 Ajustes Manuais", "📋 Apuração", "📎 Conferência 1024×1096", "🔖 Regras de CST",
-    "🚫 CFOPs sem Checagem de CST", "⚠️ Inconsistências",
+
+# Ordem das abas revista em 20/08/2026 (sessão de continuação — pedido do usuário: "ainda não colocou a aba
+# para que eu valide as inconsistencias da 1096", esclarecido como a grade editável Entrada/Saída). Entrada/
+# Saída entraram na frente, mesma posição/ordem de `2_PIS_COFINS_Lucro_Real.py` ("dado bruto primeiro,
+# cadastros de regra depois, resultado por último") — paridade completa de ordem com o Real agora, não só de
+# conteúdo (ver docstring do módulo, seção "🔖 Paridade com o Lucro Real").
+(aba_entrada, aba_saida, aba_regras_cst, aba_cfop_sem_checagem, aba_ajustes, aba_apuracao, aba_conferencia,
+ aba_inconsist) = st.tabs([
+    "📥 Entrada", "📤 Saída", "🔖 Regras de CST", "🚫 CFOPs sem Checagem de CST", "🧮 Ajustes Manuais",
+    "📋 Apuração", "📎 Conferência 1024×1096", "⚠️ Inconsistências",
 ])
+
+with aba_entrada:
+    _aba_planilha_pc(session, competencia_id, "entrada", empresa_ids_grupo, df_inc, csts_disponiveis)
+
+with aba_saida:
+    _aba_planilha_pc(session, competencia_id, "saida", empresa_ids_grupo, df_inc, csts_disponiveis)
 
 # ---------------------------------------------------------------------------------------------- Ajustes Manuais
 # Nova em 20/08/2026 (sessão de continuação — pedido do usuário: "criar lançamento manual para todas" as
@@ -562,11 +857,12 @@ with aba_apuracao:
         linhas_ordenadas = ordenar_linhas_para_exibicao(linhas_salvas)
         totais = {r["linha"]: r for r in linhas_salvas}
 
-        cab = st.columns([5, 2, 2, 1.3])
+        cab = st.columns([5, 2, 1.5, 1.5, 1.3])
         cab[0].markdown("**Linha**")
         cab[1].markdown("**Base**")
-        cab[2].markdown("**PIS / COFINS**")
-        cab[3].markdown("**Situação**")
+        cab[2].markdown("**PIS**")
+        cab[3].markdown("**COFINS**")
+        cab[4].markdown("**Situação**")
 
         secao_atual = None
         for r in linhas_ordenadas:
@@ -579,15 +875,16 @@ with aba_apuracao:
             abre, fecha = ("**", "**") if destaque else ("", "")
             base = _base_da_linha(r["detalhe"])
             base_txt = formatar_moeda(base) if base is not None else "—"
-            pis_cofins_txt = "—"
-            if r["valor_pis"] or r["valor_cofins"]:
-                pis_cofins_txt = f"PIS {formatar_moeda(r['valor_pis'])} / COFINS {formatar_moeda(r['valor_cofins'])}"
-            linha_cols = st.columns([5, 2, 2, 1.3])
+            tem_tributo = bool(r["valor_pis"] or r["valor_cofins"])
+            pis_txt = formatar_moeda(r["valor_pis"]) if tem_tributo else "—"
+            cofins_txt = formatar_moeda(r["valor_cofins"]) if tem_tributo else "—"
+            linha_cols = st.columns([5, 2, 1.5, 1.5, 1.3])
             linha_cols[0].markdown(f"{indent}{abre}{r['linha']} — {r['descricao']}{fecha}",
                                     unsafe_allow_html=True)
             linha_cols[1].markdown(f"{abre}{base_txt}{fecha}")
-            linha_cols[2].markdown(f"{abre}{pis_cofins_txt}{fecha}")
-            linha_cols[3].markdown("⏳ pendente" if r["manual"] else "✅")
+            linha_cols[2].markdown(f"{abre}{pis_txt}{fecha}")
+            linha_cols[3].markdown(f"{abre}{cofins_txt}{fecha}")
+            linha_cols[4].markdown("⏳ pendente" if r["manual"] else "✅")
 
         st.markdown("---")
         if "7.3" in totais:

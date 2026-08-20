@@ -95,6 +95,36 @@ ALIQ_COFINS = Decimal("0.0760")
 CSTS_EXCLUSAO_ENTRADA = (70, 71, 74)
 CSTS_EXCLUSAO_SAIDA = (6, 7)
 
+# --- Lei Complementar 224/2025 — incidência residual sobre produtos isentos (20/08/2026) ---------------
+# Mesmo conceito adicionado no módulo Presumido nesta mesma data, replicado aqui a pedido do usuário: dentro
+# dos itens de SAÍDA com CST 6/7 (que hoje entram inteiros na exclusão "2.7"), os que têm um destes 10 NCMs
+# passam a ter uma base de cálculo própria (o próprio Valor Contábil do item), tributada a alíquotas bem
+# menores que a cheia do regime não-cumulativo (informadas pelo usuário, não calculadas/derivadas):
+ALIQ_PIS_LC224 = Decimal("0.00165")   # PIS 0,165% — 1/10 da alíquota cheia do Real (1,65%)
+ALIQ_COFINS_LC224 = Decimal("0.0076")  # COFINS 0,76% — 1/10 da alíquota cheia do Real (7,60%)
+
+NCMS_LC224_2025_RAW = (
+    "33074900", "34011190", "48181000", "49019900", "9012100",
+    "17019900", "33049990", "22072019", "49030000", "22071090",
+)
+
+
+def _variantes_ncm(ncm: str) -> set:
+    """{variantes de texto} pra casar o NCM independente de zero à esquerda — ver mesma função no módulo
+    Presumido (`calculo_pis_cofins_lucro_presumido.py`) para a explicação completa: `importacao_pc.py` grava
+    `relatorio_pc_itens.ncm` como `str(int(v))` quando a célula do Excel é numérica pura, o que derruba
+    zeros à esquerda (ex.: "09012100" vira "9012100")."""
+    n = ncm.strip()
+    variantes = {n}
+    sem_zeros = n.lstrip("0") or "0"
+    variantes.add(sem_zeros)
+    if len(sem_zeros) <= 8:
+        variantes.add(sem_zeros.zfill(8))
+    return variantes
+
+
+NCMS_LC224_2025 = frozenset(v for ncm in NCMS_LC224_2025_RAW for v in _variantes_ncm(ncm))
+
 GRUPOS_DEBITO = {
     "1.1": "Faturamento Bruto (Mercadorias p/ Revenda)",
     "1.2": "Devolução de Mercadoria de Compra",
@@ -139,13 +169,14 @@ LANCAMENTO_TIPO_PARA_LINHA = {
 SECAO_DEBITO = "1 — Débito (Saída)"
 SECAO_EXCLUSOES_DEBITO = "2 — Exclusões do Débito"
 SECAO_FINANCEIRAS = "3 — Receitas Financeiras (alíquota reduzida)"
+SECAO_LC224 = "4 — Produtos Isentos com Incidência Residual (LC 224/2025)"
 SECAO_CREDITO = "5 — Crédito (Entrada)"
 SECAO_EXCLUSOES_CREDITO = "6 — Exclusões do Crédito"
 SECAO_SALDO_ANTERIOR = "8 — Saldo do Período Anterior"
 SECAO_RESULTADO = "Resultado da Apuração"
 
 ORDEM_SECOES = [
-    SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO, SECAO_EXCLUSOES_CREDITO,
+    SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_LC224, SECAO_CREDITO, SECAO_EXCLUSOES_CREDITO,
     SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 ]
 
@@ -161,6 +192,7 @@ LAYOUT_LINHAS = {
     "2.7": (SECAO_EXCLUSOES_DEBITO, 4, 1),
     "2": (SECAO_EXCLUSOES_DEBITO, 5, 0),
     "3": (SECAO_FINANCEIRAS, 0, 0),
+    "4": (SECAO_LC224, 0, 0),
     "5.1": (SECAO_CREDITO, 0, 1), "5.2": (SECAO_CREDITO, 1, 1), "5.3": (SECAO_CREDITO, 2, 1),
     "5.4": (SECAO_CREDITO, 3, 1), "5.5": (SECAO_CREDITO, 4, 1), "5.6": (SECAO_CREDITO, 5, 1),
     "5.7": (SECAO_CREDITO, 6, 1), "5.8": (SECAO_CREDITO, 7, 1), "5.9": (SECAO_CREDITO, 8, 1),
@@ -172,6 +204,7 @@ LAYOUT_LINHAS = {
     "6.7": (SECAO_EXCLUSOES_CREDITO, 4, 1),
     "6": (SECAO_EXCLUSOES_CREDITO, 5, 0),
     "8.1": (SECAO_SALDO_ANTERIOR, 0, 1), "8.2": (SECAO_SALDO_ANTERIOR, 1, 1),
+    # (nota) linha "4" (LC 224/2025) mapeada acima, junto de "3".
     "9.1": (SECAO_RESULTADO, 0, 0), "9.2": (SECAO_RESULTADO, 1, 0),
     "10.1": (SECAO_RESULTADO, 2, 1), "10.2": (SECAO_RESULTADO, 3, 1),
     "11.1": (SECAO_RESULTADO, 4, 0), "11.2": (SECAO_RESULTADO, 5, 0), "11.3": (SECAO_RESULTADO, 6, 0),
@@ -283,6 +316,26 @@ def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, cs
         select cfop, sum(valor_nao_tributado) as valor
         from relatorio_pc_itens
         where competencia_id = :cid and tipo_operacao = :tipo and cst not in ({placeholders})
+        group by cfop
+    """), params).mappings().all()
+    return {r["cfop"]: _dec(r["valor"]) for r in rows}
+
+
+def _somar_base_lc224_por_cfop(session, competencia_id):
+    """{cfop: Decimal} com o Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (excluídos em
+    "2.7") CUJO NCM está entre os 10 alcançados pela Lei Complementar 224/2025 (`NCMS_LC224_2025`) — mesma
+    mecânica de `_somar_exclusao_cst_por_cfop`, restrita a este subconjunto de NCM. Ver módulo Presumido
+    para o mesmo cálculo (implementado lá primeiro, replicado aqui a pedido do usuário em 20/08/2026)."""
+    placeholders_cst = ", ".join(f":c{i}" for i in range(len(CSTS_EXCLUSAO_SAIDA)))
+    placeholders_ncm = ", ".join(f":n{i}" for i in range(len(NCMS_LC224_2025)))
+    params = {"cid": competencia_id}
+    params.update({f"c{i}": c for i, c in enumerate(CSTS_EXCLUSAO_SAIDA)})
+    params.update({f"n{i}": n for i, n in enumerate(NCMS_LC224_2025)})
+    rows = session.execute(text(f"""
+        select cfop, sum(valor_contabil) as valor
+        from relatorio_pc_itens
+        where competencia_id = :cid and tipo_operacao = 'saida'
+          and cst in ({placeholders_cst}) and ncm in ({placeholders_ncm})
         group by cfop
     """), params).mappings().all()
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
@@ -432,6 +485,32 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     ))
     debito_pis_total += pis_financeiras
     debito_cofins_total += cofins_financeiras
+
+    # --- Produtos Isentos com Incidência Residual (linha 4, LC 224/2025 — pedido do usuário em 20/08/2026,
+    # mesmo conceito implementado primeiro no módulo Presumido). Base própria (Valor Contábil dos itens CST
+    # 6/7 cujo NCM está em NCMS_LC224_2025) — esses itens já estão inteiros dentro da exclusão "2.7", então
+    # isto não muda a base líquida de nenhum grupo de débito; é somado só no final (debito_pis_total/
+    # debito_cofins_total), do mesmo jeito que Receitas Financeiras (linha "3") acima.
+    base_lc224_por_cfop = _somar_base_lc224_por_cfop(session, competencia_id)
+    base_lc224 = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), base_lc224_por_cfop)
+    pis_lc224 = (base_lc224 * ALIQ_PIS_LC224).quantize(Decimal("0.01")) if base_lc224 > 0 else Decimal("0")
+    cofins_lc224 = (base_lc224 * ALIQ_COFINS_LC224).quantize(Decimal("0.01")) if base_lc224 > 0 else Decimal("0")
+    linhas.append(LinhaApuracaoPC(
+        "4", "Produtos Isentos com Incidência Residual - Lei Complementar 224/2025 (NCMs específicos)",
+        pis_lc224, cofins_lc224,
+        detalhe={
+            "base_total": str(base_lc224),
+            "base_liquida": str(base_lc224),
+            "nota": "Base = Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (já dentro da "
+                    "exclusão '2.7') cujo NCM está entre os 10 alcançados pela LC 224/2025 (lista e "
+                    "alíquotas informadas pelo usuário em 20/08/2026: PIS 0,165% / COFINS 0,76% — 1/10 da "
+                    "alíquota cheia do regime não-cumulativo). Só conta CFOPs ativos na Rotina 1024 desta "
+                    "competência dentro dos grupos de débito (1.1/1.2/1.4/1.6), mesmo escopo de 2.3/2.7.",
+            "ncms": sorted(NCMS_LC224_2025_RAW),
+        },
+    ))
+    debito_pis_total += pis_lc224
+    debito_cofins_total += cofins_lc224
 
     # --- crédito (entrada) ---
     credito_pis_total = Decimal("0")

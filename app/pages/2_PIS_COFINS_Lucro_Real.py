@@ -18,7 +18,7 @@ from lib.receitas_financeiras_pc import (
 )
 from lib.calculo_pis_cofins_lucro_real import (
     calcular_apuracao_pc, salvar_apuracao_pc, ordenar_linhas_para_exibicao, LAYOUT_LINHAS, ORDEM_SECOES,
-    conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_CREDITO,
+    conferencia_1024_x_1096, SECAO_DEBITO, SECAO_EXCLUSOES_DEBITO, SECAO_FINANCEIRAS, SECAO_LC224, SECAO_CREDITO,
     SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
 from lib.cst_regras_pc import (
@@ -899,7 +899,7 @@ with aba_apuracao:
     COR_RESULTADO = "#fbbf24"  # âmbar — resultado final (DARF)
 
     SECAO_ICONE = {
-        SECAO_DEBITO: "📤", SECAO_EXCLUSOES_DEBITO: "➖", SECAO_FINANCEIRAS: "💹",
+        SECAO_DEBITO: "📤", SECAO_EXCLUSOES_DEBITO: "➖", SECAO_FINANCEIRAS: "💹", SECAO_LC224: "⚖️",
         SECAO_CREDITO: "📥", SECAO_EXCLUSOES_CREDITO: "➖", SECAO_SALDO_ANTERIOR: "🔄",
         SECAO_RESULTADO: "🧾",
     }

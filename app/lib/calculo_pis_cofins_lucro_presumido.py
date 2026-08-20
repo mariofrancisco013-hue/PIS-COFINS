@@ -44,11 +44,11 @@ PENDENTES`):
   Operacionais — sem CFOP/dado na planilha da Teresina (todos zerados nos 7 meses vistos).
 - "2.2" Incidência da Contribuição Monofásica, "2.6" Exportação de Mercadorias para o Exterior — idem.
 - "5.1"/"5.2" PERD/COMP — mesmo ponto em aberto do Lucro Real (saldo não encadeia entre competências ainda).
-- **"APURAÇÃO PRODUTOS ISENTOS — LEI COMPLEMENTAR 224/2025"** (linha extra na planilha antiga, só MAI/JUN/
-  JUL, um valor pequeno somado a mais no PIS/COFINS devido) — NÃO implementada aqui. Testei several
-  hipóteses (soma de CST específico, VL. Ñ TRIBUTADO, etc.) contra os dados brutos da planilha e nenhuma
-  bateu com o valor exibido — não dá pra adivinhar a regra sem confirmar com o usuário. Se for necessária,
-  é o próximo ponto a perguntar antes de implementar.
+
+LINHA "3.1" — INCIDÊNCIA SOBRE PRODUTOS ISENTOS, LEI COMPLEMENTAR 224/2025 (20/08/2026): implementada a
+partir de especificação dada diretamente pelo usuário (não mais adivinhada a partir da planilha antiga, ao
+contrário do que o ponto em aberto anterior dizia) — ver `NCMS_LC224_2025`/`ALIQ_PIS_LC224`/`ALIQ_COFINS_
+LC224` e a linha "3.1" em `calcular_apuracao_pc_presumido`.
 """
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -61,6 +61,36 @@ ALIQ_COFINS = Decimal("0.0300")
 # CST de saída que o usuário definiu como "isentos" (linha "2.1") — juntos, uma exclusão só (pedido
 # explícito em 19/08/2026, mesmo a planilha antiga separando em duas linhas "2.1"/"2.5" — ver docstring).
 CSTS_ISENTOS_SAIDA = (6, 7)
+
+# --- Lei Complementar 224/2025 — incidência residual sobre produtos isentos (20/08/2026) ---------------
+# Pedido do usuário: dentro dos itens de saída CST 6/7 (que hoje entram inteiros na exclusão "2.1"), os que
+# têm um destes 10 NCMs passam a ter uma base de cálculo própria (o próprio Valor Contábil do item), tributada
+# a alíquotas bem menores que a cheia do regime (informadas pelo usuário, não calculadas/derivadas):
+ALIQ_PIS_LC224 = Decimal("0.00065")     # PIS 0,0650% — 1/10 da alíquota cheia do Presumido (0,65%)
+ALIQ_COFINS_LC224 = Decimal("0.0030")   # COFINS 0,30% — 1/10 da alíquota cheia do Presumido (3,00%)
+
+NCMS_LC224_2025_RAW = (
+    "33074900", "34011190", "48181000", "49019900", "9012100",
+    "17019900", "33049990", "22072019", "49030000", "22071090",
+)
+
+
+def _variantes_ncm(ncm: str) -> set:
+    """{variantes de texto} para casar o NCM independente de zero à esquerda. `importacao_pc.py` grava
+    `relatorio_pc_itens.ncm` como `str(int(v))` quando a célula do Excel é numérica pura — ou seja, um NCM
+    como "09012100" perde o zero à esquerda e vira "9012100" no banco (confirmado lendo o código de
+    importação). Gera a forma crua, sem zeros à esquerda, e com 8 dígitos (zero-padded), pra casar com
+    qualquer uma das três convenções sem risco de colisão (NCM sempre tem 8 dígitos "de verdade")."""
+    n = ncm.strip()
+    variantes = {n}
+    sem_zeros = n.lstrip("0") or "0"
+    variantes.add(sem_zeros)
+    if len(sem_zeros) <= 8:
+        variantes.add(sem_zeros.zfill(8))
+    return variantes
+
+
+NCMS_LC224_2025 = frozenset(v for ncm in NCMS_LC224_2025_RAW for v in _variantes_ncm(ncm))
 
 # --- Grupos de CFOP (listas fixas — ver item 4 da docstring do módulo) ---------------------------------
 # "1.1 Faturamento Bruto (Mercadorias p/Revenda)" — cruzado contra a aba CONTABIL da Teresina, seção
@@ -97,7 +127,7 @@ LAYOUT_LINHAS = {
     "1.5": (SECAO_RECEITAS, 3, 1), "1.6": (SECAO_RECEITAS, 4, 1), "1": (SECAO_RECEITAS, 5, 0),
     "2.1": (SECAO_EXCLUSOES, 0, 1), "2.2": (SECAO_EXCLUSOES, 1, 1), "2.3": (SECAO_EXCLUSOES, 2, 1),
     "1.2": (SECAO_EXCLUSOES, 3, 1), "2.6": (SECAO_EXCLUSOES, 4, 1), "2": (SECAO_EXCLUSOES, 5, 0),
-    "3": (SECAO_BASE, 0, 0),
+    "3": (SECAO_BASE, 0, 0), "3.1": (SECAO_BASE, 1, 1),
     "P": (SECAO_CONTRIBUICAO, 0, 1), "C": (SECAO_CONTRIBUICAO, 1, 1),
     "4.1": (SECAO_RESULTADO, 0, 0), "4.2": (SECAO_RESULTADO, 1, 0),
     "5.1": (SECAO_RESULTADO, 2, 1), "5.2": (SECAO_RESULTADO, 3, 1),
@@ -173,6 +203,26 @@ def _somar_icms_saida_nao_isento_por_cfop(session, competencia_id):
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
+def _somar_base_lc224_por_cfop(session, competencia_id):
+    """{cfop: Decimal} com o Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (isento) CUJO NCM
+    está entre os 10 alcançados pela Lei Complementar 224/2025 (`NCMS_LC224_2025`) — pedido do usuário em
+    20/08/2026, com NCMs e alíquotas informados diretamente (não derivados/adivinhados). Mesma mecânica de
+    `_somar_cst_isento_por_cfop`, só que restrita a este subconjunto de NCM."""
+    placeholders_cst = ", ".join(f":c{i}" for i in range(len(CSTS_ISENTOS_SAIDA)))
+    placeholders_ncm = ", ".join(f":n{i}" for i in range(len(NCMS_LC224_2025)))
+    params = {"cid": competencia_id}
+    params.update({f"c{i}": c for i, c in enumerate(CSTS_ISENTOS_SAIDA)})
+    params.update({f"n{i}": n for i, n in enumerate(NCMS_LC224_2025)})
+    rows = session.execute(text(f"""
+        select cfop, sum(valor_contabil) as valor
+        from relatorio_pc_itens
+        where competencia_id = :cid and tipo_operacao = 'saida'
+          and cst in ({placeholders_cst}) and ncm in ({placeholders_ncm})
+        group by cfop
+    """), params).mappings().all()
+    return {r["cfop"]: _dec(r["valor"]) for r in rows}
+
+
 def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaApuracaoPresumido]:
     """Calcula as linhas 1.x-7.3 da apuração PIS/COFINS Lucro Presumido a partir da Rotina 1024 (saída, só
     para o Valor Contábil bruto das linhas 1.1/1.4) + Relatório 1096 (saída — exclusão de CST isento E,
@@ -186,6 +236,7 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
 
     cst_isento_por_cfop = _somar_cst_isento_por_cfop(session, competencia_id)
     icms_nao_isento_por_cfop = _somar_icms_saida_nao_isento_por_cfop(session, competencia_id)
+    base_lc224_por_cfop = _somar_base_lc224_por_cfop(session, competencia_id)
 
     def _soma_bruta(tipo_operacao, cfops):
         return sum(
@@ -212,6 +263,11 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
         # ICMS correto (só dos itens tributados, fonte 1096) em vez do valor_icms agregado do 1024.
         cfops_ativos = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["cfop"] in cfops}
         return sum((v for cfop, v in icms_nao_isento_por_cfop.items() if cfop in cfops_ativos), Decimal("0"))
+
+    def _soma_lc224_escopada(cfops):
+        # Mesmo escopo das outras somas por CFOP (só CFOPs que aparecem na Rotina 1024 desta competência).
+        cfops_ativos = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["cfop"] in cfops}
+        return sum((v for cfop, v in base_lc224_por_cfop.items() if cfop in cfops_ativos), Decimal("0"))
 
     linhas: list[LinhaApuracaoPresumido] = []
 
@@ -283,6 +339,28 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
         detalhe={"base_total": str(base_calculo)},
     ))
 
+    # --- 3.1 — Incidência residual sobre Produtos Isentos, LC 224/2025 (20/08/2026) ---------------------
+    # Base própria (Valor Contábil dos itens CST 6/7 cujo NCM está em NCMS_LC224_2025), à parte da Base de
+    # Cálculo "3" — esses itens JÁ estão inteiros dentro da exclusão "2.1" (CST 6/7), então isto não muda a
+    # base "3"/"1"/"2"; é uma incidência residual somada só no final (linhas "4.1"/"4.2"), mesmo padrão de
+    # como a planilha antiga tratava essa linha (soma a mais só entre a Contribuição Apurada e o Saldo Final).
+    base_lc224 = _soma_lc224_escopada(CFOPS_1_1 | CFOPS_1_4)
+    pis_lc224 = _arred(base_lc224 * ALIQ_PIS_LC224) if base_lc224 > 0 else Decimal("0")
+    cofins_lc224 = _arred(base_lc224 * ALIQ_COFINS_LC224) if base_lc224 > 0 else Decimal("0")
+    linhas.append(LinhaApuracaoPresumido(
+        "3.1", "(+) Apuração Produtos Isentos - Lei Complementar 224/2025 (NCMs específicos)",
+        pis_lc224, cofins_lc224,
+        detalhe={
+            "base_total": str(base_lc224),
+            "nota": "Base = Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (já dentro da "
+                    "exclusão '2.1') cujo NCM está entre os 10 alcançados pela LC 224/2025 (lista e "
+                    "alíquotas informadas pelo usuário em 20/08/2026: PIS 0,0650% / COFINS 0,30% — 1/10 da "
+                    "alíquota cheia do Presumido). Só conta CFOPs ativos na Rotina 1024 desta competência "
+                    "dentro de 1.1/1.4 (mesmo escopo das demais linhas 2.x/3.1).",
+            "ncms": sorted(NCMS_LC224_2025_RAW),
+        },
+    ))
+
     # --- P/C — Contribuição apurada sobre a base (uma vez só, diferente do Lucro Real) ---
     pis_apurado = _arred(base_calculo * ALIQ_PIS) if base_calculo > 0 else Decimal("0")
     cofins_apurado = _arred(base_calculo * ALIQ_COFINS) if base_calculo > 0 else Decimal("0")
@@ -292,15 +370,24 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
                                           Decimal("0"), cofins_apurado))
 
     # --- Resultado / DARF (sem saldo credor anterior nem crédito — regime cumulativo) ---
-    linhas.append(LinhaApuracaoPresumido("4.1", "Saldo Final Devedor ou (Credor) de PIS - cumulativo",
-                                          pis_apurado, Decimal("0")))
-    linhas.append(LinhaApuracaoPresumido("4.2", "Saldo Final Devedor ou (Credor) de COFINS - cumulativo",
-                                          Decimal("0"), cofins_apurado))
+    # A partir de 20/08/2026, inclui a incidência residual da linha "3.1" (LC 224/2025) — soma "P"/"C" com
+    # "3.1" (pis_lc224/cofins_lc224), do mesmo jeito que a planilha antiga somava essa linha só depois da
+    # Contribuição Apurada, não dentro da Base de Cálculo "3".
+    total_pis_devido = pis_apurado + pis_lc224
+    total_cofins_devido = cofins_apurado + cofins_lc224
+    linhas.append(LinhaApuracaoPresumido(
+        "4.1", "Saldo Final Devedor ou (Credor) de PIS - cumulativo", total_pis_devido, Decimal("0"),
+        detalhe={"nota": "= P (Art. 2º) + 3.1 (LC 224/2025)."} if pis_lc224 else {},
+    ))
+    linhas.append(LinhaApuracaoPresumido(
+        "4.2", "Saldo Final Devedor ou (Credor) de COFINS - cumulativo", Decimal("0"), total_cofins_devido,
+        detalhe={"nota": "= C (Art. 2º) + 3.1 (LC 224/2025)."} if cofins_lc224 else {},
+    ))
     linhas.append(LinhaApuracaoPresumido("5.1", LINHAS_PENDENTES["5.1"], Decimal("0"), Decimal("0"), manual=True))
     linhas.append(LinhaApuracaoPresumido("5.2", LINHAS_PENDENTES["5.2"], Decimal("0"), Decimal("0"), manual=True))
 
-    pagar_pis = pis_apurado if pis_apurado > 0 else Decimal("0")
-    pagar_cofins = cofins_apurado if cofins_apurado > 0 else Decimal("0")
+    pagar_pis = total_pis_devido if total_pis_devido > 0 else Decimal("0")
+    pagar_cofins = total_cofins_devido if total_cofins_devido > 0 else Decimal("0")
     linhas.append(LinhaApuracaoPresumido("6.1", "Líquido a pagar em DARF - TOTAL PIS - DARF 8109",
                                           pagar_pis, Decimal("0")))
     linhas.append(LinhaApuracaoPresumido("6.2", "Líquido a pagar em DARF - TOTAL COFINS - DARF 2172",

@@ -38,9 +38,11 @@ logout_button()
 st.title("PIS/COFINS — Lucro Presumido")
 st.caption(
     "Regime cumulativo (Lei 9.718/1998) — PIS 0,65% / COFINS 3,00% sobre a Base de Cálculo, sem crédito de "
-    "entrada. Base = Rotina 1024 (só Saída) − Devolução de Venda − ICMS destacado − CST 6/7 (isentos). Use "
-    "**Importar Relatórios** (módulo \"Lucro Presumido\") para subir a Rotina 1024 e o Relatório 1096 antes "
-    "de calcular aqui."
+    "entrada. Base = Rotina 1024 (só Saída) − Devolução de Venda − ICMS destacado − CST 6/7 (isentos). "
+    "Desde 20/08/2026, a linha \"3.1\" soma uma incidência residual (PIS 0,0650% / COFINS 0,30% — Lei "
+    "Complementar 224/2025) sobre os itens CST 6/7 de 10 NCMs específicos, mesmo esses itens já estando "
+    "dentro da exclusão \"2.1\". Use **Importar Relatórios** (módulo \"Lucro Presumido\") para subir a "
+    "Rotina 1024 e o Relatório 1096 antes de calcular aqui."
 )
 
 session = get_session()

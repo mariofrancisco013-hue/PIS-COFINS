@@ -23,13 +23,17 @@ from lib.calculo_pis_cofins_lucro_real import (
     SECAO_EXCLUSOES_CREDITO, SECAO_SALDO_ANTERIOR, SECAO_RESULTADO,
 )
 from lib.cst_regras_pc import (
-    registrar_ajuste_cst, carregar_historico_ajustes, TIPOS_REGRA, registrar_revisao, carregar_excecoes,
-    definir_excecao_ativa, listar_cfops_sem_checagem, salvar_cfops_sem_checagem, listar_regras_cfop,
-    salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm, listar_regras_alerta, salvar_regras_alerta,
+    registrar_ajuste_cst, aplicar_ajuste_cst, escopo_ajuste_seguro, carregar_historico_ajustes, TIPOS_REGRA,
+    registrar_revisao, carregar_excecoes, definir_excecao_ativa, listar_cfops_sem_checagem,
+    salvar_cfops_sem_checagem, listar_regras_cfop, salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm,
+    listar_regras_alerta, salvar_regras_alerta,
 )
 
-# Tipos de inconsistência que carregam um CST passível de ajuste manual (log-only — ver
-# cst_regras_pc.registrar_ajuste_cst). cfop_sem_grupo não tem CST associado, então fica de fora.
+# Tipos de inconsistência que carregam um CST passível de ajuste manual. cfop_sem_grupo não tem CST
+# associado, então fica de fora. Desde 20/08/2026 (pedido do usuário: "que esses ajustes fiquem salvos para
+# ajuste no sistema"), o ajuste aplica de verdade (aplicar_ajuste_cst) quando o escopo é inequívoco — ver
+# cst_regras_pc.escopo_ajuste_seguro — e cai pro caminho antigo (registrar_ajuste_cst, log-only) só quando
+# não dá pra saber com segurança quais itens corrigir.
 TIPOS_COM_CST_AJUSTAVEL = {"cst_nao_mapeado", "cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta"}
 
 # ================================================================================================
@@ -149,7 +153,7 @@ def _cache_historico_ajustes(_session, competencia_id):
     return [dict(r) for r in carregar_historico_ajustes(_session, competencia_id)]
 
 
-def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
+def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id=None):
     """Card de inconsistência — estrutura equivalente à do módulo ICMS normal (pedido do usuário em
     18/08/2026): título com selo de quantidade (grupo = mesmo erro repetido N vezes), badge 🔁 quando
     resolvido automaticamente por uma exceção aprendida, formulário de Revisar/Ignorar/Só salvar
@@ -249,11 +253,21 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
 
         if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
             st.divider()
-            st.caption(
-                "Ou, se preferir, registre direto qual CST deveria ter sido usado — isso NÃO recalcula "
-                "nada nem altera o item importado, fica só como histórico/checklist do que precisa ser "
-                "corrigido na origem (Winthor):"
-            )
+            seguro = escopo_ajuste_seguro(row)
+            if seguro:
+                st.caption(
+                    "Registre qual CST deveria ter sido usado — desde 20/08/2026, isso CORRIGE de verdade o "
+                    "CST em relatorio_pc_itens (mantendo o CST original no histórico) e recalcula a apuração "
+                    "desta competência na hora:"
+                )
+            else:
+                st.caption(
+                    "Este CST aparece em itens de origens diferentes (sem um único CFOP/NCM associado) — "
+                    "não dá pra corrigir automaticamente sem risco de mudar itens que talvez precisassem de "
+                    "um CST diferente entre si. Registre aqui só como histórico/checklist do que precisa ser "
+                    "corrigido na origem (Winthor); para aplicar de verdade, corrija item a item na grade "
+                    "Entrada/Saída ou cadastre uma Regra de CST × CFOP/NCM (aba 🔖) para a próxima importação."
+                )
             opcoes_cst = [c["codigo"] for c in csts_disponiveis]
             cst_corrigido = st.selectbox(
                 "CST correto", opcoes_cst,
@@ -264,13 +278,27 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
             observacao_ajuste = st.text_input(
                 "Observação (opcional)", key=f"{key_prefix}_obs_ajuste_{row['id']}"
             )
-            if st.button("Registrar ajuste de CST", key=f"{key_prefix}_ajustar_{row['id']}"):
-                registrar_ajuste_cst(
-                    session, row["id"], cst_corrigido,
-                    observacao_ajuste or None, usuario_atual(),
-                )
-                _cache_inconsistencias.clear()
-                _cache_historico_ajustes.clear()
+            rotulo_botao = "✅ Aplicar CST corrigido e recalcular" if seguro else "Registrar ajuste (só histórico)"
+            if st.button(rotulo_botao, key=f"{key_prefix}_ajustar_{row['id']}"):
+                if seguro:
+                    resultado = aplicar_ajuste_cst(
+                        session, row["id"], cst_corrigido, observacao_ajuste or None, usuario_atual(),
+                    )
+                    if competencia_id is not None:
+                        linhas_recalc = calcular_apuracao_pc(session, competencia_id)
+                        salvar_apuracao_pc(session, competencia_id, linhas_recalc)
+                    _cache_inconsistencias.clear()
+                    _cache_historico_ajustes.clear()
+                    st.success(
+                        f"CST corrigido em {resultado['n_itens_corrigidos']} item(ns) — apuração recalculada."
+                    )
+                else:
+                    registrar_ajuste_cst(
+                        session, row["id"], cst_corrigido,
+                        observacao_ajuste or None, usuario_atual(),
+                    )
+                    _cache_inconsistencias.clear()
+                    _cache_historico_ajustes.clear()
                 st.rerun()
 
 
@@ -313,7 +341,8 @@ def _mostrar_resumo_por_tipo(df, key_prefix):
     )
 
 
-def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix):
+def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix,
+                                     competencia_id=None):
     """Bloco de inconsistências + ajuste de CST, filtrado por operação (saida/entrada) — usado nas abas
     Entrada/Saída. Filtro igual ao da aba Inconsistências (Status/Tipo/Filial), já pré-filtrado pela
     operação da aba (não precisa repetir Operação aqui)."""
@@ -341,7 +370,7 @@ def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponi
     _mostrar_resumo_por_tipo(df_filtrado, key_prefix)
     st.divider()
     for _, row in df_filtrado.iterrows():
-        _card_inconsistencia(session, row, csts_disponiveis, key_prefix)
+        _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id)
 
 
 def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc, csts_disponiveis):
@@ -532,7 +561,8 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
         "Revisão com justificativa — para uma correção rápida e óbvia de CFOP/NCM/valor, use a grade "
         "editável acima em vez de vir até aqui."
     )
-    _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, f"inc_{tipo_operacao}")
+    _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, f"inc_{tipo_operacao}",
+                                     competencia_id)
 
 
 def _aba_regras_cst(session):
@@ -742,9 +772,11 @@ with aba_cfop_sem_checagem:
 # ---------------------------------------------------------------------------------------------- Ajustes Manuais
 with aba_ajustes:
     st.caption(
-        "Créditos de PIS/COFINS que não vêm do Relatório 1096 — nesta versão, só Aluguéis (Prédios / "
-        "Máquinas e Equipamentos) e Depreciação (linhas 5.3, 5.4 e 5.6 da apuração). Informe a base do mês; "
-        "o PIS (1,65%) e o COFINS (7,60%) são calculados automaticamente."
+        "Valores de PIS/COFINS que não vêm da Rotina 1024/Relatório 1096: crédito (Aluguéis de Prédios/"
+        "Máquinas, Depreciação — linhas 5.3/5.4/5.6 — e Fretes Supply Log — 5.9), débito (Serviços/Aluguel "
+        "recebido — 1.3/1.5) e exclusão (ICMS Substituição/Exportação/IPI — 2.4/2.6/6.3/6.6, reduzem o "
+        "total do lado correspondente). Informe a base do mês; o PIS (1,65%) e o COFINS (7,60%) são "
+        "calculados automaticamente, na direção certa conforme o tipo escolhido."
     )
     with st.form("novo_lancamento_pc"):
         c1, c2 = st.columns(2)
@@ -759,7 +791,7 @@ with aba_ajustes:
             else:
                 resultado = lmpc.adicionar(session, competencia_id, tipo, descricao.strip(), base_valor,
                                             usuario_atual())
-                st.success(f"Lançamento adicionado — crédito PIS {formatar_moeda(resultado['valor_pis'])}, "
+                st.success(f"Lançamento adicionado — PIS {formatar_moeda(resultado['valor_pis'])}, "
                            f"COFINS {formatar_moeda(resultado['valor_cofins'])}.")
                 st.rerun()
 
@@ -775,8 +807,8 @@ with aba_ajustes:
             df_original, use_container_width=True, hide_index=True, num_rows="dynamic",
             disabled=["id", "tipo", "descricao", "base_valor", "valor_pis", "valor_cofins", "created_at"],
             column_config={
-                "base_valor": coluna_moeda("Base"), "valor_pis": coluna_moeda("Crédito PIS"),
-                "valor_cofins": coluna_moeda("Crédito COFINS"),
+                "base_valor": coluna_moeda("Base"), "valor_pis": coluna_moeda("PIS"),
+                "valor_cofins": coluna_moeda("COFINS"),
             },
             key="grade_lancamentos_pc",
         )
@@ -1063,7 +1095,7 @@ with aba_inconsist:
             _mostrar_resumo_por_tipo(df_filtrado, "inc_geral")
             st.divider()
             for _, row in df_filtrado.iterrows():
-                _card_inconsistencia(session, row, csts_disponiveis, "inc_geral")
+                _card_inconsistencia(session, row, csts_disponiveis, "inc_geral", competencia_id)
 
     st.divider()
     st.subheader("Histórico de ajustes manuais de CST")

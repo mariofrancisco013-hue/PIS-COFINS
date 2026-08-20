@@ -146,30 +146,43 @@ GRUPOS_CREDITO = {
     "5.7": "Devoluções de Vendas",
     "5.8": "Outras Entradas",
 }
-# Linhas manuais fora do escopo desta versão (ver "Pontos em aberto" na metodologia) — ficam na apuração
-# com valor zero e manual=true, para não desaparecer da tela e para o próximo lançamento ser só uma questão
-# de estender LANCAMENTOS_TIPO_PARA_LINHA / adicionar a soma correspondente aqui. 2.3/6.4 (ICMS destacado)
-# NÃO estão mais aqui desde 14/08/2026 — já saem embutidas na base de cada grupo (Valor Contábil − ICMS),
-# ver calcular_apuracao_pc.
-LINHAS_PENDENTES_DEBITO = {
-    "1.3": "Faturamento Bruto (Prestação de Serviços)",
-    "1.5": "Receitas de Aluguel de Bens",
-    "2.4": "(-) ICMS Substituição",
-    "2.6": "(-) Exportação de Mercadorias para o Exterior",
-}
-LINHAS_PENDENTES_CREDITO = {
-    "5.9": "Fretes SUPPLY LOG",
-    "6.3": "(-) IPI",
-    "6.6": "(-) Exportação de Mercadorias para o Exterior",
-}
-# "3" (Receitas Financeiras) e "6.5" (Entradas Isentas/Sem Direito a Crédito) saíram das listas acima em
-# 19/08/2026 — deixaram de ser manuais/zeradas, agora são calculadas (ver calcular_apuracao_pc).
+# Linhas manuais fora do escopo do 1024/1096 — LINHAS_PENDENTES_DEBITO/CREDITO ficam vazios desde 20/08/2026
+# (sessão de continuação: as 7 linhas que estavam aqui ganharam lançamento manual, ver LANCAMENTO_TIPO_PARA_
+# LINHA* logo abaixo e a nota "🎯 Linhas manuais..." na metodologia). Mantidos (vazios) só pra não quebrar
+# nada que ainda itere sobre eles — o padrão pra uma linha manual nova continua sendo "estender um dos dicts
+# LANCAMENTO_TIPO_PARA_LINHA* abaixo", não voltar a usar estes.
+LINHAS_PENDENTES_DEBITO = {}
+LINHAS_PENDENTES_CREDITO = {}
+# "3" (Receitas Financeiras) e "6.5" (Entradas Isentas/Sem Direito a Crédito) saíram de listas equivalentes
+# em 19/08/2026 — deixaram de ser manuais/zeradas, agora são calculadas (ver calcular_apuracao_pc).
 
-# Lançamentos manuais implementados nesta versão (Aluguéis + Depreciação) — ver lancamentos_manuais_pc.py
+# Lançamentos manuais que SOMAM ao total do lado deles — Aluguéis/Depreciação (14/08/2026, crédito) e, desde
+# 20/08/2026, Serviços/Aluguel recebido (débito, linha "1") e Fretes Supply Log (crédito, linha "5"). Mesma
+# mecânica pros quatro: base informada pelo analista × alíquota cheia (1,65%/7,60%) vira PIS/COFINS somado
+# direto no total do lado — ver lancamentos_manuais_pc.py.
 LANCAMENTO_TIPO_PARA_LINHA = {
     "aluguel_predio_credito": ("5.3", "Aluguéis pagos a PJ (Prédios)"),
     "aluguel_maquinas_credito": ("5.4", "Aluguéis pagos a PJ (Máquinas e Equipamentos)"),
     "depreciacao_credito": ("5.6", "Depreciações Máquinas e Equip. e Outros Bens do Ativo Imobilizado"),
+    "fretes_supply_log_credito": ("5.9", "Fretes SUPPLY LOG"),
+}
+LANCAMENTO_TIPO_PARA_LINHA_DEBITO = {
+    "servicos_debito": ("1.3", "Faturamento Bruto (Prestação de Serviços)"),
+    "aluguel_recebido_debito": ("1.5", "Receitas de Aluguel de Bens"),
+}
+
+# Lançamentos manuais que SUBTRAEM do total do lado deles (exclusões sem CFOP/grupo próprio na Rotina 1024 —
+# diferente de 2.3/2.5/2.7/6.4/6.5/6.7, que já saem embutidas na base líquida de cada grupo de CFOP, estas
+# não têm grupo nenhum pra "embutir": o valor entra como um ajuste à parte, igual ao que a linha "3"
+# (Receitas Financeiras) e "4" (LC 224/2025) já fazem — só que subtraindo em vez de somando, aplicado DEPOIS
+# que a linha "1"/"5" já fechou (ver calcular_apuracao_pc), pra não distorcer o total bruto de cada seção.
+LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_DEBITO = {
+    "icms_substituicao_exclusao": ("2.4", "(-) ICMS Substituição"),
+    "exportacao_debito_exclusao": ("2.6", "(-) Exportação de Mercadorias para o Exterior"),
+}
+LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_CREDITO = {
+    "ipi_exclusao": ("6.3", "(-) IPI"),
+    "exportacao_credito_exclusao": ("6.6", "(-) Exportação de Mercadorias para o Exterior"),
 }
 
 # Layout de exibição — só de APRESENTAÇÃO (não entra no cálculo). Mapeia cada linha para (seção, ordem
@@ -419,6 +432,53 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     for linha, descricao in LINHAS_PENDENTES_DEBITO.items():
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
 
+    # --- Lançamentos manuais de débito (1.3/1.5) — novos em 20/08/2026, ver LANCAMENTO_TIPO_PARA_LINHA_
+    # DEBITO acima. Mesmo padrão de leitura da tabela usado pros lançamentos de crédito (5.3/5.4/5.6/5.9,
+    # mais abaixo) — somam em debito_pis_total/debito_cofins_total ANTES da linha "1" fechar, porque "1.3"/
+    # "1.5" são numeradas dentro da própria seção "1" (diferente de "3"/"4", que são seções à parte, somadas
+    # DEPOIS de "1" já fechada).
+    lancamentos_debito = session.execute(text("""
+        select tipo, descricao, base_valor, valor_pis, valor_cofins
+        from lancamentos_manuais_pc where competencia_id = :cid
+    """), {"cid": competencia_id}).mappings().all()
+
+    for tipo, (linha, descricao) in LANCAMENTO_TIPO_PARA_LINHA_DEBITO.items():
+        itens_tipo = [l for l in lancamentos_debito if l["tipo"] == tipo]
+        soma_pis = sum((_dec(l["valor_pis"]) for l in itens_tipo), Decimal("0"))
+        soma_cofins = sum((_dec(l["valor_cofins"]) for l in itens_tipo), Decimal("0"))
+        base_lancamentos = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
+        linhas.append(LinhaApuracaoPC(linha, descricao, soma_pis, soma_cofins, detalhe={
+            "base_total": str(base_lancamentos),
+            "base_liquida": str(base_lancamentos),
+            "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
+        }))
+        debito_pis_total += soma_pis
+        debito_cofins_total += soma_cofins
+        debito_base_bruta_total += base_lancamentos
+        debito_base_liquida_total += base_lancamentos
+
+    # --- Lançamentos manuais de exclusão de débito (2.4/2.6) — novos em 20/08/2026. Diferente de 2.3/2.5/
+    # 2.7 (já embutidas na base líquida de cada grupo de CFOP), estas não têm grupo pra "embutir" — o PIS/
+    # COFINS calculado aqui é SUBTRAÍDO de debito_pis_total/debito_cofins_total só DEPOIS que a linha "1" já
+    # fechou (mesma posição de "3"/"4", só que subtraindo em vez de somando) — ver aplicação logo após a
+    # linha "1" ser adicionada a `linhas`, abaixo.
+    pis_exclusao_debito = Decimal("0")
+    cofins_exclusao_debito = Decimal("0")
+    for tipo, (linha, descricao) in LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_DEBITO.items():
+        itens_tipo = [l for l in lancamentos_debito if l["tipo"] == tipo]
+        soma_pis = sum((_dec(l["valor_pis"]) for l in itens_tipo), Decimal("0"))
+        soma_cofins = sum((_dec(l["valor_cofins"]) for l in itens_tipo), Decimal("0"))
+        base_lancamentos = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
+        linhas.append(LinhaApuracaoPC(linha, descricao, soma_pis, soma_cofins, detalhe={
+            "base_total": str(base_lancamentos),
+            "nota": "Lançamento manual (aba Ajustes Manuais) — PIS/COFINS mostrados aqui são o valor "
+                    "SUBTRAÍDO do total da seção \"1\" (aplicado depois que ela já fechou, mesma posição das "
+                    "linhas \"3\"/\"4\", só que reduzindo em vez de somando).",
+            "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
+        }))
+        pis_exclusao_debito += soma_pis
+        cofins_exclusao_debito += soma_cofins
+
     linhas.append(LinhaApuracaoPC(
         "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
@@ -459,8 +519,10 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         detalhe={
             "base_total": str(total_exclusoes_debito),
             "nota": "Soma de 2.3 (ICMS destacado) + 2.5 (Outras) + 2.7 (CST 6/7), todas calculadas via "
-                    "Rotina 1024/Relatório 1096 — 2.4/2.6 seguem pendentes (fora do escopo do 1024/1096 "
-                    "nesta versão), ver metodologia.",
+                    "Rotina 1024/Relatório 1096. 2.4/2.6 (ICMS Substituição/Exportação, lançamento manual "
+                    "desde 20/08/2026) NÃO entram nesta soma — são aplicadas como redução direta de PIS/"
+                    "COFINS depois que a linha \"1\" fecha, não como redução de base (ver LANCAMENTO_TIPO_"
+                    "PARA_LINHA_EXCLUSAO_DEBITO).",
         },
     ))
     linhas.append(LinhaApuracaoPC("1", "Total das Receitas Tributáveis (débito)",
@@ -469,6 +531,12 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
                                        "base_total": str(debito_base_bruta_total),
                                        "base_liquida": str(debito_base_liquida_total),
                                    }))
+
+    # Aplica a redução de 2.4/2.6 (lançamentos manuais de exclusão, calculados acima) — DEPOIS que "1" já
+    # capturou seu próprio total, pra "1" continuar representando só a receita bruta (grupos de CFOP +
+    # 1.3/1.5), sem a exclusão misturada dentro dela.
+    debito_pis_total -= pis_exclusao_debito
+    debito_cofins_total -= cofins_exclusao_debito
 
     # --- Receitas Financeiras (linha 3, alíquota reduzida Lei 8.426/2015 — pedido do usuário em 19/08/2026)
     # Débito: soma no que se paga. Somada em debito_pis_total/debito_cofins_total DEPOIS da linha "1" já ter
@@ -602,6 +670,26 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     for linha, descricao in LINHAS_PENDENTES_CREDITO.items():
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
 
+    # --- Lançamentos manuais de exclusão de crédito (6.3/6.6) — novos em 20/08/2026, mesmo raciocínio de
+    # 2.4/2.6 (débito, ver acima): sem grupo de CFOP pra embutir a exclusão, o valor é SUBTRAÍDO de
+    # credito_pis_total/credito_cofins_total só DEPOIS que a linha "5" fechar (aplicado logo após ela ser
+    # adicionada a `linhas`, abaixo).
+    pis_exclusao_credito = Decimal("0")
+    cofins_exclusao_credito = Decimal("0")
+    for tipo, (linha, descricao) in LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_CREDITO.items():
+        itens_tipo = [l for l in lancamentos if l["tipo"] == tipo]
+        soma_pis = sum((_dec(l["valor_pis"]) for l in itens_tipo), Decimal("0"))
+        soma_cofins = sum((_dec(l["valor_cofins"]) for l in itens_tipo), Decimal("0"))
+        base_lancamentos = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
+        linhas.append(LinhaApuracaoPC(linha, descricao, soma_pis, soma_cofins, detalhe={
+            "base_total": str(base_lancamentos),
+            "nota": "Lançamento manual (aba Ajustes Manuais) — PIS/COFINS mostrados aqui são o valor "
+                    "SUBTRAÍDO do total da seção \"5\" (aplicado depois que ela já fechou).",
+            "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
+        }))
+        pis_exclusao_credito += soma_pis
+        cofins_exclusao_credito += soma_cofins
+
     linhas.append(LinhaApuracaoPC(
         "6.4", "(-) ICMS Apuração - Destacado Entradas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
@@ -644,7 +732,10 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         detalhe={
             "base_total": str(total_exclusoes_credito),
             "nota": "Soma de 6.4 (ICMS destacado) + 6.5 (CST 70/71/74) + 6.7 (Outras), todas calculadas via "
-                    "Rotina 1024/Relatório 1096 — 6.3/6.6 seguem pendentes, ver metodologia.",
+                    "Rotina 1024/Relatório 1096. 6.3/6.6 (IPI/Exportação, lançamento manual desde 20/08/2026) "
+                    "NÃO entram nesta soma — são aplicadas como redução direta de PIS/COFINS depois que a "
+                    "linha \"5\" fecha, não como redução de base (ver LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_"
+                    "CREDITO).",
         },
     ))
     linhas.append(LinhaApuracaoPC("5", "Total de Créditos", credito_pis_total, credito_cofins_total,
@@ -652,6 +743,11 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
                                        "base_total": str(credito_base_bruta_total),
                                        "base_liquida": str(credito_base_liquida_total),
                                    }))
+
+    # Aplica a redução de 6.3/6.6 (lançamentos manuais de exclusão, calculados acima) — DEPOIS que "5" já
+    # capturou seu próprio total, mesmo raciocínio de 2.4/2.6 no lado débito.
+    credito_pis_total -= pis_exclusao_credito
+    credito_cofins_total -= cofins_exclusao_credito
 
     # --- saldo credor do período anterior (entrada manual — ver saldo_credor_anterior_pc) ---
     saldo_anterior = session.execute(text("""

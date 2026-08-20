@@ -46,16 +46,20 @@ from lib.calculo_pis_cofins_lucro_presumido import (
     LAYOUT_LINHAS, conferencia_1024_x_1096_presumido, detalhar_cfop_presumido,
 )
 from lib.cst_regras_pc import (
-    registrar_ajuste_cst, carregar_historico_ajustes, TIPOS_REGRA, registrar_revisao, carregar_excecoes,
-    definir_excecao_ativa, listar_cfops_sem_checagem, salvar_cfops_sem_checagem, listar_regras_cfop,
-    salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm, listar_regras_alerta, salvar_regras_alerta,
+    registrar_ajuste_cst, aplicar_ajuste_cst, escopo_ajuste_seguro, carregar_historico_ajustes, TIPOS_REGRA,
+    registrar_revisao, carregar_excecoes, definir_excecao_ativa, listar_cfops_sem_checagem,
+    salvar_cfops_sem_checagem, listar_regras_cfop, salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm,
+    listar_regras_alerta, salvar_regras_alerta,
 )
+from lib import lancamentos_manuais_pc as lmpc
 
 MODULO = "pis_cofins_lucro_presumido"
 REGIME_LIKE = "Lucro Presumido%"
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual (mesmo conjunto do Lucro Real — ver
-# lib/cst_regras_pc.py; cfop_sem_grupo não tem CST associado, fica de fora).
+# lib/cst_regras_pc.py; cfop_sem_grupo não tem CST associado, fica de fora). Desde 20/08/2026, o ajuste
+# aplica de verdade (aplicar_ajuste_cst) quando o escopo é inequívoco — ver escopo_ajuste_seguro — mesmo
+# comportamento novo do Lucro Real.
 TIPOS_COM_CST_AJUSTAVEL = {"cst_nao_mapeado", "cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta"}
 
 # Cache de leitura — mesmo padrão/motivo do Lucro Real (ver docstring de _cache_* em 2_PIS_COFINS_Lucro_
@@ -106,7 +110,7 @@ def _cache_historico_ajustes(_session, competencia_id):
     return [dict(r) for r in carregar_historico_ajustes(_session, competencia_id)]
 
 
-def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
+def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id=None):
     """Card de inconsistência — cópia adaptada de `2_PIS_COFINS_Lucro_Real.py::_card_inconsistencia` (ver lá
     a docstring completa sobre o motivo do `key_prefix`: a mesma inconsistência pode, em tese, aparecer em
     mais de uma seção da tela no mesmo run do Streamlit, e sem prefixo os widgets colidem
@@ -191,11 +195,21 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
 
         if row["status"] != "ajustado" and row["tipo"] in TIPOS_COM_CST_AJUSTAVEL:
             st.divider()
-            st.caption(
-                "Ou, se preferir, registre direto qual CST deveria ter sido usado — isso NÃO recalcula "
-                "nada nem altera o item importado, fica só como histórico/checklist do que precisa ser "
-                "corrigido na origem (Winthor):"
-            )
+            seguro = escopo_ajuste_seguro(row)
+            if seguro:
+                st.caption(
+                    "Registre qual CST deveria ter sido usado — desde 20/08/2026, isso CORRIGE de verdade o "
+                    "CST em relatorio_pc_itens (mantendo o CST original no histórico) e recalcula a apuração "
+                    "desta competência na hora:"
+                )
+            else:
+                st.caption(
+                    "Este CST aparece em itens de origens diferentes (sem um único CFOP/NCM associado) — "
+                    "não dá pra corrigir automaticamente sem risco de mudar itens que talvez precisassem de "
+                    "um CST diferente entre si. Registre aqui só como histórico/checklist do que precisa ser "
+                    "corrigido na origem (Winthor); para aplicar de verdade, corrija item a item na grade "
+                    "ou cadastre uma Regra de CST × CFOP/NCM (aba 🔖) para a próxima importação."
+                )
             opcoes_cst = [c["codigo"] for c in csts_disponiveis]
             cst_corrigido = st.selectbox(
                 "CST correto", opcoes_cst,
@@ -206,13 +220,27 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix):
             observacao_ajuste = st.text_input(
                 "Observação (opcional)", key=f"{key_prefix}_obs_ajuste_{row['id']}"
             )
-            if st.button("Registrar ajuste de CST", key=f"{key_prefix}_ajustar_{row['id']}"):
-                registrar_ajuste_cst(
-                    session, row["id"], cst_corrigido,
-                    observacao_ajuste or None, usuario_atual(),
-                )
-                _cache_inconsistencias.clear()
-                _cache_historico_ajustes.clear()
+            rotulo_botao = "✅ Aplicar CST corrigido e recalcular" if seguro else "Registrar ajuste (só histórico)"
+            if st.button(rotulo_botao, key=f"{key_prefix}_ajustar_{row['id']}"):
+                if seguro:
+                    resultado = aplicar_ajuste_cst(
+                        session, row["id"], cst_corrigido, observacao_ajuste or None, usuario_atual(),
+                    )
+                    if competencia_id is not None:
+                        linhas_recalc = calcular_apuracao_pc_presumido(session, competencia_id)
+                        salvar_apuracao_pc_presumido(session, competencia_id, linhas_recalc)
+                    _cache_inconsistencias.clear()
+                    _cache_historico_ajustes.clear()
+                    st.success(
+                        f"CST corrigido em {resultado['n_itens_corrigidos']} item(ns) — apuração recalculada."
+                    )
+                else:
+                    registrar_ajuste_cst(
+                        session, row["id"], cst_corrigido,
+                        observacao_ajuste or None, usuario_atual(),
+                    )
+                    _cache_inconsistencias.clear()
+                    _cache_historico_ajustes.clear()
                 st.rerun()
 
 
@@ -439,10 +467,73 @@ empresa_ids_grupo = [f["id"] for f in filiais_grupo]
 df_inc = _cache_inconsistencias(session, competencia_id)
 csts_disponiveis = _cache_csts_disponiveis(session)
 
-(aba_apuracao, aba_conferencia, aba_regras_cst, aba_cfop_sem_checagem, aba_inconsist) = st.tabs([
-    "📋 Apuração", "📎 Conferência 1024×1096", "🔖 Regras de CST", "🚫 CFOPs sem Checagem de CST",
-    "⚠️ Inconsistências",
+(aba_ajustes, aba_apuracao, aba_conferencia, aba_regras_cst, aba_cfop_sem_checagem, aba_inconsist) = st.tabs([
+    "🧮 Ajustes Manuais", "📋 Apuração", "📎 Conferência 1024×1096", "🔖 Regras de CST",
+    "🚫 CFOPs sem Checagem de CST", "⚠️ Inconsistências",
 ])
+
+# ---------------------------------------------------------------------------------------------- Ajustes Manuais
+# Nova em 20/08/2026 (sessão de continuação — pedido do usuário: "criar lançamento manual para todas" as
+# linhas que ficavam ⏳ pendente). Regime Presumido não tinha NENHUM lançamento manual até aqui (diferente
+# do Lucro Real, que já tinha Aluguéis/Depreciação desde 14/08/2026) — mesmo padrão de formulário genérico
+# do Real (ver lib/lancamentos_manuais_pc.py), só que com TIPOS_PRESUMIDO e as alíquotas do regime cumulativo
+# (PIS 0,65% / COFINS 3,00%).
+with aba_ajustes:
+    st.caption(
+        "Receitas/exclusões de PIS/COFINS que não vêm da Rotina 1024/Relatório 1096 — linhas 1.3 (Serviços), "
+        "1.5 (Aluguel recebido), 1.6 (Demais Receitas), 2.2 (Monofásica) e 2.6 (Exportação) da apuração. "
+        "Informe a base do mês — só a base entra no cálculo (neste regime, PIS e COFINS são apurados uma "
+        "vez só, em cima da Base de Cálculo final \"3\"); o PIS (0,65%) e o COFINS (3,00%) mostrados abaixo "
+        "são só de referência, calculados nesta mesma base."
+    )
+    with st.form("novo_lancamento_pc_presumido"):
+        c1, c2 = st.columns(2)
+        tipo_lanc = c1.selectbox("Tipo", list(lmpc.TIPOS_PRESUMIDO.keys()),
+                                  format_func=lambda t: lmpc.TIPOS_PRESUMIDO[t])
+        base_valor = c2.number_input("Base do mês (R$)", min_value=0.0, step=100.0, format="%.2f")
+        descricao_lanc = st.text_input("Descrição", placeholder="ex: Serviço de instalação — julho/2026")
+        if st.form_submit_button("Adicionar", type="primary"):
+            if not descricao_lanc.strip():
+                st.error("Informe uma descrição.")
+            elif base_valor <= 0:
+                st.error("Informe uma base maior que zero.")
+            else:
+                resultado = lmpc.adicionar(
+                    session, competencia_id, tipo_lanc, descricao_lanc.strip(), base_valor, usuario_atual(),
+                    aliq_pis=lmpc.ALIQ_PIS_PRESUMIDO, aliq_cofins=lmpc.ALIQ_COFINS_PRESUMIDO,
+                )
+                st.success(f"Lançamento adicionado — PIS {formatar_moeda(resultado['valor_pis'])}, "
+                           f"COFINS {formatar_moeda(resultado['valor_cofins'])} (referência).")
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("Lançamentos desta competência")
+    lancamentos_presumido = lmpc.listar(session, competencia_id)
+    lancamentos_presumido = [l for l in lancamentos_presumido if l["tipo"] in lmpc.TIPOS_PRESUMIDO]
+    if not lancamentos_presumido:
+        st.info("Nenhum lançamento manual ainda.")
+    else:
+        df_original_lanc = pd.DataFrame(lancamentos_presumido)
+        df_original_lanc["tipo"] = df_original_lanc["tipo"].map(lmpc.TIPOS_PRESUMIDO)
+        df_editado_lanc = st.data_editor(
+            df_original_lanc, use_container_width=True, hide_index=True, num_rows="dynamic",
+            disabled=["id", "tipo", "descricao", "base_valor", "valor_pis", "valor_cofins", "created_at"],
+            column_config={
+                "base_valor": st.column_config.NumberColumn("Base", format="R$ %.2f"),
+                "valor_pis": st.column_config.NumberColumn("PIS (referência)", format="R$ %.2f"),
+                "valor_cofins": st.column_config.NumberColumn("COFINS (referência)", format="R$ %.2f"),
+            },
+            key="grade_lancamentos_pc_presumido",
+        )
+        removidos_lanc = lmpc.excluir_removidos(session, df_original_lanc, df_editado_lanc)
+        if removidos_lanc:
+            st.success(f"{removidos_lanc} lançamento(s) excluído(s).")
+            st.rerun()
+
+    st.caption(
+        "Depois de adicionar/remover um lançamento, clique em **🔄 Calcular apuração** (aba 📋 Apuração) "
+        "para refletir na Base de Cálculo e no resultado final."
+    )
 
 # ---------------------------------------------------------------------------------------------- Apuração
 with aba_apuracao:
@@ -696,7 +787,7 @@ with aba_inconsist:
             _mostrar_resumo_por_tipo(df_filtrado, "pres_inc_geral")
             st.divider()
             for _, row in df_filtrado.iterrows():
-                _card_inconsistencia(session, row, csts_disponiveis, "pres_inc_geral")
+                _card_inconsistencia(session, row, csts_disponiveis, "pres_inc_geral", competencia_id)
 
     st.divider()
     st.subheader("Histórico de ajustes manuais de CST")

@@ -381,21 +381,127 @@ def definir_excecao_ativa(session, excecao_id, ativa):
     session.commit()
 
 
-# --------------------------------------------------------------------------------------- Ajuste manual (log-only)
+# --------------------------------------------------------------------------------------- Ajuste manual de CST
+# Até 20/08/2026 (sessão de continuação) isso era só histórico (registrar_ajuste_cst, mantida abaixo pros
+# casos de escopo ambíguo). Pedido do usuário no mesmo dia ("que esses ajustes fiquem salvos para ajuste no
+# sistema"): quando dá pra saber com segurança QUAIS itens do Relatório 1096 geraram a inconsistência,
+# `aplicar_ajuste_cst` agora corrige de verdade o CST em relatorio_pc_itens (mantendo o CST original no
+# histórico de ajustes_cst_pc) e quem chama (a página) recalcula a apuração na sequência — ver
+# `escopo_ajuste_seguro` pra quando isso é seguro fazer.
+def escopo_ajuste_seguro(row) -> bool:
+    """True quando dá pra identificar, sem ambiguidade, o conjunto EXATO de itens de `relatorio_pc_itens`
+    por trás da inconsistência — condição pra `aplicar_ajuste_cst` poder corrigir o CST de verdade:
+
+    - 'cst_nao_mapeado': sempre seguro — o CST em si não existe na tabela oficial (ver
+      importacao_pc._registrar_inconsistencias_1096), então TODO item desta filial/competência/operação com
+      esse CST literal está errado da mesma forma; não há "alguns itens certos, outros errados" dentro do
+      grupo.
+    - 'cst_regra_cfop' / 'cst_regra_ncm': seguro só no caso 1 de `_checar_regra_cfop`/`_checar_regra_ncm`
+      (`cst_esperado` não era None quando a inconsistência foi gerada) — aí a linha tem um CFOP ou NCM
+      específico gravado. O caso 2 (mesmo CST espalhado por vários CFOPs/NCMs diferentes, sem um "CST
+      esperado" único) grava cfop=None e ncm=None nesses dois tipos — ver `_inserir_grupo` nas duas funções
+      — então não há um CFOP/NCM único pra escopar a correção; aplicar mudaria itens que talvez precisassem
+      de CSTs diferentes entre si.
+    - 'cst_regra_alerta': nunca seguro — `_checar_alerta` agrupa só por (cst, tipo_operacao), sem CFOP/NCM
+      nenhum (o `cfop_repr` salvo na linha é só uma AMOSTRA pra descrição, "min(cfop)" entre vários
+      diferentes — não é o escopo real do grupo).
+    - qualquer outro tipo (ex.: 'cfop_sem_grupo'): não tem CST pra ajustar, nem chega a aparecer nesta tela
+      (ver TIPOS_COM_CST_AJUSTAVEL nas páginas).
+
+    `row` pode ser um dict/Row do SQLAlchemy (cfop/ncm ausentes = None) OU uma linha de DataFrame do pandas
+    (cfop/ncm ausentes = NaN, um float) — vindo da tela, que monta o card a partir de um `df_inc.iterrows()`.
+    Usa `pd.notna()` (não `is not None`) pra tratar os dois casos igual: `NaN is not None` dá True em Python
+    puro (são objetos diferentes), o que faria esta função achar por engano que uma linha SEM CFOP/NCM tinha
+    um CFOP/NCM válido — um bug que aplicaria a correção com escopo largo demais."""
+    tipo = row["tipo"]
+    if tipo == "cst_nao_mapeado":
+        return True
+    if tipo == "cst_regra_cfop":
+        return pd.notna(row["cfop"])
+    if tipo == "cst_regra_ncm":
+        return pd.notna(row["ncm"])
+    return False
+
+
+def aplicar_ajuste_cst(session, inconsistencia_id, cst_corrigido, observacao=None, usuario=None):
+    """Corrige de verdade o CST dos itens de `relatorio_pc_itens` por trás desta inconsistência, grava o
+    histórico em `ajustes_cst_pc` (mesma tabela/formato de antes) e marca a inconsistência como 'ajustado'.
+    NÃO recalcula a apuração sozinha — quem chama (a página) roda `calcular_apuracao_pc`/
+    `salvar_apuracao_pc` (ou os equivalentes do Presumido) logo em seguida, mesmo botão que já existia
+    ("🔄 Calcular apuração"). Levanta ValueError se `escopo_ajuste_seguro` for False — chame
+    `registrar_ajuste_cst` (log-only) nesse caso, é o único caminho seguro pra escopo ambíguo.
+
+    Retorna {"n_itens_corrigidos": int} — pode ser 0 numa borda rara (o item que gerou a inconsistência foi
+    editado/excluído manualmente na grade Entrada/Saída depois de a inconsistência ter sido gerada e antes
+    de o ajuste ser aplicado); não é tratado como erro, só reflete a realidade atual dos dados."""
+    row = session.execute(text("""
+        select competencia_id, empresa_id, tipo, cst, cfop, ncm, tipo_operacao
+        from inconsistencias_pc where id = :id
+    """), {"id": inconsistencia_id}).mappings().first()
+    if row is None:
+        raise ValueError("Inconsistência não encontrada.")
+    if not escopo_ajuste_seguro(row):
+        raise ValueError(
+            "Esta inconsistência não tem um CFOP ou NCM específico associado (o mesmo CST aparece em itens "
+            "de origens diferentes) — aplicar uma correção automática arriscaria mudar itens que talvez "
+            "precisassem de um CST diferente entre si. Use 'Registrar ajuste (só histórico)' e corrija "
+            "item a item no Winthor, ou cadastre uma Regra de CST × CFOP/NCM (aba 🔖) para a próxima "
+            "importação já vir certa."
+        )
+
+    # Escopo por tipo — ver docstring de escopo_ajuste_seguro pra por que NCM não soma cláusula de CFOP
+    # (cfop_repr é só amostra) e por que cst_nao_mapeado não tem cláusula de CFOP/NCM nenhuma.
+    params = {
+        "cid": row["competencia_id"], "eid": row["empresa_id"], "top": row["tipo_operacao"],
+        "cst_orig": row["cst"], "cst_novo": cst_corrigido,
+    }
+    clausula = ""
+    if row["tipo"] == "cst_regra_cfop":
+        clausula = " and cfop = :cfop"
+        params["cfop"] = row["cfop"]
+    elif row["tipo"] == "cst_regra_ncm":
+        clausula = " and ncm = :ncm"
+        params["ncm"] = row["ncm"]
+
+    resultado = session.execute(text(f"""
+        update relatorio_pc_itens
+        set cst = :cst_novo
+        where competencia_id = :cid and empresa_id = :eid and tipo_operacao = :top and cst = :cst_orig
+        {clausula}
+    """), params)
+    n_itens = resultado.rowcount
+
+    usuario = usuario or {}
+    session.execute(text("""
+        insert into ajustes_cst_pc (inconsistencia_id, cst_original, cst_corrigido, observacao, ajustado_por,
+                                     aplicado)
+        values (:iid, :original, :corrigido, :obs, :por, true)
+    """), {"iid": inconsistencia_id, "original": row["cst"], "corrigido": cst_corrigido, "obs": observacao,
+           "por": usuario.get("id")})
+    session.execute(text("""
+        update inconsistencias_pc
+        set status = 'ajustado', revisado_por = :por, revisado_em = now()
+        where id = :id
+    """), {"id": inconsistencia_id, "por": usuario.get("id")})
+    session.commit()
+    return {"n_itens_corrigidos": n_itens}
+
+
 def registrar_ajuste_cst(session, inconsistencia_id, cst_corrigido, observacao=None, usuario=None):
     """Registra uma correção manual de CST feita na tela — SÓ HISTÓRICO. Não atualiza relatorio_pc_itens,
     não recalcula nada: a apuração continua 100% sobre a Rotina 1024. Serve pra virar uma lista de "o que
-    corrigir no Winthor" (rastreável: quem, quando, de que CST original pra que CST corrigido). Marca a
-    inconsistência como status='ajustado' (distinto de 'revisado', que é só "vi e não vou mexer"). Essa
-    ação é específica do PIS/COFINS (não existe no ICMS) e continua disponível junto com o fluxo de
-    revisar/ignorar/replicar descrito acima — são independentes."""
+    corrigir no Winthor" (rastreável: quem, quando, de que CST original pra que CST corrigido). Usado só
+    quando `escopo_ajuste_seguro` é False (ver `aplicar_ajuste_cst`) — nesses casos aplicar de verdade
+    arriscaria corrigir itens que não deveriam mudar. Marca a inconsistência como status='ajustado'
+    (distinto de 'revisado', que é só "vi e não vou mexer")."""
     usuario = usuario or {}
     original = session.execute(
         text("select cst from inconsistencias_pc where id = :id"), {"id": inconsistencia_id}
     ).scalar()
     session.execute(text("""
-        insert into ajustes_cst_pc (inconsistencia_id, cst_original, cst_corrigido, observacao, ajustado_por)
-        values (:iid, :original, :corrigido, :obs, :por)
+        insert into ajustes_cst_pc (inconsistencia_id, cst_original, cst_corrigido, observacao, ajustado_por,
+                                     aplicado)
+        values (:iid, :original, :corrigido, :obs, :por, false)
     """), {"iid": inconsistencia_id, "original": original, "corrigido": cst_corrigido, "obs": observacao,
            "por": usuario.get("id")})
     session.execute(text("""
@@ -550,9 +656,14 @@ def _salvar_regra_generica(session, tabela, colunas_chave, colunas_conflito, df_
 
 def carregar_historico_ajustes(session, competencia_id):
     """Uma linha por ajuste manual registrado nesta competência — usada pra exportar/consultar a lista de
-    correções pendentes de aplicar no Winthor (CST original → CST corrigido, quem, quando, em que CFOP/NCM)."""
+    ajustes de CST. `aplicado` (coluna nova, migração sql/010) distingue os dois caminhos desde 20/08/2026:
+    True = corrigido de verdade em relatorio_pc_itens (aplicar_ajuste_cst, escopo inequívoco); False = só
+    histórico/checklist pra corrigir manualmente no Winthor (registrar_ajuste_cst, escopo ambíguo). Ajustes
+    de ANTES desta migração ficam com aplicado=false por padrão — é o comportamento real deles (nenhum
+    mexeu em relatorio_pc_itens)."""
     rows = session.execute(text("""
         select a.id, a.inconsistencia_id, a.cst_original, a.cst_corrigido, a.observacao, a.ajustado_em,
+               coalesce(a.aplicado, false) as aplicado,
                i.cfop, i.ncm, i.tipo_operacao, i.descricao,
                coalesce(e.filial_winthor, '(não identificada)') as filial
         from ajustes_cst_pc a

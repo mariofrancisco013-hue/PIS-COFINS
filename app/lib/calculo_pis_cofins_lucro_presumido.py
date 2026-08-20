@@ -117,14 +117,29 @@ CFOPS_1_4 = frozenset({5152, 5202, 5409, 5411, 5910, 5923, 5926, 5927, 5929, 594
 # CONTABIL, seção "DEVOLUÇÃO DE VENDAS", e contra a aba PC (linhas de detalhe sob "1.2").
 CFOPS_1_2_DEVOLUCAO_VENDA = frozenset({1202, 1411, 2202, 2411, 3202})
 
+# 1.3/1.5/1.6/2.2/2.6 saíram desta lista em 20/08/2026 (sessão de continuação — pedido do usuário: "criar
+# lançamento manual para todas") — ganharam lançamento manual, ver LANCAMENTO_TIPO_PARA_LINHA_PRESUMIDO
+# abaixo e lancamentos_manuais_pc.TIPOS_PRESUMIDO. 5.1/5.2 (PERD/COMP) continuam pendentes — não é um valor
+# que o analista lança mensalmente, é um crédito que se pede à parte (mesmo ponto em aberto do saldo credor
+# do Lucro Real, que também não encadeia sozinho entre competências).
 LINHAS_PENDENTES = {
-    "1.3": "(+) Faturamento Bruto (Prestação de Serviços)",
-    "1.5": "(+) Receitas de Aluguel de Bens",
-    "1.6": "(+) Demais Receitas Operacionais",
-    "2.2": "(-) Incidência da Contribuição Monofásica",
-    "2.6": "(-) Exportação de Mercadorias para o Exterior",
     "5.1": "PERD/COMP - cumulativa PIS",
     "5.2": "PERD/COMP - cumulativa COFINS",
+}
+
+# Lançamentos manuais (novos em 20/08/2026) — diferente do Lucro Real, aqui só a BASE importa: o Presumido
+# calcula PIS/COFINS uma vez só em cima da Base de Cálculo final ("3" = "1" − "2"), então estas linhas só
+# contribuem com `base_valor`, somado em total_receitas (débito) ou total_exclusoes (exclusão) ANTES de "3"
+# ser calculada — ver calcular_apuracao_pc_presumido. `valor_pis`/`valor_cofins` gravados no lançamento (via
+# lancamentos_manuais_pc.ALIQ_PIS_PRESUMIDO/ALIQ_COFINS_PRESUMIDO) ficam só de referência/auditoria.
+LANCAMENTO_TIPO_PARA_LINHA_DEBITO_PRESUMIDO = {
+    "servicos_debito_presumido": ("1.3", "(+) Faturamento Bruto (Prestação de Serviços)"),
+    "aluguel_recebido_debito_presumido": ("1.5", "(+) Receitas de Aluguel de Bens"),
+    "demais_receitas_debito_presumido": ("1.6", "(+) Demais Receitas Operacionais"),
+}
+LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_PRESUMIDO = {
+    "monofasica_exclusao_presumido": ("2.2", "(-) Incidência da Contribuição Monofásica"),
+    "exportacao_exclusao_presumido": ("2.6", "(-) Exportação de Mercadorias para o Exterior"),
 }
 
 SECAO_RECEITAS = "1 — Receitas Tributáveis"
@@ -310,10 +325,23 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
                                           Decimal("0"), Decimal("0"), detalhe={"base_total": str(base_1_1)}))
     linhas.append(LinhaApuracaoPresumido("1.4", "(+) Outras Saídas", Decimal("0"), Decimal("0"),
                                           detalhe={"base_total": str(base_1_4)}))
-    for linha in ("1.3", "1.5", "1.6"):
-        linhas.append(LinhaApuracaoPresumido(linha, LINHAS_PENDENTES[linha], Decimal("0"), Decimal("0"),
-                                              manual=True))
-    total_receitas = base_1_1 + base_1_4
+    # Lançamentos manuais de receita (1.3/1.5/1.6) — novos em 20/08/2026, ver LANCAMENTO_TIPO_PARA_LINHA_
+    # DEBITO_PRESUMIDO acima. Só a base soma em total_receitas — PIS/COFINS deste regime é calculado uma vez
+    # só, lá na frente, em cima da Base de Cálculo final "3".
+    lancamentos = session.execute(text("""
+        select tipo, descricao, base_valor, valor_pis, valor_cofins
+        from lancamentos_manuais_pc where competencia_id = :cid
+    """), {"cid": competencia_id}).mappings().all()
+    base_lancamentos_debito = Decimal("0")
+    for tipo, (linha, descricao) in LANCAMENTO_TIPO_PARA_LINHA_DEBITO_PRESUMIDO.items():
+        itens_tipo = [l for l in lancamentos if l["tipo"] == tipo]
+        base_tipo = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
+        linhas.append(LinhaApuracaoPresumido(linha, descricao, Decimal("0"), Decimal("0"), detalhe={
+            "base_total": str(base_tipo),
+            "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
+        }))
+        base_lancamentos_debito += base_tipo
+    total_receitas = base_1_1 + base_1_4 + base_lancamentos_debito
     linhas.append(LinhaApuracaoPresumido("1", "1 - Totais das Receitas Tributáveis", Decimal("0"),
                                           Decimal("0"), detalhe={"base_total": str(total_receitas)}))
 
@@ -330,7 +358,18 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
                     "da Conferência 1024×1096 do Lucro Real).",
         },
     ))
-    linhas.append(LinhaApuracaoPresumido("2.2", LINHAS_PENDENTES["2.2"], Decimal("0"), Decimal("0"), manual=True))
+    # Lançamentos manuais de exclusão (2.2/2.6) — novos em 20/08/2026, ver LANCAMENTO_TIPO_PARA_LINHA_
+    # EXCLUSAO_PRESUMIDO acima. Só a base soma em total_exclusoes — mesmo raciocínio de 1.3/1.5/1.6 (só a
+    # Base de Cálculo final "3" tem PIS/COFINS próprio neste regime).
+    base_lancamentos_exclusao = Decimal("0")
+    for tipo, (linha, descricao) in LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_PRESUMIDO.items():
+        itens_tipo = [l for l in lancamentos if l["tipo"] == tipo]
+        base_tipo = sum((_dec(l["base_valor"]) for l in itens_tipo), Decimal("0"))
+        linhas.append(LinhaApuracaoPresumido(linha, descricao, Decimal("0"), Decimal("0"), detalhe={
+            "base_total": str(base_tipo),
+            "lancamentos": [{"descricao": l["descricao"], "base": str(l["base_valor"])} for l in itens_tipo],
+        }))
+        base_lancamentos_exclusao += base_tipo
 
     icms_saida = _soma_icms_saida_nao_isento_escopado(CFOPS_1_1 | CFOPS_1_4)
     linhas.append(LinhaApuracaoPresumido(
@@ -357,9 +396,7 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
                     "igual à planilha antiga, mesmo aparecendo dentro da seção de Exclusões.",
         },
     ))
-    linhas.append(LinhaApuracaoPresumido("2.6", LINHAS_PENDENTES["2.6"], Decimal("0"), Decimal("0"), manual=True))
-
-    total_exclusoes = isentos_saida + icms_saida + base_devolucao
+    total_exclusoes = isentos_saida + icms_saida + base_devolucao + base_lancamentos_exclusao
     linhas.append(LinhaApuracaoPresumido("2", "2 - Total das Exclusões", Decimal("0"), Decimal("0"),
                                           detalhe={"base_total": str(total_exclusoes)}))
 

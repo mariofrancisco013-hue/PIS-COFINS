@@ -202,35 +202,48 @@ def _dec(v):
     return Decimal(str(v)) if v is not None else Decimal("0")
 
 
-def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop):
-    """Soma valor_contábil (bruto) e valor_contábil − valor_icms − exclusão_cst (líquido) de todas as linhas
-    do resumo_1024_pc (já somando todas as filiais da competência) cujo CFOP pertence a este grupo. Devolve
-    (base_bruta, base_liquida, detalhe_por_cfop) — o líquido é o que efetivamente entra no PIS/COFINS
+def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, icms_correto_por_cfop):
+    """Soma valor_contábil (bruto) e valor_contábil − ICMS_correto − exclusão_cst (líquido) de todas as
+    linhas do resumo_1024_pc (já somando todas as filiais da competência) cujo CFOP pertence a este grupo.
+    Devolve (base_bruta, base_liquida, detalhe_por_cfop) — o líquido é o que efetivamente entra no PIS/COFINS
     (base_liquida × alíquota); o bruto é só para exibir a "Receita" antes das exclusões, pra ficar visível na
     tela que as linhas 2.x/6.x realmente saem da base bruta.
 
-    `exclusao_cst_por_cfop` (novo em 19/08/2026) = {cfop: Decimal} com o Valor Contábil somado do Relatório
-    1096 dos itens com CST 70/71/74 (entrada) ou 6/7 (saída) daquele CFOP — ver
-    _somar_exclusao_cst_por_cfop. Embutida aqui, CFOP a CFOP, exatamente como o ICMS (valor_icms) já era —
-    mantém a mesma granularidade de arredondamento (uma quantização por grupo, não uma por linha), em vez de
-    subtrair um total avulso do resultado final.
+    CORRIGIDOS DOIS BUGS em 20/08/2026 (ver seção "Bug real..." na metodologia do Presumido, mesma causa
+    raiz aplicada aqui — usuário pediu pra ajustar o Real também depois de confirmar com dados reais no
+    Presumido):
 
-    NOTA (19/08/2026, 2ª revisão): a coluna "Outras" da Rotina 1024 (valor_outras) NÃO é mais usada aqui —
-    ver nota de calcular_apuracao_pc sobre os grupos "1.4"/"5.8"."""
-    base_bruta = Decimal("0")
-    base_liquida = Decimal("0")
-    det = {}
+    1. **ICMS agregado por CFOP inteiro causava duplo desconto.** Antes: `icms = r["valor_icms"]` (Rotina
+       1024, por linha de resumo_1024 — que já soma TODOS os itens daquele CFOP/filial, inclusive os com CST
+       70/71/74 (entrada) ou 6/7 (saída)). Como esses mesmos itens também têm o Valor Contábil INTEIRO deles
+       excluído por `exclusao_cst_por_cfop`, o ICMS embutido nesse valor contábil era descontado duas vezes.
+       Agora usa `icms_correto_por_cfop` (ver `_somar_icms_nao_excluido_por_cfop`), que soma
+       `relatorio_pc_itens.valor_nao_tributado` só dos itens SEM CST excluído — por identidade do próprio
+       Winthor (`Vl.Tributado = Vl.Contábil − Vl.Não Tributado`, confirmada item a item contra um relatório
+       de conferência oficial no módulo Presumido — mesmo formato de relatório, entrada/saída), essa coluna
+       já É o ICMS do item quando ele não é excluído.
+    2. **Exclusão de CST multiplicada pelo número de filiais.** `resumo_1024_pc` tem UMA LINHA POR (FILIAL,
+       CFOP) — o loop antigo aplicava `exclusao_cst_por_cfop.get(cfop)` (um total já somado entre TODAS as
+       filiais) a CADA linha de filial que batia com aquele CFOP, então um CFOP reportado por 3 filiais tinha
+       sua exclusão de CST subtraída 3 vezes na base líquida. Agora o Valor Contábil é agregado por CFOP
+       PRIMEIRO (somando todas as filiais), e cada exclusão (ICMS correto e CST) é aplicada só UMA VEZ por
+       CFOP, do mesmo jeito que já é feito no módulo Presumido."""
+    contabil_por_cfop = {}
     for r in resumo_1024:
         if r["tipo_operacao"] != tipo_operacao or r["grupo"] != grupo:
             continue
-        contabil = _dec(r["valor_contabil"])
-        icms = _dec(r["valor_icms"])
-        exc_cst = exclusao_cst_por_cfop.get(r["cfop"], Decimal("0"))
+        contabil_por_cfop[r["cfop"]] = contabil_por_cfop.get(r["cfop"], Decimal("0")) + _dec(r["valor_contabil"])
+
+    base_bruta = Decimal("0")
+    base_liquida = Decimal("0")
+    det = {}
+    for cfop, contabil in contabil_por_cfop.items():
+        icms = icms_correto_por_cfop.get(cfop, Decimal("0"))
+        exc_cst = exclusao_cst_por_cfop.get(cfop, Decimal("0"))
         liquido_item = contabil - icms - exc_cst
         base_bruta += contabil
         base_liquida += liquido_item
-        atual = det.get(r["cfop"], Decimal("0"))
-        det[r["cfop"]] = atual + liquido_item
+        det[cfop] = liquido_item
     return base_bruta, base_liquida, det
 
 
@@ -254,6 +267,27 @@ def _somar_exclusao_cst_por_cfop(session, competencia_id, tipo_operacao, csts):
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
+def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, csts_excluidos):
+    """{cfop: Decimal} com o ICMS destacado (`relatorio_pc_itens.valor_nao_tributado`) dos itens de
+    `tipo_operacao` cujo CST NÃO está em `csts_excluidos`, somado entre todas as filiais — NOVO em
+    20/08/2026, ver docstring de `_base_por_grupo` para a explicação completa do bug que isso corrige.
+    Extrapolado do que foi confirmado com dados reais no módulo Presumido (saída, CST 6/7): a identidade
+    `Vl.Tributado = Vl.Contábil − Vl.Não Tributado` é uma propriedade do próprio formato do relatório
+    "Analítico" do Winthor (mesmo gerador para Entrada e Saída, qualquer regime) — não foi reconfirmada
+    independentemente aqui para Entrada/CST 70-71-74, mas a mecânica do relatório é a mesma; vale re-
+    conferir contra um relatório de conferência real de Entrada antes de confiar 100% se algo não bater."""
+    placeholders = ", ".join(f":c{i}" for i in range(len(csts_excluidos)))
+    params = {"cid": competencia_id, "tipo": tipo_operacao}
+    params.update({f"c{i}": c for i, c in enumerate(csts_excluidos)})
+    rows = session.execute(text(f"""
+        select cfop, sum(valor_nao_tributado) as valor
+        from relatorio_pc_itens
+        where competencia_id = :cid and tipo_operacao = :tipo and cst not in ({placeholders})
+        group by cfop
+    """), params).mappings().all()
+    return {r["cfop"]: _dec(r["valor"]) for r in rows}
+
+
 def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     """Calcula as linhas 1.x-11.x da apuração PIS/COFINS Lucro Real a partir da Rotina 1024 (fonte primária,
     somando todas as filiais da competência/grupo). Não grava no banco — ver salvar_apuracao_pc."""
@@ -265,25 +299,25 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         where r.competencia_id = :cid
     """), {"cid": competencia_id}).mappings().all()
 
-    def _somar_exclusao(tipo_operacao, grupos, campo):
-        return sum(
-            (_dec(r[campo]) for r in resumo_1024 if r["tipo_operacao"] == tipo_operacao and r["grupo"] in grupos),
-            Decimal("0"),
-        )
-
-    def _somar_exclusao_cst_escopada(tipo_operacao, grupos, exclusao_por_cfop):
-        # Só conta o CFOP se ele de fato aparece em resumo_1024 dentro de um desses grupos — mesma regra
-        # aplicada dentro de _base_por_grupo, aqui só para o total de exibição (linha 6.5/2.7) bater com o
-        # que foi realmente subtraído da base, e não com a soma bruta de exclusao_por_cfop (que pode incluir
-        # CFOPs sem Rotina 1024 importada nesta competência/filial — ver nota em _somar_exclusao_cst_por_cfop).
+    def _somar_exclusao_cst_escopada(tipo_operacao, grupos, valor_por_cfop):
+        # Nome mantido por compatibilidade (usado desde 19/08/2026 só pra CST), mas genérico: soma qualquer
+        # {cfop: Decimal} restrito aos CFOPs que de fato aparecem em resumo_1024 dentro desses grupos — mesma
+        # regra aplicada dentro de _base_por_grupo, aqui só pro total de exibição (2.3/2.7/6.4/6.5) bater com
+        # o que foi realmente subtraído da base, e não com a soma bruta de valor_por_cfop (que pode incluir
+        # CFOPs sem Rotina 1024 importada nesta competência/filial). Desde 20/08/2026 também usada para o
+        # ICMS correto (icms_correto_saida/entrada), não só para a exclusão de CST.
         cfops_do_grupo = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == tipo_operacao and r["grupo"] in grupos}
-        return sum((v for cfop, v in exclusao_por_cfop.items() if cfop in cfops_do_grupo), Decimal("0"))
+        return sum((v for cfop, v in valor_por_cfop.items() if cfop in cfops_do_grupo), Decimal("0"))
 
     # Exclusão por CST (19/08/2026) — Valor Contábil dos itens do 1096 com CST 70/71/74 (entrada) / 6/7
     # (saída), agrupado por CFOP, calculado uma vez aqui e reusado tanto dentro de _base_por_grupo (embutido
     # na base líquida de cada grupo) quanto nos totais de exibição das linhas 6.5/2.7 abaixo.
     exclusao_cst_entrada = _somar_exclusao_cst_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
     exclusao_cst_saida = _somar_exclusao_cst_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
+    # ICMS correto (20/08/2026, ver docstring de _base_por_grupo) — substitui resumo_1024_pc.valor_icms
+    # dentro do cálculo da base líquida, pra não descontar duas vezes o ICMS dos itens já excluídos por CST.
+    icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
+    icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
 
     linhas: list[LinhaApuracaoPC] = []
 
@@ -294,7 +328,8 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     debito_base_liquida_total = Decimal("0")  # = base bruta - ICMS - Outras - CST 6/7 — é o que vira PIS/COFINS
     outras_bruta_saida = Decimal("0")  # = valor bruto do grupo "1.4" (ver nota abaixo em "2.5")
     for grupo, descricao in GRUPOS_DEBITO.items():
-        base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "saida", grupo, exclusao_cst_saida)
+        base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "saida", grupo, exclusao_cst_saida,
+                                                          icms_correto_saida)
         if grupo == "1.4":
             # "1.4 Outras Saídas" (catch-all de CFOP da Rotina 1024) — pedido do usuário em 19/08/2026, 2ª
             # revisão: a exclusão desse grupo NÃO depende mais da coluna "Outras" do PDF (valor_outras, que
@@ -318,7 +353,7 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         debito_base_bruta_total += base_bruta
         debito_base_liquida_total += base_liquida
 
-    icms_excluido_saida = _somar_exclusao("saida", GRUPOS_DEBITO.keys(), "valor_icms")
+    icms_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), icms_correto_saida)
     cst_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), exclusao_cst_saida)
     total_exclusoes_debito = icms_excluido_saida + outras_bruta_saida + cst_excluido_saida
 
@@ -329,8 +364,11 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_saida),
-            "nota": "Valor de ICMS destacado nas saídas (soma de todas as filiais, Rotina 1024) — é o que sai "
-                    "da Receita Bruta (linha 1.1 a 1.6) para chegar na Base de Cálculo líquida do PIS/COFINS.",
+            "nota": "CORRIGIDO em 20/08/2026: soma de relatorio_pc_itens.valor_nao_tributado (Relatório "
+                    "1096, saída) dos itens que NÃO são CST 6/7, todas as filiais — já é, item a item, o "
+                    "ICMS destacado de cada item com direito a débito. Antes somava valor_icms da Rotina "
+                    "1024 por CFOP inteiro (inclusive itens CST 6/7), descontando o ICMS deles duas vezes "
+                    "junto com a linha \"2.7\" — ver metodologia (\"Bug real encontrado...\").",
             "icms_destacado_saida_total": str(icms_excluido_saida),
         },
     ))
@@ -402,7 +440,8 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     credito_base_liquida_total = Decimal("0")
     outras_bruta_entrada = Decimal("0")  # = valor bruto do grupo "5.8" (mesmo padrão de "1.4"/"2.5")
     for grupo, descricao in GRUPOS_CREDITO.items():
-        base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "entrada", grupo, exclusao_cst_entrada)
+        base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "entrada", grupo, exclusao_cst_entrada,
+                                                          icms_correto_entrada)
         if grupo == "5.8":
             # "5.8 Outras Entradas" — mesmo tratamento de "1.4"/"2.5" (ver nota lá): grupo inteiro excluído
             # da base líquida (não gera crédito de PIS/COFINS), valor bruto replicado na linha "6.7".
@@ -420,7 +459,7 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         credito_base_bruta_total += base_bruta
         credito_base_liquida_total += base_liquida
 
-    icms_excluido_entrada = _somar_exclusao("entrada", GRUPOS_CREDITO.keys(), "valor_icms")
+    icms_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), icms_correto_entrada)
     cst_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), exclusao_cst_entrada)
     total_exclusoes_credito = icms_excluido_entrada + outras_bruta_entrada + cst_excluido_entrada
 
@@ -453,8 +492,11 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "6.4", "(-) ICMS Apuração - Destacado Entradas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_entrada),
-            "nota": "Valor de ICMS destacado nas entradas (soma de todas as filiais, Rotina 1024) — é o que "
-                    "sai da base bruta de crédito (linha 5.1 a 5.8) para chegar na Base de Cálculo líquida.",
+            "nota": "CORRIGIDO em 20/08/2026: soma de relatorio_pc_itens.valor_nao_tributado (Relatório "
+                    "1096, entrada) dos itens que NÃO são CST 70/71/74, todas as filiais — já é, item a "
+                    "item, o ICMS destacado de cada item com direito a crédito. Antes somava valor_icms da "
+                    "Rotina 1024 por CFOP inteiro (inclusive itens CST 70/71/74), descontando o ICMS deles "
+                    "duas vezes junto com a linha \"6.5\" — ver metodologia (\"Bug real encontrado...\").",
             "icms_destacado_entrada_total": str(icms_excluido_entrada),
         },
     ))
@@ -562,12 +604,15 @@ TOLERANCIA_CONFERENCIA = Decimal("1.00")  # diferença em R$ acima disso é sina
 
 def conferencia_1024_x_1096(session, competencia_id: int) -> list[dict]:
     """Uma linha por CFOP presente no 1024 e/ou no 1096 desta competência (todas as filiais somadas),
-    comparando PIS/COFINS: `1024` = (valor_contabil - valor_icms - valor_outras - exclusão_cst) × alíquota —
-    mesma base usada em calcular_apuracao_pc (atualizado em 19/08/2026 para incluir as mesmas exclusões
-    novas: coluna "Outras" da Rotina 1024 e CST 70/71/74/6/7 do 1096 — senão a conferência passaria a
-    divergir por definição para todo CFOP afetado por essas exclusões, mesmo quando os dados batem); `1096`
-    = soma direta de valor_pis/valor_cofins dos itens. Não usa cfop_pis_cofins (mostra TODO CFOP encontrado,
-    mesmo sem grupo) — o objetivo aqui é auditoria, não o cálculo da apuração."""
+    comparando PIS/COFINS: `1024` = (valor_contabil - ICMS_correto - exclusão_cst) × alíquota — MESMA base
+    usada em calcular_apuracao_pc (ver `_base_por_grupo`). CORRIGIDO em 20/08/2026: `valor_icms` agregado do
+    1024 (que inclui o ICMS dos itens já excluídos por CST) foi trocado por `_somar_icms_nao_excluido_por_
+    cfop` (Relatório 1096, só itens não-excluídos) — senão a Conferência ficaria "confirmando" uma conta
+    diferente da que a Apuração de fato faz (double-count de ICMS nos itens CST 70/71/74/6/7, ver
+    metodologia). `valor_outras` continua fora da base (mesmo motivo de calcular_apuracao_pc: grupos "1.4"/
+    "5.8" são zerados por inteiro, não usam mais essa coluna). `1096` = soma direta de valor_pis/valor_cofins
+    dos itens. Não usa cfop_pis_cofins (mostra TODO CFOP encontrado, mesmo sem grupo) — o objetivo aqui é
+    auditoria, não o cálculo da apuração."""
     linhas_1024 = session.execute(text("""
         select cfop, tipo_operacao, sum(valor_contabil) as valor_contabil, sum(valor_icms) as valor_icms,
                sum(valor_outras) as valor_outras
@@ -577,6 +622,8 @@ def conferencia_1024_x_1096(session, competencia_id: int) -> list[dict]:
 
     exclusao_cst_entrada = _somar_exclusao_cst_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
     exclusao_cst_saida = _somar_exclusao_cst_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
+    icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
+    icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
 
     linhas_1096 = session.execute(text("""
         select cfop, tipo_operacao, sum(valor_pis) as valor_pis, sum(valor_cofins) as valor_cofins
@@ -593,7 +640,10 @@ def conferencia_1024_x_1096(session, competencia_id: int) -> list[dict]:
         exclusao_cst = (exclusao_cst_entrada if r["tipo_operacao"] == "entrada" else exclusao_cst_saida).get(
             r["cfop"], Decimal("0")
         )
-        base = _dec(r["valor_contabil"]) - _dec(r["valor_icms"]) - _dec(r["valor_outras"]) - exclusao_cst
+        icms_correto = (icms_correto_entrada if r["tipo_operacao"] == "entrada" else icms_correto_saida).get(
+            r["cfop"], Decimal("0")
+        )
+        base = _dec(r["valor_contabil"]) - icms_correto - exclusao_cst
         pis_1024 = (base * ALIQ_PIS).quantize(Decimal("0.01"))
         cofins_1024 = (base * ALIQ_COFINS).quantize(Decimal("0.01"))
         r1096 = por_cfop_1096.get(chave)

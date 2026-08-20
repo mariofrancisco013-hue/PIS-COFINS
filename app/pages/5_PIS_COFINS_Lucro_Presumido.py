@@ -26,7 +26,7 @@ from lib.status_apuracao_pc import status_competencia
 from lib import importacao_pc
 from lib.calculo_pis_cofins_lucro_presumido import (
     calcular_apuracao_pc_presumido, salvar_apuracao_pc_presumido, ordenar_linhas_para_exibicao,
-    LAYOUT_LINHAS, conferencia_1024_x_1096_presumido,
+    LAYOUT_LINHAS, conferencia_1024_x_1096_presumido, detalhar_cfop_presumido,
 )
 
 MODULO = "pis_cofins_lucro_presumido"
@@ -155,7 +155,18 @@ with aba_conferencia:
     st.caption(
         "Comparação por CFOP (só Saída) entre o resultado da Rotina 1024 (usado na apuração) e a soma direta "
         "de valor_pis/valor_cofins do Relatório 1096 — só leitura, não muda nenhum valor calculado. "
-        "Diferenças acima de R$ 1,00 aparecem como 'Divergente'."
+        "Diferenças acima de R$ 1,00 aparecem como 'Divergente'. **Correção de 20/08/2026, confirmada com o "
+        "usuário conferindo item a item contra um 3º relatório do Winthor ('Relatório de conferência PIS/"
+        "COFINS e ICMS'): o Relatório 1096 já está correto — ele exclui o ICMS destacado item a item "
+        "certinho. A causa real de divergência é a fórmula da Rotina 1024 (`Vl.Contábil − Vl.ICMS do CFOP "
+        "inteiro − Vl.Contábil dos itens CST 6/7`) descontar duas vezes o ICMS que pertence aos itens "
+        "isentos (uma vez embutido no ICMS agregado do CFOP, outra vez porque o valor contábil inteiro "
+        "desses itens já foi zerado à parte).** Causa provável \"ICMS destacado nos itens isentos\" = a "
+        "razão diff_cofins ÷ diff_pis bate com 3% ÷ 0,65% (4,615) — a assinatura matemática desse duplo "
+        "desconto; 'icms_isento_implicito' é o valor em R$ que esse duplo desconto está tirando da base, "
+        "estimado a partir do próprio diff (a Rotina 1024 não separa ICMS por CST de PIS/COFINS, então não "
+        "dá pra medir esse valor direto sem importar aquele 3º relatório). Só vale abrir o 'Detalhar um "
+        "CFOP' abaixo pras linhas com causa 'Outra causa'."
     )
     linhas_conf = conferencia_1024_x_1096_presumido(session, competencia_id)
     if not linhas_conf:
@@ -186,6 +197,73 @@ with aba_conferencia:
         else:
             st.caption(f"Mostrando {len(linhas_filtradas)} de {len(linhas_conf)} CFOP(s).")
             df_conf = pd.DataFrame(linhas_filtradas)
+            # "Causa provável" (corrigido em 20/08/2026 — ver docstring de `_linha_conferencia`): pra CFOPs
+            # "Divergente", testa se a razão diff_cofins/diff_pis bate com 3%/0,65% (assinatura de ICMS
+            # descontado 2x nos itens isentos pela fórmula do 1024). "icms_1024" é o ICMS agregado do CFOP
+            # inteiro (só contexto, NÃO é a causa da divergência — é ~25x maior que ela na prática).
+            # "icms_isento_implicito" é a estimativa (via diff) do ICMS só dos itens isentos, a causa real.
+            df_conf = df_conf.rename(columns={"icms_1024": "icms_1024_num",
+                                               "icms_isento_implicito": "icms_isento_implicito_num"})
             for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins"):
                 df_conf[col] = df_conf[col].apply(lambda v: formatar_moeda(v) if v is not None else "—")
-            st.dataframe(df_conf, use_container_width=True, hide_index=True)
+            df_conf["icms_1024"] = df_conf["icms_1024_num"].apply(
+                lambda v: formatar_moeda(v) if v is not None else "—")
+            df_conf["icms_isento_implicito"] = df_conf["icms_isento_implicito_num"].apply(
+                lambda v: formatar_moeda(v) if v is not None else "—")
+            df_conf["causa_provavel"] = df_conf["causa_provavel"].fillna("—")
+            colunas_exibir = ["cfop", "tipo_operacao", "pis_1024", "cofins_1024", "pis_1096", "cofins_1096",
+                               "diff_pis", "diff_cofins", "icms_1024", "icms_isento_implicito", "situacao",
+                               "causa_provavel"]
+            st.dataframe(df_conf[colunas_exibir], use_container_width=True, hide_index=True)
+
+        # -------------------------------------------------------------------------------------- Detalhar um CFOP
+        st.markdown("---")
+        st.subheader("🔍 Detalhar um CFOP")
+        st.caption(
+            "Mostra o insumo bruto por trás da linha acima: o que a Rotina 1024 trouxe por filial (lado "
+            "\"1024\") e os itens do Relatório 1096 agrupados por CST, com a faixa de alíquota de PIS/COFINS "
+            "usada em cada um (lado \"1096\"). Causa mais comum de divergência: a Rotina 1024 soma o CFOP "
+            "inteiro e aplica uma alíquota só (0,65%/3%), mas o 1096 respeita a alíquota de cada item — se "
+            "aparecer um CST com aliq_pis/aliq_cofins diferente de 0,65%/3% aqui embaixo (ex.: monofásica, "
+            "ST, alíquota zero), é ele que está puxando a diferença."
+        )
+        cfops_disponiveis = sorted({l["cfop"] for l in linhas_conf})
+        cfops_divergentes = sorted({l["cfop"] for l in linhas_conf if l["situacao"] != "OK"})
+        cfop_detalhe = st.selectbox(
+            "CFOP", cfops_disponiveis,
+            index=cfops_disponiveis.index(cfops_divergentes[0]) if cfops_divergentes else 0,
+            key="conf_pres_cfop_detalhe",
+        )
+        detalhe = detalhar_cfop_presumido(session, competencia_id, cfop_detalhe)
+
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            st.markdown("**Rotina 1024 — por filial**")
+            if not detalhe["1024_por_filial"]:
+                st.info("Nenhuma linha da Rotina 1024 para este CFOP nesta competência.")
+            else:
+                df_1024 = pd.DataFrame(detalhe["1024_por_filial"])
+                df_1024["valor_contabil"] = df_1024["valor_contabil"].apply(formatar_moeda)
+                df_1024["valor_icms"] = df_1024["valor_icms"].apply(formatar_moeda)
+                st.dataframe(df_1024, use_container_width=True, hide_index=True)
+        with dc2:
+            st.markdown("**Relatório 1096 — por CST**")
+            if not detalhe["1096_por_cst"]:
+                st.info("Nenhum item do Relatório 1096 (saída) para este CFOP nesta competência.")
+            else:
+                df_1096 = pd.DataFrame(detalhe["1096_por_cst"])
+                for col in ("valor_contabil", "valor_pis", "valor_cofins"):
+                    df_1096[col] = df_1096[col].apply(formatar_moeda)
+                df_1096["aliq_pis"] = df_1096.apply(
+                    lambda r: f"{r['aliq_pis_min']:.4%}" if r["aliq_pis_min"] == r["aliq_pis_max"]
+                    else f"{r['aliq_pis_min']:.4%} a {r['aliq_pis_max']:.4%}", axis=1,
+                )
+                df_1096["aliq_cofins"] = df_1096.apply(
+                    lambda r: f"{r['aliq_cofins_min']:.4%}" if r["aliq_cofins_min"] == r["aliq_cofins_max"]
+                    else f"{r['aliq_cofins_min']:.4%} a {r['aliq_cofins_max']:.4%}", axis=1,
+                )
+                st.dataframe(
+                    df_1096[["cst", "cst_descricao", "n_itens", "valor_contabil", "aliq_pis", "valor_pis",
+                              "aliq_cofins", "valor_cofins"]],
+                    use_container_width=True, hide_index=True,
+                )

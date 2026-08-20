@@ -149,17 +149,43 @@ def _somar_cst_isento_por_cfop(session, competencia_id):
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
+def _somar_icms_saida_nao_isento_por_cfop(session, competencia_id):
+    """{cfop: Decimal} com o ICMS destacado que de fato pertence aos itens TRIBUTADOS de saída (CST de
+    PIS/COFINS diferente de 6/7) — CORREÇÃO de 20/08/2026, ver seção "Bug real encontrado..." na
+    metodologia. Fonte: `relatorio_pc_itens.valor_nao_tributado` (Relatório 1096, já importado, não precisa
+    de relatório novo), que por identidade do próprio Winthor (`Vl.Tributado = Vl.Contábil − Vl.Não
+    Tributado`, válida item a item) vale exatamente o ICMS destacado quando o item é tributado — confirmado
+    contra o "Relatório de conferência PIS/COFINS e ICMS" (item a item, 26.399 itens, bateu ao centavo nos
+    totais oficiais). Substitui a antiga soma de `resumo_1024_pc.valor_icms`: aquela soma é por CFOP
+    INTEIRO (Rotina 1024 não separa ICMS por CST de PIS/COFINS) e inclui o ICMS dos itens CST 6/7 — que,
+    somado à exclusão separada desses mesmos itens (`_somar_cst_isento_por_cfop`), descontava o ICMS deles
+    DUAS VEZES (prova numérica real: CFOP 5102/filial F7/jul-2026, base menor em R$ 17.285,44 — exatamente o
+    ICMS dos 643 itens isentos daquele CFOP/mês)."""
+    placeholders = ", ".join(f":c{i}" for i in range(len(CSTS_ISENTOS_SAIDA)))
+    params = {"cid": competencia_id}
+    params.update({f"c{i}": c for i, c in enumerate(CSTS_ISENTOS_SAIDA)})
+    rows = session.execute(text(f"""
+        select cfop, sum(valor_nao_tributado) as valor
+        from relatorio_pc_itens
+        where competencia_id = :cid and tipo_operacao = 'saida' and cst not in ({placeholders})
+        group by cfop
+    """), params).mappings().all()
+    return {r["cfop"]: _dec(r["valor"]) for r in rows}
+
+
 def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaApuracaoPresumido]:
-    """Calcula as linhas 1.x-7.3 da apuração PIS/COFINS Lucro Presumido a partir da Rotina 1024 (saída) +
-    Relatório 1096 (saída, só para a exclusão de CST isento) — não grava no banco, ver
-    `salvar_apuracao_pc_presumido`. Mesma tabela `apuracao_pc_linhas` do Lucro Real (a `competencia_id` já
-    identifica o módulo via `competencias.modulo`)."""
+    """Calcula as linhas 1.x-7.3 da apuração PIS/COFINS Lucro Presumido a partir da Rotina 1024 (saída, só
+    para o Valor Contábil bruto das linhas 1.1/1.4) + Relatório 1096 (saída — exclusão de CST isento E,
+    desde 20/08/2026, também o ICMS destacado dos itens tributados, ver `_somar_icms_saida_nao_isento_por_
+    cfop`) — não grava no banco, ver `salvar_apuracao_pc_presumido`. Mesma tabela `apuracao_pc_linhas` do
+    Lucro Real (a `competencia_id` já identifica o módulo via `competencias.modulo`)."""
     resumo_1024 = session.execute(text("""
         select tipo_operacao, cfop, valor_contabil, valor_icms
         from resumo_1024_pc where competencia_id = :cid
     """), {"cid": competencia_id}).mappings().all()
 
     cst_isento_por_cfop = _somar_cst_isento_por_cfop(session, competencia_id)
+    icms_nao_isento_por_cfop = _somar_icms_saida_nao_isento_por_cfop(session, competencia_id)
 
     def _soma_bruta(tipo_operacao, cfops):
         return sum(
@@ -180,6 +206,12 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
         # regra do Lucro Real (evita contar CST 6/7 de um CFOP cujo grupo nem está ativo/importado ainda).
         cfops_ativos = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["cfop"] in cfops}
         return sum((v for cfop, v in cst_isento_por_cfop.items() if cfop in cfops_ativos), Decimal("0"))
+
+    def _soma_icms_saida_nao_isento_escopado(cfops):
+        # Mesmo escopo de `_soma_isento_escopado` acima (só CFOPs ativos no 1024 desta competência) — usa o
+        # ICMS correto (só dos itens tributados, fonte 1096) em vez do valor_icms agregado do 1024.
+        cfops_ativos = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["cfop"] in cfops}
+        return sum((v for cfop, v in icms_nao_isento_por_cfop.items() if cfop in cfops_ativos), Decimal("0"))
 
     linhas: list[LinhaApuracaoPresumido] = []
 
@@ -213,10 +245,18 @@ def calcular_apuracao_pc_presumido(session, competencia_id: int) -> list[LinhaAp
     ))
     linhas.append(LinhaApuracaoPresumido("2.2", LINHAS_PENDENTES["2.2"], Decimal("0"), Decimal("0"), manual=True))
 
-    icms_saida = _soma_icms("saida", CFOPS_1_1 | CFOPS_1_4)
+    icms_saida = _soma_icms_saida_nao_isento_escopado(CFOPS_1_1 | CFOPS_1_4)
     linhas.append(LinhaApuracaoPresumido(
         "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"),
-        detalhe={"base_total": str(icms_saida)},
+        detalhe={
+            "base_total": str(icms_saida),
+            "nota": "CORRIGIDO em 20/08/2026: soma de relatorio_pc_itens.valor_nao_tributado (Relatório "
+                    "1096, saída) dos itens que NÃO são CST 6/7 — que já é, item a item, o ICMS destacado "
+                    "de cada item tributado. Antes somava valor_icms da Rotina 1024 por CFOP inteiro, que "
+                    "inclui o ICMS dos itens isentos e descontava esse ICMS duas vezes junto com a linha "
+                    "\"2.1\" (prova numérica real: CFOP 5102/filial F7/jul-2026, base menor em R$ 17.285,44 "
+                    "— o ICMS dos itens isentos daquele CFOP/mês). Ver metodologia do projeto.",
+        },
     ))
 
     base_devolucao = _soma_bruta("entrada", CFOPS_1_2_DEVOLUCAO_VENDA) - _soma_icms("entrada", CFOPS_1_2_DEVOLUCAO_VENDA)
@@ -300,11 +340,22 @@ def salvar_apuracao_pc_presumido(session, competencia_id: int, linhas: list[Linh
 # ==================================================================================================
 TOLERANCIA_CONFERENCIA = Decimal("1.00")
 
+# Razão COFINS/PIS (3,00% ÷ 0,65%) — assinatura de uma divergência causada por ICMS descontado duas vezes
+# nos itens isentos (ver docstring de `_linha_conferencia`, 20/08/2026). Tolerância relativa de 15%: cobre o
+# ruído de arredondamento de somar milhares de itens (visto na prática: R$ 1,97 de ruído em R$ 2,1 milhões,
+# bem dentro da faixa) sem deixar passar causas realmente diferentes (alíquota de item monofásico/ST, que
+# tende a dar uma razão bem distante de 4,615).
+RAZAO_COFINS_PIS = ALIQ_COFINS / ALIQ_PIS
+TOLERANCIA_RELATIVA_RAZAO_ICMS_ISENTO = Decimal("0.15")
+
 
 def conferencia_1024_x_1096_presumido(session, competencia_id: int) -> list[dict]:
-    """Mesma lógica de `calculo_pis_cofins_lucro_real.conferencia_1024_x_1096`, mas só saída e com as
-    alíquotas do Presumido (0,65%/3,00%): `1024` = (valor_contabil - valor_icms - cst_isento) × alíquota;
-    `1096` = soma direta de valor_pis/valor_cofins dos itens."""
+    """CORRIGIDO em 20/08/2026 (ver `_somar_icms_saida_nao_isento_por_cfop`): o lado "1024" agora usa a
+    MESMA fórmula corrigida da Apuração (`valor_contabil(1024) - icms_nao_isento(1096) - cst_isento(1096)`),
+    não mais `valor_icms` agregado do 1024 — senão a Conferência ficaria mostrando uma conta diferente da
+    que a Apuração realmente faz. `icms_1024` (valor_icms agregado, cru, direto da Rotina 1024) continua
+    calculado só como contexto/auditoria (mostra o ICMS total que o RAICMS relatou pro CFOP), mas não entra
+    mais na fórmula. `1096` = soma direta de valor_pis/valor_cofins dos itens (sempre foi a fonte correta)."""
     linhas_1024 = session.execute(text("""
         select cfop, sum(valor_contabil) as valor_contabil, sum(valor_icms) as valor_icms
         from resumo_1024_pc where competencia_id = :cid and tipo_operacao = 'saida'
@@ -312,6 +363,7 @@ def conferencia_1024_x_1096_presumido(session, competencia_id: int) -> list[dict
     """), {"cid": competencia_id}).mappings().all()
 
     cst_isento_por_cfop = _somar_cst_isento_por_cfop(session, competencia_id)
+    icms_nao_isento_por_cfop = _somar_icms_saida_nao_isento_por_cfop(session, competencia_id)
 
     linhas_1096 = session.execute(text("""
         select cfop, sum(valor_pis) as valor_pis, sum(valor_cofins) as valor_cofins
@@ -324,25 +376,50 @@ def conferencia_1024_x_1096_presumido(session, competencia_id: int) -> list[dict
     resultado = []
     for r in linhas_1024:
         vistos.add(r["cfop"])
+        icms_1024_agregado = _dec(r["valor_icms"])  # cru, só contexto — ver docstring
+        icms_correto = icms_nao_isento_por_cfop.get(r["cfop"], Decimal("0"))
         isento = cst_isento_por_cfop.get(r["cfop"], Decimal("0"))
-        base = _dec(r["valor_contabil"]) - _dec(r["valor_icms"]) - isento
+        base = _dec(r["valor_contabil"]) - icms_correto - isento
         pis_1024 = _arred(base * ALIQ_PIS) if base > 0 else Decimal("0")
         cofins_1024 = _arred(base * ALIQ_COFINS) if base > 0 else Decimal("0")
         r1096 = por_cfop_1096.get(r["cfop"])
         pis_1096 = _dec(r1096["valor_pis"]) if r1096 else None
         cofins_1096 = _dec(r1096["valor_cofins"]) if r1096 else None
-        resultado.append(_linha_conferencia(r["cfop"], pis_1024, cofins_1024, pis_1096, cofins_1096))
+        resultado.append(_linha_conferencia(r["cfop"], pis_1024, cofins_1024, pis_1096, cofins_1096,
+                                              icms_1024_agregado))
 
     for cfop, r1096 in por_cfop_1096.items():
         if cfop in vistos:
             continue
-        resultado.append(_linha_conferencia(cfop, None, None, _dec(r1096["valor_pis"]), _dec(r1096["valor_cofins"])))
+        resultado.append(_linha_conferencia(cfop, None, None, _dec(r1096["valor_pis"]), _dec(r1096["valor_cofins"]),
+                                              None))
 
     resultado.sort(key=lambda r: r["cfop"])
     return resultado
 
 
-def _linha_conferencia(cfop, pis_1024, cofins_1024, pis_1096, cofins_1096):
+def _linha_conferencia(cfop, pis_1024, cofins_1024, pis_1096, cofins_1096, icms_1024):
+    """CORRIGIDO em 20/08/2026 depois de reconciliar com o "Relatório de conferência PIS/COFINS e ICMS" (um
+    3º relatório do Winthor, item a item, que o usuário trouxe pra bater a conta manualmente). A explicação
+    anterior aqui estava ERRADA: não é "1024 exclui ICMS, 1096 não" — os dois relatórios oficiais do Winthor
+    (1096 "combinação CFOP/CST/NCM" e o "conferência PIS/COFINS e ICMS") já excluem ICMS item a item e batem
+    entre si ao centavo. A causa real, confirmada com dados reais (CFOP 5102, filial F7, jul/2026, conferido
+    item a item nos 26.399 itens do relatório novo): a fórmula do 1024 (`valor_contabil − valor_icms −
+    isento`) desconta o ICMS uma vez AGREGADO por CFOP (`valor_icms` da Rotina 1024, que inclui o ICMS de
+    TODOS os itens, inclusive os isentos de PIS/COFINS) e desconta o valor contábil dos itens CST 6/7 outra
+    vez — ou seja, o ICMS que pertence aos itens isentos é descontado DUAS vezes. O tamanho do erro é
+    exatamente o ICMS destacado só dos itens isentos (no exemplo real: R$ 17.285,44 num CFOP de R$ 2,6
+    milhões) — não o `icms_1024` inteiro do CFOP (esse é ~25x maior e não serve de referência sozinho, foi o
+    erro da versão anterior desta função).
+
+    A Rotina 1024 não separa ICMS por CST de PIS/COFINS, e o Relatório 1096 hoje importado não guarda ICMS
+    por item — então não dá pra calcular o valor exato do "ICMS dos isentos" só com os dados já importados
+    (precisaria importar aquele 3º relatório). Em vez disso, usamos a ASSINATURA da causa: quando a razão
+    diff_cofins ÷ diff_pis bate com ALIQ_COFINS ÷ ALIQ_PIS (3% ÷ 0,65% = 4,615), é porque a diferença toda
+    vem de um único valor em R$ sendo aplicado nas duas alíquotas — a assinatura exata de "ICMS descontado
+    duas vezes" (confirmado matematicamente: se diff_pis = -X × ALIQ_PIS e diff_cofins = -X × ALIQ_COFINS
+    para o MESMO X, a razão dá exatamente ALIQ_COFINS/ALIQ_PIS, não importa o valor de X). Quando a razão não
+    bate, a causa é outra (item com alíquota diferente da cheia, CFOP sem item numa das fontes, etc.)."""
     diff_pis = (pis_1024 - pis_1096) if (pis_1024 is not None and pis_1096 is not None) else None
     diff_cofins = (cofins_1024 - cofins_1096) if (cofins_1024 is not None and cofins_1096 is not None) else None
     if pis_1024 is None or pis_1096 is None:
@@ -351,10 +428,69 @@ def _linha_conferencia(cfop, pis_1024, cofins_1024, pis_1096, cofins_1096):
         situacao = "Divergente"
     else:
         situacao = "OK"
+
+    causa_provavel = None
+    icms_isento_implicito = None
+    if situacao == "Divergente":
+        # Só testa a razão quando os dois diffs são negativos e o diff_pis não é ínfimo (perto de zero a
+        # razão fica instável/sem sentido — nesses casos cai em "Outra causa", conferir manualmente).
+        if diff_pis < 0 and diff_cofins < 0 and abs(diff_pis) >= Decimal("0.10"):
+            razao = diff_cofins / diff_pis
+            desvio_relativo = abs(razao - RAZAO_COFINS_PIS) / RAZAO_COFINS_PIS
+            if desvio_relativo <= TOLERANCIA_RELATIVA_RAZAO_ICMS_ISENTO:
+                causa_provavel = ("ICMS destacado nos itens isentos (CST 6/7) descontado 2x pela fórmula do "
+                                  "1024 — não é erro de importação")
+                # Estima o ICMS dos itens isentos a partir do próprio diff (não é medido direto — a Rotina
+                # 1024 não separa ICMS por CST de PIS/COFINS). Usa a média das duas implicações (PIS e
+                # COFINS) pra reduzir o ruído de arredondamento de cada uma isoladamente.
+                estimativa_via_pis = -diff_pis / ALIQ_PIS
+                estimativa_via_cofins = -diff_cofins / ALIQ_COFINS
+                icms_isento_implicito = _arred((estimativa_via_pis + estimativa_via_cofins) / 2)
+        if causa_provavel is None:
+            causa_provavel = "Outra causa (ver CST/alíquota no detalhamento abaixo)"
+    elif situacao == "Só em uma fonte":
+        causa_provavel = "CFOP sem item importado numa das duas fontes"
+
     return {
         "cfop": cfop, "tipo_operacao": "saida",
         "pis_1024": pis_1024, "cofins_1024": cofins_1024,
         "pis_1096": pis_1096, "cofins_1096": cofins_1096,
         "diff_pis": diff_pis, "diff_cofins": diff_cofins,
-        "situacao": situacao,
+        "icms_1024": icms_1024, "icms_isento_implicito": icms_isento_implicito,
+        "situacao": situacao, "causa_provavel": causa_provavel,
+    }
+
+
+def detalhar_cfop_presumido(session, competencia_id: int, cfop: int) -> dict:
+    """Drill-down de UM CFOP (pedido do usuário em 19/08/2026, depois de ver a Conferência com vários
+    CFOPs "Divergente" sem conseguir identificar a causa): devolve (a) o que a Rotina 1024 trouxe por filial
+    para este CFOP (valor_contabil/valor_icms — o insumo bruto do lado "1024" da conferência) e (b) os itens
+    do Relatório 1096 deste CFOP agrupados por CST (quantidade, soma de valor_contabil/valor_pis/
+    valor_cofins, e as alíquotas de PIS/COFINS efetivamente usadas por item — min/max, pra pular à vista
+    quando um item tem uma alíquota diferente da cheia 0,65%/3%, ex.: monofásica/ST, o que sozinho já explica
+    a maior parte das divergências: a Rotina 1024 soma o CFOP inteiro e aplica uma alíquota só, mas o
+    Relatório 1096 respeita a alíquota de cada item individualmente)."""
+    linhas_1024 = session.execute(text("""
+        select e.filial_winthor, e.razao_social, r.valor_contabil, r.valor_icms
+        from resumo_1024_pc r join empresas e on e.id = r.empresa_id
+        where r.competencia_id = :cid and r.tipo_operacao = 'saida' and r.cfop = :cfop
+        order by e.filial_winthor nulls last, e.razao_social
+    """), {"cid": competencia_id, "cfop": cfop}).mappings().all()
+
+    por_cst = session.execute(text("""
+        select ri.cst, c.descricao as cst_descricao, count(*) as n_itens,
+               sum(ri.valor_contabil) as valor_contabil, sum(ri.valor_pis) as valor_pis,
+               sum(ri.valor_cofins) as valor_cofins, min(ri.aliq_pis) as aliq_pis_min,
+               max(ri.aliq_pis) as aliq_pis_max, min(ri.aliq_cofins) as aliq_cofins_min,
+               max(ri.aliq_cofins) as aliq_cofins_max
+        from relatorio_pc_itens ri
+        left join cst_pis_cofins c on c.codigo = ri.cst
+        where ri.competencia_id = :cid and ri.tipo_operacao = 'saida' and ri.cfop = :cfop
+        group by ri.cst, c.descricao
+        order by ri.cst
+    """), {"cid": competencia_id, "cfop": cfop}).mappings().all()
+
+    return {
+        "1024_por_filial": [dict(r) for r in linhas_1024],
+        "1096_por_cst": [dict(r) for r in por_cst],
     }

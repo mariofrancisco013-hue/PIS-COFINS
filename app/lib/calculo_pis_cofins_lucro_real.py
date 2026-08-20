@@ -95,18 +95,15 @@ ALIQ_COFINS = Decimal("0.0760")
 CSTS_EXCLUSAO_ENTRADA = (70, 71, 74)
 CSTS_EXCLUSAO_SAIDA = (6, 7)
 
-# --- Lei Complementar 224/2025 — incidência residual sobre produtos isentos (20/08/2026) ---------------
-# Mesmo conceito adicionado no módulo Presumido nesta mesma data, replicado aqui a pedido do usuário: dentro
-# dos itens de SAÍDA com CST 6/7 (que hoje entram inteiros na exclusão "2.7"), os que têm um destes 10 NCMs
-# passam a ter uma base de cálculo própria (o próprio Valor Contábil do item), tributada a alíquotas bem
-# menores que a cheia do regime não-cumulativo (informadas pelo usuário, não calculadas/derivadas):
-ALIQ_PIS_LC224 = Decimal("0.00165")   # PIS 0,165% — 1/10 da alíquota cheia do Real (1,65%)
-ALIQ_COFINS_LC224 = Decimal("0.0076")  # COFINS 0,76% — 1/10 da alíquota cheia do Real (7,60%)
-
-NCMS_LC224_2025_RAW = (
-    "33074900", "34011190", "48181000", "49019900", "9012100",
-    "17019900", "33049990", "22072019", "49030000", "22071090",
-)
+# --- Lei Complementar 224/2025 — incidência residual sobre produtos isentos (20/08/2026, tabela desde a
+# migração 009) ------------------------------------------------------------------------------------------
+# Mesmo conceito do módulo Presumido, mesma tabela `ncms_lc224_pc` (compartilhada entre os dois regimes,
+# distinguida pela coluna `regime`) — dentro dos itens de SAÍDA com CST 6/7 (que hoje entram inteiros na
+# exclusão "2.7"), os que têm um NCM cadastrado ali passam a ter uma base de cálculo própria (o próprio
+# Valor Contábil do item), tributada às alíquotas cadastradas (por NCM). Até 20/08/2026 (mais cedo no mesmo
+# dia) a lista de NCMs e as alíquotas estavam fixas no código — pedido do usuário: "vira fonte do cálculo
+# (editável)" direto no Supabase, sem precisar mexer em código/reimplantar o app.
+REGIME_LC224 = "real"
 
 
 def _variantes_ncm(ncm: str) -> set:
@@ -123,7 +120,18 @@ def _variantes_ncm(ncm: str) -> set:
     return variantes
 
 
-NCMS_LC224_2025 = frozenset(v for ncm in NCMS_LC224_2025_RAW for v in _variantes_ncm(ncm))
+def _carregar_ncms_lc224(session):
+    """{variante_ncm: (aliq_pis, aliq_cofins)} para todo NCM ativo cadastrado em `ncms_lc224_pc` para o
+    regime Real — ver mesma função no módulo Presumido."""
+    rows = session.execute(text("""
+        select ncm, aliq_pis, aliq_cofins from ncms_lc224_pc where regime = :regime and ativo = true
+    """), {"regime": REGIME_LC224}).mappings().all()
+    lookup = {}
+    for r in rows:
+        par = (_dec(r["aliq_pis"]), _dec(r["aliq_cofins"]))
+        for v in _variantes_ncm(str(r["ncm"])):
+            lookup[v] = par
+    return lookup
 
 GRUPOS_DEBITO = {
     "1.1": "Faturamento Bruto (Mercadorias p/ Revenda)",
@@ -321,24 +329,22 @@ def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, cs
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
-def _somar_base_lc224_por_cfop(session, competencia_id):
-    """{cfop: Decimal} com o Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (excluídos em
-    "2.7") CUJO NCM está entre os 10 alcançados pela Lei Complementar 224/2025 (`NCMS_LC224_2025`) — mesma
-    mecânica de `_somar_exclusao_cst_por_cfop`, restrita a este subconjunto de NCM. Ver módulo Presumido
-    para o mesmo cálculo (implementado lá primeiro, replicado aqui a pedido do usuário em 20/08/2026)."""
+def _somar_lc224_saida_por_cfop_ncm(session, competencia_id):
+    """[{cfop, ncm, valor}] Valor Contábil (Relatório 1096, saída) agrupado por CFOP+NCM, só itens CST 6/7
+    (excluídos em "2.7") — casado depois, em Python, contra o lookup de `_carregar_ncms_lc224` (mesma
+    mecânica do módulo Presumido — não dá pra filtrar por NCM direto no SQL porque cada NCM pode ter uma
+    alíquota diferente cadastrada, e variantes de zero à esquerda precisam ser casadas em Python)."""
     placeholders_cst = ", ".join(f":c{i}" for i in range(len(CSTS_EXCLUSAO_SAIDA)))
-    placeholders_ncm = ", ".join(f":n{i}" for i in range(len(NCMS_LC224_2025)))
     params = {"cid": competencia_id}
     params.update({f"c{i}": c for i, c in enumerate(CSTS_EXCLUSAO_SAIDA)})
-    params.update({f"n{i}": n for i, n in enumerate(NCMS_LC224_2025)})
     rows = session.execute(text(f"""
-        select cfop, sum(valor_contabil) as valor
+        select cfop, ncm, sum(valor_contabil) as valor
         from relatorio_pc_itens
         where competencia_id = :cid and tipo_operacao = 'saida'
-          and cst in ({placeholders_cst}) and ncm in ({placeholders_ncm})
-        group by cfop
+          and cst in ({placeholders_cst}) and ncm is not null
+        group by cfop, ncm
     """), params).mappings().all()
-    return {r["cfop"]: _dec(r["valor"]) for r in rows}
+    return [dict(r) for r in rows]
 
 
 def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
@@ -487,14 +493,36 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     debito_cofins_total += cofins_financeiras
 
     # --- Produtos Isentos com Incidência Residual (linha 4, LC 224/2025 — pedido do usuário em 20/08/2026,
-    # mesmo conceito implementado primeiro no módulo Presumido). Base própria (Valor Contábil dos itens CST
-    # 6/7 cujo NCM está em NCMS_LC224_2025) — esses itens já estão inteiros dentro da exclusão "2.7", então
-    # isto não muda a base líquida de nenhum grupo de débito; é somado só no final (debito_pis_total/
-    # debito_cofins_total), do mesmo jeito que Receitas Financeiras (linha "3") acima.
-    base_lc224_por_cfop = _somar_base_lc224_por_cfop(session, competencia_id)
-    base_lc224 = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), base_lc224_por_cfop)
-    pis_lc224 = (base_lc224 * ALIQ_PIS_LC224).quantize(Decimal("0.01")) if base_lc224 > 0 else Decimal("0")
-    cofins_lc224 = (base_lc224 * ALIQ_COFINS_LC224).quantize(Decimal("0.01")) if base_lc224 > 0 else Decimal("0")
+    # mesmo conceito implementado primeiro no módulo Presumido; fonte = tabela `ncms_lc224_pc` desde a
+    # migração 009). Base própria (Valor Contábil dos itens CST 6/7 cujo NCM está cadastrado ali) — esses
+    # itens já estão inteiros dentro da exclusão "2.7", então isto não muda a base líquida de nenhum grupo
+    # de débito; é somado só no final (debito_pis_total/debito_cofins_total), do mesmo jeito que Receitas
+    # Financeiras (linha "3") acima. Alíquotas vêm por NCM da tabela (hoje todas iguais: PIS 0,165% / COFINS
+    # 0,76% — 1/10 da alíquota cheia do regime não-cumulativo).
+    ncms_lc224_lookup = _carregar_ncms_lc224(session)
+    itens_lc224 = _somar_lc224_saida_por_cfop_ncm(session, competencia_id)
+    cfops_debito_ativos = {
+        r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["grupo"] in GRUPOS_DEBITO
+    }
+    base_lc224 = Decimal("0")
+    pis_lc224 = Decimal("0")
+    cofins_lc224 = Decimal("0")
+    detalhe_lc224_ncm = {}
+    for item in itens_lc224:
+        if item["cfop"] not in cfops_debito_ativos:
+            continue
+        ncm_norm = str(item["ncm"]).strip()
+        par = ncms_lc224_lookup.get(ncm_norm)
+        if not par:
+            continue
+        aliq_pis_n, aliq_cofins_n = par
+        valor = _dec(item["valor"])
+        base_lc224 += valor
+        pis_lc224 += valor * aliq_pis_n
+        cofins_lc224 += valor * aliq_cofins_n
+        detalhe_lc224_ncm[ncm_norm] = detalhe_lc224_ncm.get(ncm_norm, Decimal("0")) + valor
+    pis_lc224 = pis_lc224.quantize(Decimal("0.01")) if base_lc224 > 0 else Decimal("0")
+    cofins_lc224 = cofins_lc224.quantize(Decimal("0.01")) if base_lc224 > 0 else Decimal("0")
     linhas.append(LinhaApuracaoPC(
         "4", "Produtos Isentos com Incidência Residual - Lei Complementar 224/2025 (NCMs específicos)",
         pis_lc224, cofins_lc224,
@@ -502,11 +530,11 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
             "base_total": str(base_lc224),
             "base_liquida": str(base_lc224),
             "nota": "Base = Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (já dentro da "
-                    "exclusão '2.7') cujo NCM está entre os 10 alcançados pela LC 224/2025 (lista e "
-                    "alíquotas informadas pelo usuário em 20/08/2026: PIS 0,165% / COFINS 0,76% — 1/10 da "
-                    "alíquota cheia do regime não-cumulativo). Só conta CFOPs ativos na Rotina 1024 desta "
-                    "competência dentro dos grupos de débito (1.1/1.2/1.4/1.6), mesmo escopo de 2.3/2.7.",
-            "ncms": sorted(NCMS_LC224_2025_RAW),
+                    "exclusão '2.7') cujo NCM está cadastrado em ncms_lc224_pc (tabela editável no Supabase "
+                    "desde 20/08/2026 — sql/009_ncms_lc224_pc.sql, substituiu a lista fixa que estava no "
+                    "código). Só conta CFOPs ativos na Rotina 1024 desta competência dentro dos grupos de "
+                    "débito (1.1/1.2/1.4/1.6), mesmo escopo de 2.3/2.7.",
+            "base_por_ncm": {k: str(v) for k, v in detalhe_lc224_ncm.items()},
         },
     ))
     debito_pis_total += pis_lc224

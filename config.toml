@@ -1,0 +1,18 @@
+# Tema visual do app. primaryColor atualizado em 20/08/2026 para a identidade "Sodine" (mockup HTML/
+# Tailwind enviado pelo usuário — pedido "ajustar a identidade visual com base nesse código e html") —
+# antes era #1F4E78 (herdado do projeto Agente de Retenções NFS-e), agora é o navy sodine.900 (#0B2545) do
+# mockup, o mesmo tom usado nos botões/headers de lá. Ver app/lib/theme_sodine.py pra paleta completa e os
+# componentes (KPI card, badge, título de seção) que usam essas cores fora do que o tema nativo cobre.
+# backgroundColor/secondaryBackgroundColor/textColor/font não mudaram — já batiam com o mockup (fundo
+# #F8FAFC, texto #1F2937, fonte Inter). Não contém segredos, pode subir normalmente pro GitHub.
+#
+# Esse tema (claro, fundo branco) vale pro app depois de logado. A tela de login usa um fundo azul-marinho
+# customizado à parte (CSS injetado em app/lib/auth.py, também atualizado pra sodine.900/800) — ver esse
+# arquivo se precisar ajustar as cores da tela de login especificamente.
+[theme]
+base = "light"
+primaryColor = "#0B2545"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#1F2937"
+font = "Inter"

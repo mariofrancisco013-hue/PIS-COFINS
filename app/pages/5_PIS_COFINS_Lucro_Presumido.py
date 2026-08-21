@@ -56,7 +56,7 @@ from lib.cst_regras_pc import (
     registrar_ajuste_cst, aplicar_ajuste_cst, escopo_ajuste_seguro, carregar_historico_ajustes, TIPOS_REGRA,
     registrar_revisao, carregar_excecoes, definir_excecao_ativa, listar_cfops_sem_checagem,
     salvar_cfops_sem_checagem, listar_regras_cfop, salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm,
-    listar_regras_alerta, salvar_regras_alerta,
+    listar_regras_alerta, salvar_regras_alerta, registrar_inconsistencias_cst_regras,
 )
 from lib import lancamentos_manuais_pc as lmpc
 
@@ -579,9 +579,31 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                                      competencia_id)
 
 
-def _aba_regras_cst(session):
+def _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids):
+    """Roda `registrar_inconsistencias_cst_regras` para cada filial do grupo NESTA competência — chamada
+    logo após salvar uma regra em `_aba_regras_cst` (sessão de continuação, 21/08/2026: usuário cadastrou uma
+    regra CFOP 5102/saída ↔ CST 6 e a inconsistência "CST × CFOP divergente" já existente na grade não
+    sumiu — investigação: `salvar_regras_cfop`/`_ncm`/`_alerta` NUNCA recalculavam nada, de propósito, porque
+    as regras são GLOBAIS e recalcular para TODO o sistema a cada salvamento seria caro; a tela só avisava
+    "recalcula no próximo reimport do 1096", o que deixa a inconsistência velha na tela até lá — confuso,
+    parecia bug). Como recalcular só as filiais da competência ABERTA na tela é barato (mesma operação que já
+    roda a cada edição da grade Entrada/Saída, ver `planilha_pc.recalcular_inconsistencias_apos_edicao`),
+    passou a rodar automaticamente ao salvar — a tela refletir a regra nova na hora, sem precisar reimportar
+    nada. Continua sendo necessário reimportar o 1096 para competências FECHADAS/outras que não estejam
+    abertas nesta tela — isso não mudou, só o caso comum (a competência que você está olhando agora) ficou
+    imediato. `empresa_ids` vazio (grupo sem filial) não faz nada."""
+    for empresa_id in empresa_ids:
+        registrar_inconsistencias_cst_regras(session, competencia_id, empresa_id)
+
+
+def _aba_regras_cst(session, competencia_id, empresa_ids):
     """Cópia de `2_PIS_COFINS_Lucro_Real.py::_aba_regras_cst` — as 3 tabelas de regra são globais
-    (compartilhadas entre Presumido e Real), então editar aqui também vale para o Lucro Real e vice-versa."""
+    (compartilhadas entre Presumido e Real), então editar aqui também vale para o Lucro Real e vice-versa.
+
+    `competencia_id`/`empresa_ids` (novos parâmetros, sessão de continuação de 21/08/2026): só usados para
+    recalcular as inconsistências desta competência/grupo logo após salvar uma regra — ver
+    `_recalcular_regras_cst_grupo`. As regras em si continuam globais (afetam qualquer competência/regime que
+    usar aquele CFOP/NCM/CST), só o recálculo imediato é escopado à competência aberta na tela."""
     st.markdown(
         "**Para que serve esta aba:** cadastro das regras de CST × CFOP/NCM usadas pela checagem automática "
         "do Relatório 1096 (ver aba ⚠️ Inconsistências) — mesmas 3 tabelas já usadas pelo Lucro Real "
@@ -590,8 +612,9 @@ def _aba_regras_cst(session):
         "diferente da aba 🚫 CFOPs sem Checagem de CST, que é por filial."
     )
     st.warning(
-        "Depois de incluir, editar ou remover uma regra, as inconsistências só refletem a mudança na "
-        "próxima vez que o Relatório 1096 for reimportado (Presumido ou Real)."
+        "Ao salvar, as inconsistências desta competência (a que você está vendo agora) são recalculadas na "
+        "hora — outras competências (fechadas ou de outros grupos) só refletem a mudança na próxima vez que "
+        "o Relatório 1096 delas for reimportado."
     )
 
     sub_cfop, sub_ncm, sub_alerta = st.tabs(["Por CFOP", "Por NCM", "Sempre-alerta (por CST)"])
@@ -617,8 +640,13 @@ def _aba_regras_cst(session):
         if st.button("💾 Salvar regras por CFOP", key="pres_salvar_regras_cfop"):
             resultado = salvar_regras_cfop(session, df_cfop, df_cfop_editado)
             _cache_regras_cfop.clear()
+            with st.spinner("Recalculando inconsistências desta competência..."):
+                _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+            _cache_inconsistencias.clear()
+            _cache_itens_editavel.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
-                       f"{resultado['removidos']} removida(s).")
+                       f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
+                       f"recalculadas.")
             st.rerun()
 
     with sub_ncm:
@@ -642,8 +670,13 @@ def _aba_regras_cst(session):
         if st.button("💾 Salvar regras por NCM", key="pres_salvar_regras_ncm"):
             resultado = salvar_regras_ncm(session, df_ncm, df_ncm_editado)
             _cache_regras_ncm.clear()
+            with st.spinner("Recalculando inconsistências desta competência..."):
+                _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+            _cache_inconsistencias.clear()
+            _cache_itens_editavel.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
-                       f"{resultado['removidos']} removida(s).")
+                       f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
+                       f"recalculadas.")
             st.rerun()
 
     with sub_alerta:
@@ -669,8 +702,13 @@ def _aba_regras_cst(session):
         if st.button("💾 Salvar regras sempre-alerta", key="pres_salvar_regras_alerta"):
             resultado = salvar_regras_alerta(session, df_alerta, df_alerta_editado)
             _cache_regras_alerta.clear()
+            with st.spinner("Recalculando inconsistências desta competência..."):
+                _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+            _cache_inconsistencias.clear()
+            _cache_itens_editavel.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
-                       f"{resultado['removidos']} removida(s).")
+                       f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
+                       f"recalculadas.")
             st.rerun()
 
 
@@ -1049,7 +1087,7 @@ with aba_conferencia:
 
 # ---------------------------------------------------------------------------------------------- Regras de CST
 with aba_regras_cst:
-    _aba_regras_cst(session)
+    _aba_regras_cst(session, competencia_id, empresa_ids_grupo)
 
 # --------------------------------------------------------------------------------- CFOPs sem Checagem de CST
 with aba_cfop_sem_checagem:

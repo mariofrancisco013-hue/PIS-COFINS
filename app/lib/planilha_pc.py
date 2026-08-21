@@ -130,10 +130,27 @@ def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids,
               and (
                   -- cfop/ncm is null = alerta consolidado por CST (achado "esse CST está fora da lista de
                   -- regras" — ver cst_regras_pc._checar_regra_cfop/_checar_regra_ncm, 18/08/2026: "agrupar
-                  -- os NCMs/CFOPs por erro em um único alerta"); casa com QUALQUER item deste CST/operação,
-                  -- não só um CFOP/NCM específico, por isso o "or i2.cfop is null" / "or i2.ncm is null".
-                  (i2.tipo = 'cst_regra_cfop' and i2.cst = ri.cst and (i2.cfop = ri.cfop or i2.cfop is null))
-                  or (i2.tipo = 'cst_regra_ncm' and i2.cst = ri.cst and (i2.ncm = ri.ncm or i2.ncm is null))
+                  -- os NCMs/CFOPs por erro em um único alerta"). Casa com QUALQUER item deste CST/operação
+                  -- que NÃO tenha ganhado sua própria regra específica depois (ver `not exists` abaixo,
+                  -- correção de 21/08/2026: "Inclui o CFOP na regra mais a inconsistência não sai" — sem essa
+                  -- checagem, um CFOP recém-cadastrado com regra própria continuava aparecendo flagado só
+                  -- porque OUTRO CFOP com o mesmo CST ainda não tinha regra e mantinha o alerta consolidado
+                  -- (cfop/ncm null) vivo, e o "or i2.cfop is null" batia com QUALQUER cfop, inclusive o já
+                  -- resolvido).
+                  (i2.tipo = 'cst_regra_cfop' and i2.cst = ri.cst and (
+                      i2.cfop = ri.cfop
+                      or (i2.cfop is null and not exists (
+                          select 1 from cst_regra_cfop_pc r2
+                          where r2.cfop = ri.cfop and r2.cst = ri.cst and r2.tipo_operacao = ri.tipo_operacao
+                      ))
+                  ))
+                  or (i2.tipo = 'cst_regra_ncm' and i2.cst = ri.cst and (
+                      i2.ncm = ri.ncm
+                      or (i2.ncm is null and not exists (
+                          select 1 from cst_regra_ncm_pc r2
+                          where r2.ncm = ri.ncm and r2.cst = ri.cst and r2.tipo_operacao = ri.tipo_operacao
+                      ))
+                  ))
                   or (i2.tipo = 'cst_regra_alerta' and i2.cst = ri.cst)
                   or (i2.tipo = 'cst_nao_mapeado' and i2.cst = ri.cst)
                   or (i2.tipo = 'cfop_sem_grupo' and i2.cfop = ri.cfop)
@@ -158,10 +175,24 @@ def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids,
             where i.competencia_id = ri.competencia_id and i.empresa_id = ri.empresa_id
               and i.status = 'pendente' and i.fonte = 'relatorio_1096'
               and (
-                  -- mesmo ajuste do bloco de tipos_inconsistencia acima: alerta consolidado (cfop/ncm null)
-                  -- casa com qualquer item deste CST/operação.
-                  (i.tipo = 'cst_regra_cfop' and i.cst = ri.cst and (i.cfop = ri.cfop or i.cfop is null))
-                  or (i.tipo = 'cst_regra_ncm' and i.cst = ri.cst and (i.ncm = ri.ncm or i.ncm is null))
+                  -- mesmo ajuste do bloco de tipos_inconsistencia acima (ver comentário lá, 21/08/2026):
+                  -- alerta consolidado (cfop/ncm null) só casa com um item se ele ainda NÃO tiver ganhado
+                  -- sua própria regra específica de CFOP/NCM — senão um CFOP recém-corrigido continua
+                  -- aparecendo flagado na grade só por causa de outro CFOP com o mesmo CST ainda sem regra.
+                  (i.tipo = 'cst_regra_cfop' and i.cst = ri.cst and (
+                      i.cfop = ri.cfop
+                      or (i.cfop is null and not exists (
+                          select 1 from cst_regra_cfop_pc r2
+                          where r2.cfop = ri.cfop and r2.cst = ri.cst and r2.tipo_operacao = ri.tipo_operacao
+                      ))
+                  ))
+                  or (i.tipo = 'cst_regra_ncm' and i.cst = ri.cst and (
+                      i.ncm = ri.ncm
+                      or (i.ncm is null and not exists (
+                          select 1 from cst_regra_ncm_pc r2
+                          where r2.ncm = ri.ncm and r2.cst = ri.cst and r2.tipo_operacao = ri.tipo_operacao
+                      ))
+                  ))
                   or (i.tipo = 'cst_regra_alerta' and i.cst = ri.cst)
                   or (i.tipo = 'cst_nao_mapeado' and i.cst = ri.cst)
                   or (i.tipo = 'cfop_sem_grupo' and i.cfop = ri.cfop)

@@ -15,7 +15,7 @@ impresso/agrupado por bloco de NF traz isso.
 import pandas as pd
 from sqlalchemy import text
 
-from lib.cst_regras_pc import registrar_inconsistencias_cst_regras
+from lib.cst_regras_pc import registrar_inconsistencias_cst_regras, clausula_entrada_permitida_presumido
 
 COLS = [
     "produto_codigo", "ncm", "cst", "cfop", "quantidade", "valor_contabil", "valor_desconto",
@@ -214,12 +214,18 @@ def _registrar_inconsistencias_1096(session, competencia_id, empresa_id):
         where competencia_id = :cid and empresa_id = :eid and fonte = 'relatorio_1096'
     """), {"cid": competencia_id, "eid": empresa_id})
 
-    csts_ruins = session.execute(text("""
+    # Entrada do Lucro Presumido = só Devolução de Venda (sessão de continuação, 20/08/2026, "os outros não
+    # precisa validar na presumido") — ver clausula_entrada_permitida_presumido em cst_regras_pc.py. Vazio
+    # (sem filtro) para o Lucro Real, que continua 100% sem restrição nas duas direções.
+    params_cst = {"cid": competencia_id, "eid": empresa_id}
+    clausula_entrada_cst = clausula_entrada_permitida_presumido(session, competencia_id, "ri", params_cst)
+    csts_ruins = session.execute(text(f"""
         select distinct ri.cst, ri.tipo_operacao
         from relatorio_pc_itens ri
         left join cst_pis_cofins c on c.codigo = ri.cst
         where ri.competencia_id = :cid and ri.empresa_id = :eid and c.codigo is null
-    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
+          {clausula_entrada_cst}
+    """), params_cst).mappings().all()
     for r in csts_ruins:
         session.execute(text("""
             insert into inconsistencias_pc (competencia_id, empresa_id, tipo, cst, tipo_operacao, descricao, fonte)
@@ -228,12 +234,15 @@ def _registrar_inconsistencias_1096(session, competencia_id, empresa_id):
                     || 'exportação do Winthor ou um código novo que precisa de cadastro manual.', 'relatorio_1096')
         """), {"cid": competencia_id, "eid": empresa_id, "cst": r["cst"], "tipo": r["tipo_operacao"]})
 
-    cfops_ruins = session.execute(text("""
+    params_cfop = {"cid": competencia_id, "eid": empresa_id}
+    clausula_entrada_cfop = clausula_entrada_permitida_presumido(session, competencia_id, "ri", params_cfop)
+    cfops_ruins = session.execute(text(f"""
         select distinct ri.cfop, ri.tipo_operacao
         from relatorio_pc_itens ri
         left join cfop_pis_cofins cp on cp.codigo = ri.cfop
         where ri.competencia_id = :cid and ri.empresa_id = :eid and cp.codigo is null
-    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
+          {clausula_entrada_cfop}
+    """), params_cfop).mappings().all()
     for r in cfops_ruins:
         session.execute(text("""
             insert into inconsistencias_pc (competencia_id, empresa_id, tipo, cfop, tipo_operacao, descricao, fonte)

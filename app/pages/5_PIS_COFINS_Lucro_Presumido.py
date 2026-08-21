@@ -50,7 +50,7 @@ from lib.status_apuracao_pc import status_competencia
 from lib import importacao_pc, resumo_pc, planilha_pc
 from lib.calculo_pis_cofins_lucro_presumido import (
     calcular_apuracao_pc_presumido, salvar_apuracao_pc_presumido, ordenar_linhas_para_exibicao,
-    LAYOUT_LINHAS, conferencia_1024_x_1096_presumido, detalhar_cfop_presumido,
+    LAYOUT_LINHAS, conferencia_1024_x_1096_presumido, detalhar_cfop_presumido, CFOPS_1_2_DEVOLUCAO_VENDA,
 )
 from lib.cst_regras_pc import (
     registrar_ajuste_cst, aplicar_ajuste_cst, escopo_ajuste_seguro, carregar_historico_ajustes, TIPOS_REGRA,
@@ -122,34 +122,43 @@ def _cache_historico_ajustes(_session, competencia_id):
 # Saída, não a aba ⚠️ Inconsistências consolidada, que já existia). Mesmas funções (mesmo nome/assinatura) de
 # `2_PIS_COFINS_Lucro_Real.py` — `lib/planilha_pc.py` e `lib/resumo_pc.py` já são 100% regime-agnósticos
 # (só dependem de competencia_id/tipo_operacao/empresa_ids), não precisaram de nenhuma mudança.
+#
+# `cfops_permitidos` (ainda em 20/08/2026, segunda parte do pedido — "na entrada considerar somente CFOP de
+# devolução", confirmado com o usuário que também vale pra grade/resumos, não só pra geração automática de
+# inconsistências, ver cst_regras_pc.clausula_entrada_permitida_presumido): parâmetro NOVO, opcional,
+# `None` por padrão — só quem chama (a função _aba_planilha_pc abaixo) decide passar
+# `CFOPS_1_2_DEVOLUCAO_VENDA` quando `tipo_operacao == "entrada"`. Recebe uma TUPLE (não um frozenset/set) —
+# st.cache_data precisa de um argumento hashable E com repr estável para a chave de cache; tuple ordenada
+# cumpre os dois, frozenset também seria hashable mas sem ordem estável entre execuções.
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
-def _cache_resumo_1024_por_cfop(_session, competencia_id, tipo_operacao):
-    return resumo_pc.resumo_1024_por_cfop(_session, competencia_id, tipo_operacao)
+def _cache_resumo_1024_por_cfop(_session, competencia_id, tipo_operacao, cfops_permitidos=None):
+    return resumo_pc.resumo_1024_por_cfop(_session, competencia_id, tipo_operacao, cfops_permitidos)
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
-def _cache_resumo_por_cfop(_session, competencia_id, tipo_operacao):
-    return resumo_pc.resumo_por_cfop(_session, competencia_id, tipo_operacao)
+def _cache_resumo_por_cfop(_session, competencia_id, tipo_operacao, cfops_permitidos=None):
+    return resumo_pc.resumo_por_cfop(_session, competencia_id, tipo_operacao, cfops_permitidos)
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
-def _cache_resumo_por_cst(_session, competencia_id, tipo_operacao):
-    return resumo_pc.resumo_por_cst(_session, competencia_id, tipo_operacao)
+def _cache_resumo_por_cst(_session, competencia_id, tipo_operacao, cfops_permitidos=None):
+    return resumo_pc.resumo_por_cst(_session, competencia_id, tipo_operacao, cfops_permitidos)
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
 def _cache_itens_editavel(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
-                           busca, tipos_inc, limite):
+                           busca, tipos_inc, limite, cfops_permitidos=None):
     return planilha_pc.carregar_itens_editavel(
         _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro, busca, tipos_inc,
-        limite,
+        limite, cfops_permitidos,
     )
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
-def _cache_totalizador(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro):
+def _cache_totalizador(_session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
+                        cfops_permitidos=None):
     return planilha_pc.carregar_totalizador(
-        _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro,
+        _session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro, cfops_permitidos,
     )
 
 
@@ -379,6 +388,13 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     AVISO CRÍTICO, mostrado também na tela: editar aqui NUNCA muda a Apuração (que roda 100% sobre a Rotina
     1024) — só recalcula as inconsistências de CST × CFOP/NCM e a Conferência 1024×1096. Ver docstring de
     lib/planilha_pc.py para o raciocínio completo."""
+    # Entrada do Lucro Presumido = só Devolução de Venda (sessão de continuação, 20/08/2026 — "na entrada
+    # considerar somente CFOP de devolução", confirmado com o usuário que isso restringe também esta grade e
+    # os resumos por CFOP/CST dela, não só a geração automática de inconsistências — ver
+    # planilha_pc._clausula_cfops_permitidos / resumo_pc._clausula_cfops_permitidos). Tuple ordenada (não
+    # set/frozenset) — argumento passa por st.cache_data, precisa de repr estável pra chave de cache.
+    cfops_permitidos = tuple(sorted(CFOPS_1_2_DEVOLUCAO_VENDA)) if tipo_operacao == "entrada" else None
+
     st.info(
         "⚠️ Esta grade edita o **Relatório 1096** (conferência) — os valores da **Apuração** (linhas "
         "1.x-7.3, aba Apuração) continuam vindo 100% da **Rotina 1024** e NÃO mudam com uma edição aqui. "
@@ -388,7 +404,9 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     if tipo_operacao == "entrada":
         st.caption(
             "Neste regime (cumulativo), só a Devolução de Venda (linha \"1.2\") vem do lado Entrada — não "
-            "há crédito de entrada. É normal esta grade só ter itens dos CFOPs 1202/1411/2202/2411/3202."
+            "há crédito de entrada. Esta grade e os resumos abaixo já filtram só os CFOPs de devolução "
+            "(1202/1411/2202/2411/3202); os demais CFOPs de entrada do 1096 (compras) não aparecem aqui "
+            "porque não influenciam em nada a apuração do Presumido."
         )
     else:
         st.caption(
@@ -405,7 +423,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     sintetica = visao.startswith("Sintética")
 
     c1, c_ncm, c2, c3 = st.columns([2, 2, 3, 2])
-    resumo_1096_cfop = _cache_resumo_por_cfop(session, competencia_id, tipo_operacao)
+    resumo_1096_cfop = _cache_resumo_por_cfop(session, competencia_id, tipo_operacao, cfops_permitidos)
     cfops_disponiveis = (["(todos)"] + sorted(resumo_1096_cfop["cfop"].tolist())) if not resumo_1096_cfop.empty else ["(todos)"]
     cfop_sel = c1.selectbox("Filtrar por CFOP", cfops_disponiveis, key=f"pres_cfop_{tipo_operacao}")
     cfop_filtro = None if cfop_sel == "(todos)" else int(cfop_sel)
@@ -418,7 +436,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
         limite = c3.number_input("Máx. linhas na tela", min_value=50, max_value=5000, value=500, step=50,
                                   key=f"pres_limite_{tipo_operacao}")
         tot = _cache_totalizador(session, competencia_id, tipo_operacao, empresa_ids,
-                                  cfop_filtro, ncm_filtro or None)
+                                  cfop_filtro, ncm_filtro or None, cfops_permitidos)
         st.caption(f"{len(tot)} combinação(ões) de Filial + Produto + CST"
                    f"{' para este CFOP/NCM' if (cfop_filtro or ncm_filtro) else ''}.")
         st.dataframe(
@@ -451,7 +469,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
 
         df, total = _cache_itens_editavel(
             session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro, ncm_filtro or None,
-            busca or None, tipos_inc_sel or None, limite,
+            busca or None, tipos_inc_sel or None, limite, cfops_permitidos,
         )
 
         if total > len(df):
@@ -544,12 +562,12 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
     c_res1, c_res2 = st.columns(2)
     with c_res1:
         st.subheader("Resumo por CFOP — Rotina 1024 (usado na Apuração)")
-        resumo_1024_cfop = _cache_resumo_1024_por_cfop(session, competencia_id, tipo_operacao)
+        resumo_1024_cfop = _cache_resumo_1024_por_cfop(session, competencia_id, tipo_operacao, cfops_permitidos)
         st.dataframe(resumo_1024_cfop, use_container_width=True, hide_index=True)
     with c_res2:
         st.subheader("Resumo por CST — Relatório 1096")
-        st.dataframe(_cache_resumo_por_cst(session, competencia_id, tipo_operacao), use_container_width=True,
-                     hide_index=True)
+        st.dataframe(_cache_resumo_por_cst(session, competencia_id, tipo_operacao, cfops_permitidos),
+                     use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.subheader("Inconsistências desta operação (regras de CST do 1096)")

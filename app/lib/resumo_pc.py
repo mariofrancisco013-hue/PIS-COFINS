@@ -12,13 +12,32 @@ ALIQ_PIS = 0.0165
 ALIQ_COFINS = 0.0760
 
 
-def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
+def _clausula_cfops_permitidos(cfops_permitidos, alias, params, prefix="cfp"):
+    """Filtro OPCIONAL e genérico por uma lista fechada de CFOPs — usado pela aba Entrada do Lucro Presumido
+    (sessão de continuação, 20/08/2026: "na entrada considerar somente CFOP de devolução", confirmado que
+    isso também vale para a GRADE/resumos, não só para a geração de inconsistências — ver
+    cst_regras_pc.clausula_entrada_permitida_presumido para o equivalente usado nas checagens automáticas).
+    `None` (padrão) = sem filtro nenhum — mantém o Lucro Real e a aba Saída do Presumido 100% inalterados."""
+    if cfops_permitidos is None:
+        return ""
+    cfops = list(cfops_permitidos)
+    placeholders = ", ".join(f":{prefix}{i}" for i in range(len(cfops)))
+    for i, c in enumerate(cfops):
+        params[f"{prefix}{i}"] = c
+    return f" and {alias}.cfop in ({placeholders})"
+
+
+def resumo_1024_por_cfop(session, competencia_id, tipo_operacao, cfops_permitidos=None):
     """Resumo por CFOP a partir da Rotina 1024 (fonte primária da apuração) — soma todas as filiais da
     competência (grupo). base = valor_contabil - valor_icms; pis/cofins = base × alíquota, só para leitura (o
     cálculo oficial da apuração está em calculo_pis_cofins_lucro_real.calcular_apuracao_pc — mesma fórmula,
     mantidas em sincronia). NOTA (18/08/2026): a exclusão de "Isentas/Não Tributadas" foi testada entre 14 e
-    18/08 e revertida a pedido do usuário — a base voltou a ser só Valor Contábil − ICMS destacado."""
-    rows = session.execute(text("""
+    18/08 e revertida a pedido do usuário — a base voltou a ser só Valor Contábil − ICMS destacado.
+
+    `cfops_permitidos` (opcional) restringe a uma lista fechada de CFOPs — ver `_clausula_cfops_permitidos`."""
+    params = {"cid": competencia_id, "tipo": tipo_operacao}
+    clausula = _clausula_cfops_permitidos(cfops_permitidos, "r", params)
+    rows = session.execute(text(f"""
         select r.cfop, coalesce(cpe.grupo, '(sem grupo)') as grupo, cp.descricao,
                count(distinct r.empresa_id) as n_filiais,
                sum(r.valor_contabil) as valor_contabil, sum(r.valor_icms) as valor_icms
@@ -26,9 +45,10 @@ def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
         left join cfop_pis_cofins_efetivo cpe on cpe.codigo = r.cfop
         left join cfop_pis_cofins cp on cp.codigo = r.cfop
         where r.competencia_id = :cid and r.tipo_operacao = :tipo
+          {clausula}
         group by r.cfop, cpe.grupo, cp.descricao
         order by r.cfop
-    """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
+    """), params).mappings().all()
     df = pd.DataFrame(rows, columns=["cfop", "grupo", "descricao", "n_filiais", "valor_contabil", "valor_icms"])
     if not df.empty:
         # sum(numeric) no Postgres volta como decimal.Decimal (via psycopg2), não float — Decimal * float
@@ -41,8 +61,11 @@ def resumo_1024_por_cfop(session, competencia_id, tipo_operacao):
     return df
 
 
-def resumo_por_cfop(session, competencia_id, tipo_operacao):
-    rows = session.execute(text("""
+def resumo_por_cfop(session, competencia_id, tipo_operacao, cfops_permitidos=None):
+    """`cfops_permitidos` (opcional) restringe a uma lista fechada de CFOPs — ver `_clausula_cfops_permitidos`."""
+    params = {"cid": competencia_id, "tipo": tipo_operacao}
+    clausula = _clausula_cfops_permitidos(cfops_permitidos, "ri", params)
+    rows = session.execute(text(f"""
         select ri.cfop, coalesce(cpe.grupo, '(sem grupo)') as grupo, cp.descricao,
                count(*) as n_itens, sum(ri.valor_itens) as valor_itens,
                sum(ri.valor_tributado) as valor_tributado, sum(ri.valor_pis) as valor_pis,
@@ -51,15 +74,19 @@ def resumo_por_cfop(session, competencia_id, tipo_operacao):
         left join cfop_pis_cofins_efetivo cpe on cpe.codigo = ri.cfop
         left join cfop_pis_cofins cp on cp.codigo = ri.cfop
         where ri.competencia_id = :cid and ri.tipo_operacao = :tipo
+          {clausula}
         group by ri.cfop, cpe.grupo, cp.descricao
         order by ri.cfop
-    """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
+    """), params).mappings().all()
     return pd.DataFrame(rows, columns=["cfop", "grupo", "descricao", "n_itens", "valor_itens",
                                         "valor_tributado", "valor_pis", "valor_cofins"])
 
 
-def resumo_por_cst(session, competencia_id, tipo_operacao):
-    rows = session.execute(text("""
+def resumo_por_cst(session, competencia_id, tipo_operacao, cfops_permitidos=None):
+    """`cfops_permitidos` (opcional) restringe a uma lista fechada de CFOPs — ver `_clausula_cfops_permitidos`."""
+    params = {"cid": competencia_id, "tipo": tipo_operacao}
+    clausula = _clausula_cfops_permitidos(cfops_permitidos, "ri", params)
+    rows = session.execute(text(f"""
         select ri.cst, cs.descricao,
                count(*) as n_itens, sum(ri.valor_itens) as valor_itens,
                sum(ri.valor_tributado) as valor_tributado, sum(ri.valor_pis) as valor_pis,
@@ -67,9 +94,10 @@ def resumo_por_cst(session, competencia_id, tipo_operacao):
         from relatorio_pc_itens ri
         left join cst_pis_cofins cs on cs.codigo = ri.cst
         where ri.competencia_id = :cid and ri.tipo_operacao = :tipo
+          {clausula}
         group by ri.cst, cs.descricao
         order by ri.cst
-    """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
+    """), params).mappings().all()
     return pd.DataFrame(rows, columns=["cst", "descricao", "n_itens", "valor_itens", "valor_tributado",
                                         "valor_pis", "valor_cofins"])
 

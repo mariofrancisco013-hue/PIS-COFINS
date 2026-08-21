@@ -1,4 +1,4 @@
-# Apuração PIS/COFINS 
+# Apuração PIS/COFINS — Grupo Sodine
 
 Plataforma de apuração de PIS/COFINS, construída em 14/08/2026 (Supabase + Streamlit + GitHub), na mesma
 arquitetura do projeto "Apuração ICMS". Módulo em desenvolvimento: **PIS/COFINS Lucro Real** (regime

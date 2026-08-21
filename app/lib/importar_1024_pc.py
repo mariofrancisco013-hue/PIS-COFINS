@@ -41,6 +41,8 @@ from decimal import Decimal
 import pdfplumber
 from sqlalchemy import text
 
+from lib.cst_regras_pc import clausula_entrada_permitida_presumido
+
 _LINHA_CFOP_RE = re.compile(
     r"^\d+\s+(\d{4})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+[\d.]+,\d{2}\s+([\d.]+,\d{2})$"
 )
@@ -139,12 +141,19 @@ def importar_1024(session, empresa_id, competencia_id, arquivo_pdf, substituir=F
             "vo": str(l["valor_outras"]),
         })
 
-    cfops_ruins = session.execute(text("""
+    # Entrada do Lucro Presumido = só Devolução de Venda (sessão de continuação, 20/08/2026, "os outros não
+    # precisa validar na presumido") — ver clausula_entrada_permitida_presumido em cst_regras_pc.py. Esta é a
+    # checagem MAIS importante das 4 (Rotina 1024 é a fonte de que o cálculo do Presumido realmente lê, ver
+    # calculo_pis_cofins_lucro_presumido._soma_bruta). Vazio (sem filtro) para o Lucro Real.
+    params_cfop = {"cid": competencia_id, "eid": empresa_id}
+    clausula_entrada = clausula_entrada_permitida_presumido(session, competencia_id, "r", params_cfop)
+    cfops_ruins = session.execute(text(f"""
         select distinct r.cfop, r.tipo_operacao
         from resumo_1024_pc r
         left join cfop_pis_cofins cp on cp.codigo = r.cfop
         where r.competencia_id = :cid and r.empresa_id = :eid and cp.codigo is null
-    """), {"cid": competencia_id, "eid": empresa_id}).mappings().all()
+          {clausula_entrada}
+    """), params_cfop).mappings().all()
     for r in cfops_ruins:
         session.execute(text("""
             insert into inconsistencias_pc (competencia_id, empresa_id, tipo, cfop, tipo_operacao, descricao, fonte)

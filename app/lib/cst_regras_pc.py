@@ -42,7 +42,46 @@ mais dois complementos, ver sql/006_planilha_editavel_pc.sql:
 import pandas as pd
 from sqlalchemy import text
 
+from lib.calculo_pis_cofins_lucro_presumido import CFOPS_1_2_DEVOLUCAO_VENDA
+
 TIPOS_REGRA = ("cst_regra_cfop", "cst_regra_ncm", "cst_regra_alerta")
+
+
+# --- Entrada do Lucro Presumido = só Devolução de Venda (sessão de continuação, 20/08/2026) --------------
+# Pedido do usuário: "na entrada considerar somente CFOP de devolução" / "os outros não precisa validar na
+# presumido". Este regime cumulativo não usa NENHUM outro CFOP de Entrada — nem no cálculo (só lê
+# resumo_1024_pc filtrado a CFOPS_1_2_DEVOLUCAO_VENDA, ver calculo_pis_cofins_lucro_presumido.calcular_
+# apuracao_pc_presumido) nem como crédito (regime cumulativo não tem crédito de entrada). Um CFOP de compra
+# normal (ex.: 1102 Compra para Revenda) com CST errado não é um erro que precise de atenção aqui — é ruído
+# puro, porque aquele item nunca vai influenciar em nada a apuração do Presumido. As checagens abaixo
+# (regras de CST × CFOP/NCM em cst_regras_pc.py, e CST/CFOP sem cadastro em importacao_pc.py/importar_1024_
+# pc.py) passam a restringir a direção Entrada a essa lista quando a competência é do módulo Presumido — a
+# direção Saída continua sem nenhuma restrição ("na saida pode ter todas"), e o Lucro Real (onde Entrada É a
+# base de crédito de verdade) continua 100% sem restrição também, nas duas direções.
+def _cfops_entrada_permitidos_presumido(session, competencia_id):
+    """None = sem restrição nenhuma (Lucro Real, ou competência não encontrada) — devolve o conjunto de
+    CFOPs de Entrada que fazem sentido checar quando esta competência é do módulo Lucro Presumido (só
+    Devolução de Venda)."""
+    modulo = session.execute(
+        text("select modulo from competencias where id = :cid"), {"cid": competencia_id}
+    ).scalar()
+    if modulo == "pis_cofins_lucro_presumido":
+        return set(CFOPS_1_2_DEVOLUCAO_VENDA)
+    return None
+
+
+def clausula_entrada_permitida_presumido(session, competencia_id, alias, params, prefix="cfe"):
+    """Monta `and (<alias>.tipo_operacao <> 'entrada' or <alias>.cfop in (...))` — só restringe linhas de
+    Entrada, e só quando a competência é do Lucro Presumido (ver `_cfops_entrada_permitidos_presumido`).
+    Devolve string vazia (sem filtro) para o Lucro Real. Usada tanto pelas checagens deste módulo quanto por
+    `importacao_pc._registrar_inconsistencias_1096` e `importar_1024_pc.importar_1024` (CFOP sem grupo)."""
+    cfops = _cfops_entrada_permitidos_presumido(session, competencia_id)
+    if cfops is None:
+        return ""
+    placeholders = ", ".join(f":{prefix}{i}" for i in range(len(cfops)))
+    for i, c in enumerate(sorted(cfops)):
+        params[f"{prefix}{i}"] = c
+    return f" and ({alias}.tipo_operacao <> 'entrada' or {alias}.cfop in ({placeholders}))"
 
 
 def _buscar_excecoes_ativas(session, empresa_id, tipo):
@@ -159,6 +198,7 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
     excecoes = _buscar_excecoes_ativas(session, empresa_id, "cst_regra_cfop")
     params = {"cid": competencia_id, "eid": empresa_id}
     clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
+    clausula_entrada = clausula_entrada_permitida_presumido(session, competencia_id, "ri", params)
     achados = session.execute(text(f"""
         select ri.cfop, ri.cst, ri.tipo_operacao, count(*) as quantidade,
                (select r.cst from cst_regra_cfop_pc r
@@ -174,6 +214,7 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
           and not exists (select 1 from cst_regra_cfop_pc r
                            where r.cfop = ri.cfop and r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao)
           {clausula_excluidos}
+          {clausula_entrada}
         group by ri.cfop, ri.cst, ri.tipo_operacao
         order by ri.cfop, ri.cst
     """), params).mappings().all()
@@ -223,6 +264,7 @@ def _checar_regra_ncm(session, competencia_id, empresa_id):
     excecoes = _buscar_excecoes_ativas(session, empresa_id, "cst_regra_ncm")
     params = {"cid": competencia_id, "eid": empresa_id}
     clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
+    clausula_entrada = clausula_entrada_permitida_presumido(session, competencia_id, "ri", params)
     achados = session.execute(text(f"""
         select ri.ncm, ri.cst, ri.tipo_operacao, count(*) as quantidade,
                min(ri.cfop) as cfop_repr, count(distinct ri.cfop) as n_cfops,
@@ -239,6 +281,7 @@ def _checar_regra_ncm(session, competencia_id, empresa_id):
           and not exists (select 1 from cst_regra_ncm_pc r
                            where r.ncm = ri.ncm and r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao)
           {clausula_excluidos}
+          {clausula_entrada}
         group by ri.ncm, ri.cst, ri.tipo_operacao
         order by ri.ncm, ri.cst
     """), params).mappings().all()
@@ -289,6 +332,7 @@ def _checar_alerta(session, competencia_id, empresa_id):
     excecoes = _buscar_excecoes_ativas(session, empresa_id, "cst_regra_alerta")
     params = {"cid": competencia_id, "eid": empresa_id}
     clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
+    clausula_entrada = clausula_entrada_permitida_presumido(session, competencia_id, "ri", params)
     achados = session.execute(text(f"""
         select ri.cst, ri.tipo_operacao, count(*) as quantidade,
                min(ri.cfop) as cfop_repr, count(distinct ri.cfop) as n_cfops
@@ -296,6 +340,7 @@ def _checar_alerta(session, competencia_id, empresa_id):
         join cst_regra_alerta_pc r on r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao
         where ri.competencia_id = :cid and ri.empresa_id = :eid
           {clausula_excluidos}
+          {clausula_entrada}
         group by ri.cst, ri.tipo_operacao
         order by ri.cst
     """), params).mappings().all()

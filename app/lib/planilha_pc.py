@@ -73,8 +73,26 @@ def _where_empresas(empresa_ids, alias, params, prefix):
     return f"{alias}.empresa_id in ({placeholders})"
 
 
+def _clausula_cfops_permitidos(cfops_permitidos, alias, params, prefix="cfp"):
+    """Filtro OPCIONAL e genérico por uma lista fechada de CFOPs, no formato `<alias>.cfop in (...)` (SEM o
+    "and" na frente — quem chama decide como encaixar, ver usos abaixo) — usado pela aba Entrada do Lucro
+    Presumido (sessão de continuação, 20/08/2026: "na entrada considerar somente CFOP de devolução",
+    confirmado com o usuário que isso vale também para a grade/resumos, não só para a geração automática de
+    inconsistências — ver o equivalente `cst_regras_pc.clausula_entrada_permitida_presumido`, usado nas
+    checagens). `None` (padrão) = sem filtro nenhum — mantém o Lucro Real e a aba Saída do Presumido 100%
+    inalterados."""
+    if cfops_permitidos is None:
+        return ""
+    cfops = list(cfops_permitidos)
+    placeholders = ", ".join(f":{prefix}{i}" for i in range(len(cfops)))
+    for i, c in enumerate(cfops):
+        params[f"{prefix}{i}"] = c
+    return f"{alias}.cfop in ({placeholders})"
+
+
 def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro=None,
-                             ncm_filtro=None, busca=None, tipos_inconsistencia=None, limite=500):
+                             ncm_filtro=None, busca=None, tipos_inconsistencia=None, limite=500,
+                             cfops_permitidos=None):
     """Devolve (DataFrame, total_sem_filtro_de_limite) — itens do Relatório 1096 de TODAS as filiais do
     grupo passadas em `empresa_ids` (a apuração de PIS/COFINS é por grupo, não por filial única).
 
@@ -82,9 +100,14 @@ def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids,
     que bate com este item — casado por (empresa_id, tipo_operacao) + CFOP/NCM/CST conforme o tipo (mesma
     chave usada para gerar cada uma em cst_regras_pc.py), sem precisar de uma tabela de vínculo por item
     (diferença do ICMS Normal, que usa `inconsistencia_itens` — não precisamos aqui porque as checagens do
-    PIS/COFINS já são por CFOP/NCM/CST exato, não por nota fiscal individual)."""
+    PIS/COFINS já são por CFOP/NCM/CST exato, não por nota fiscal individual).
+
+    `cfops_permitidos` (opcional) restringe a uma lista fechada de CFOPs — ver `_clausula_cfops_permitidos`."""
     params = {"cid": competencia_id, "tipo": tipo_operacao}
     where = ["ri.competencia_id = :cid", "ri.tipo_operacao = :tipo", _where_empresas(empresa_ids, "ri", params, "eid")]
+    clausula_permitidos = _clausula_cfops_permitidos(cfops_permitidos, "ri", params)
+    if clausula_permitidos:
+        where.append(clausula_permitidos)
     if cfop_filtro:
         where.append("ri.cfop = :cfop")
         params["cfop"] = cfop_filtro
@@ -162,12 +185,18 @@ def carregar_itens_editavel(session, competencia_id, tipo_operacao, empresa_ids,
     return df[COLUNAS_TODAS], total
 
 
-def carregar_totalizador(session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro=None, ncm_filtro=None):
+def carregar_totalizador(session, competencia_id, tipo_operacao, empresa_ids, cfop_filtro=None, ncm_filtro=None,
+                          cfops_permitidos=None):
     """Visão SINTÉTICA — totaliza por Filial + Código do Produto + CST, em vez de item a item (equivalente
     à visão "UF + Código do Produto + Alíquota" do ICMS Normal; aqui o CST faz esse papel de agrupador
-    tributário, já que o PIS/COFINS não varia por UF)."""
+    tributário, já que o PIS/COFINS não varia por UF).
+
+    `cfops_permitidos` (opcional) restringe a uma lista fechada de CFOPs — ver `_clausula_cfops_permitidos`."""
     params = {"cid": competencia_id, "tipo": tipo_operacao}
     where = ["ri.competencia_id = :cid", "ri.tipo_operacao = :tipo", _where_empresas(empresa_ids, "ri", params, "eid")]
+    clausula_permitidos = _clausula_cfops_permitidos(cfops_permitidos, "ri", params)
+    if clausula_permitidos:
+        where.append(clausula_permitidos)
     if cfop_filtro:
         where.append("ri.cfop = :cfop")
         params["cfop"] = cfop_filtro

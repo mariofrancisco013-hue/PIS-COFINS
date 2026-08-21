@@ -598,6 +598,39 @@ def salvar_regras_ncm(session, df_original, df_editado):
     )
 
 
+# --- Atalho "cadastrar como regra" a partir de um item/inconsistência já visto (sessão de continuação,
+# 21/08/2026) — pedido do usuário: "crie uma forma de eu informar que aquele NCM deve ser adicionado a aba
+# Regras de CST", sem precisar ir na aba 🔖 e digitar o CFOP/NCM/CST manualmente. Diferente de
+# `salvar_regras_cfop`/`_ncm` (CRUD em lote via grade `st.data_editor`, usado só dentro da aba de cadastro),
+# estas duas funções fazem um UPSERT de UMA linha só — chamadas a partir de um botão no card de
+# inconsistência (⚠️ Inconsistências) ou na grade Entrada/Saída (📥/📤), usando o CST que já está no item como
+# o CST esperado da regra nova (decisão do usuário: "o CST que já está no item" — um clique, sem digitar
+# nada; se o CST estivesse errado, o item já apareceria como inconsistência de outro tipo, então assumir que
+# está certo é uma aposta razoável, e dá pra corrigir a regra depois na aba 🔖 se precisar). Mesmo conflito
+# (cfop, tipo_operacao) / (ncm, tipo_operacao) das tabelas — se já existir uma regra para aquele CFOP/NCM
+# nesta direção, o CST é atualizado para o valor novo (mesmo comportamento de "cadastrar de novo" na grade).
+def adicionar_regra_cfop(session, cst, cfop, tipo_operacao, observacao=None):
+    session.execute(text("""
+        insert into cst_regra_cfop_pc (cst, cfop, tipo_operacao, observacao)
+        values (:cst, :cfop, :top, :obs)
+        on conflict (cfop, tipo_operacao) do update
+            set cst = excluded.cst,
+                observacao = coalesce(excluded.observacao, cst_regra_cfop_pc.observacao)
+    """), {"cst": int(cst), "cfop": int(cfop), "top": tipo_operacao, "obs": observacao})
+    session.commit()
+
+
+def adicionar_regra_ncm(session, cst, ncm, tipo_operacao, observacao=None):
+    session.execute(text("""
+        insert into cst_regra_ncm_pc (cst, ncm, tipo_operacao, observacao)
+        values (:cst, :ncm, :top, :obs)
+        on conflict (ncm, tipo_operacao) do update
+            set cst = excluded.cst,
+                observacao = coalesce(excluded.observacao, cst_regra_ncm_pc.observacao)
+    """), {"cst": int(cst), "ncm": str(ncm), "top": tipo_operacao, "obs": observacao})
+    session.commit()
+
+
 def listar_regras_alerta(session):
     rows = session.execute(text("""
         select r.id, r.cst, r.tipo_operacao, r.observacao, r.created_at

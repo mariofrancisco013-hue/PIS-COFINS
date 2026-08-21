@@ -57,6 +57,7 @@ from lib.cst_regras_pc import (
     registrar_revisao, carregar_excecoes, definir_excecao_ativa, listar_cfops_sem_checagem,
     salvar_cfops_sem_checagem, listar_regras_cfop, salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm,
     listar_regras_alerta, salvar_regras_alerta, registrar_inconsistencias_cst_regras,
+    adicionar_regra_cfop, adicionar_regra_ncm,
 )
 from lib import lancamentos_manuais_pc as lmpc
 
@@ -167,11 +168,14 @@ def _cache_historico_edicoes(_session, competencia_id, tipo_operacao):
     return planilha_pc.carregar_historico_edicoes(_session, competencia_id, tipo_operacao)
 
 
-def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id=None):
+def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id=None, empresa_ids=None):
     """Card de inconsistência — cópia adaptada de `2_PIS_COFINS_Lucro_Real.py::_card_inconsistencia` (ver lá
     a docstring completa sobre o motivo do `key_prefix`: a mesma inconsistência pode, em tese, aparecer em
     mais de uma seção da tela no mesmo run do Streamlit, e sem prefixo os widgets colidem
-    — `StreamlitDuplicateElementKey`, bug real já visto em produção no Lucro Real em 18/08/2026)."""
+    — `StreamlitDuplicateElementKey`, bug real já visto em produção no Lucro Real em 18/08/2026).
+
+    `empresa_ids` (novo, sessão de continuação de 21/08/2026): só usado pelo botão "➕ Cadastrar como regra"
+    — ver mais abaixo — para recalcular as inconsistências do grupo/competência logo depois de cadastrar."""
     tem_grupo = pd.notna(row.get("chave_agrupamento")) and row.get("chave_agrupamento")
     qtd = int(row["quantidade"]) if pd.notna(row.get("quantidade")) else 1
     selo = f"{qtd}× " if qtd > 1 else ""
@@ -193,6 +197,51 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia
                 f"Esse mesmo erro se repete em {qtd} itens do Relatório 1096 nesta filial/competência "
                 f"(agrupado numa linha só) — revisar/ignorar/justificar aqui vale para os {qtd} de uma vez."
             )
+
+        # ➕ Cadastrar como regra permanente (sessão de continuação, 21/08/2026) — pedido do usuário: "crie
+        # uma forma de eu informar que aquele NCM deve ser adicionado a aba Regras de CST". Só aparece nos
+        # casos "caso 1" de `_checar_regra_cfop`/`_checar_regra_ncm` (o achado já tem um CFOP ou NCM
+        # específico, não o alerta consolidado por CST — ver `cst_regras_pc._inserir_grupo`/`_checar_regra_*`,
+        # mesmo raciocínio de "escopo seguro" já usado no ajuste de CST). Usa o CST que já está no item como o
+        # CST esperado da regra nova — decisão do usuário: um clique, sem digitar nada.
+        if row["tipo"] == "cst_regra_cfop" and pd.notna(row.get("cfop")) and pd.notna(row.get("cst")):
+            if st.button(
+                f"➕ Cadastrar regra: CFOP {int(row['cfop'])} × CST {int(row['cst'])} ({row['tipo_operacao']})",
+                key=f"{key_prefix}_add_regra_cfop_{row['id']}",
+                help="Cadastra esta combinação na aba 🔖 Regras de CST → Por CFOP, assumindo que o CST atual "
+                     "deste item está certo. Recalcula as inconsistências desta competência na hora.",
+            ):
+                adicionar_regra_cfop(
+                    session, int(row["cst"]), int(row["cfop"]), row["tipo_operacao"],
+                    observacao=f"Cadastrada a partir da inconsistência #{row['id']} (aba ⚠️ Inconsistências).",
+                )
+                if competencia_id is not None and empresa_ids:
+                    with st.spinner("Recalculando inconsistências..."):
+                        _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+                _cache_regras_cfop.clear()
+                _cache_inconsistencias.clear()
+                _cache_itens_editavel.clear()
+                st.success("Regra de CFOP cadastrada — inconsistências desta competência já recalculadas.")
+                st.rerun()
+        elif row["tipo"] == "cst_regra_ncm" and pd.notna(row.get("ncm")) and pd.notna(row.get("cst")):
+            if st.button(
+                f"➕ Cadastrar regra: NCM {row['ncm']} × CST {int(row['cst'])} ({row['tipo_operacao']})",
+                key=f"{key_prefix}_add_regra_ncm_{row['id']}",
+                help="Cadastra esta combinação na aba 🔖 Regras de CST → Por NCM, assumindo que o CST atual "
+                     "deste item está certo. Recalcula as inconsistências desta competência na hora.",
+            ):
+                adicionar_regra_ncm(
+                    session, int(row["cst"]), row["ncm"], row["tipo_operacao"],
+                    observacao=f"Cadastrada a partir da inconsistência #{row['id']} (aba ⚠️ Inconsistências).",
+                )
+                if competencia_id is not None and empresa_ids:
+                    with st.spinner("Recalculando inconsistências..."):
+                        _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+                _cache_regras_ncm.clear()
+                _cache_inconsistencias.clear()
+                _cache_itens_editavel.clear()
+                st.success("Regra de NCM cadastrada — inconsistências desta competência já recalculadas.")
+                st.rerun()
 
         if row.get("aplicada_por_excecao"):
             st.info(
@@ -337,7 +386,7 @@ def _mostrar_resumo_por_tipo(df, key_prefix):
 
 
 def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, key_prefix,
-                                     competencia_id=None):
+                                     competencia_id=None, empresa_ids=None):
     """Cópia de `2_PIS_COFINS_Lucro_Real.py::_secao_inconsistencias_operacao` — bloco de inconsistências +
     ajuste de CST, filtrado por operação (saida/entrada), usado nas abas Entrada/Saída (20/08/2026, sessão
     de continuação)."""
@@ -365,7 +414,7 @@ def _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponi
     _mostrar_resumo_por_tipo(df_filtrado, key_prefix)
     st.divider()
     for _, row in df_filtrado.iterrows():
-        _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id)
+        _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id, empresa_ids)
 
 
 def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc, csts_disponiveis):
@@ -537,6 +586,90 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                 st.info("Nenhuma mudança detectada.")
             st.rerun()
 
+        with st.expander("➕ Cadastrar regra de CST a partir desta grade"):
+            st.caption(
+                "Atalho para quando você já está olhando a grade e percebe que um CFOP ou NCM inteiro "
+                "deveria ter uma regra fixa de CST (aba 🔖 Regras de CST). Usa o CST que já está nos itens "
+                "abaixo — recalcula as inconsistências desta competência na hora, igual ao botão da aba "
+                "⚠️ Inconsistências (pedido do usuário: \"crie uma forma de eu informar que aquele NCM deve "
+                "ser adicionado a aba REGRAS DE CST\", 21/08/2026, sessão de continuação)."
+            )
+            col_cfop, col_ncm = st.columns(2)
+
+            with col_cfop:
+                st.markdown("**Por CFOP**")
+                if cfop_filtro is None:
+                    st.caption("Selecione um CFOP específico no filtro acima para cadastrar por CFOP.")
+                elif df.empty:
+                    st.caption("Nenhum item nesta grade para derivar o CST.")
+                else:
+                    csts_do_cfop = sorted(df["cst"].dropna().unique().tolist())
+                    if len(csts_do_cfop) == 1:
+                        cst_cfop_sel = int(csts_do_cfop[0])
+                        st.caption(f"CST único encontrado nos itens deste CFOP: **{cst_cfop_sel}**.")
+                    else:
+                        cst_cfop_sel = st.selectbox(
+                            "CST a cadastrar", [int(c) for c in csts_do_cfop],
+                            key=f"pres_grade_regra_cfop_cst_{tipo_operacao}",
+                            help="Este CFOP tem mais de um CST nos itens carregados — escolha qual vira regra.",
+                        )
+                    if st.button(
+                        f"➕ Cadastrar CFOP {cfop_filtro} × CST {cst_cfop_sel} ({tipo_operacao})",
+                        key=f"pres_grade_add_regra_cfop_{tipo_operacao}",
+                    ):
+                        adicionar_regra_cfop(
+                            session, cst_cfop_sel, cfop_filtro, tipo_operacao,
+                            observacao=f"Cadastrada a partir da grade editável ({tipo_operacao}), competência "
+                                       f"{competencia_id}.",
+                        )
+                        with st.spinner("Recalculando inconsistências..."):
+                            _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+                        _cache_regras_cfop.clear()
+                        _cache_inconsistencias.clear()
+                        _cache_itens_editavel.clear()
+                        st.success("Regra de CFOP cadastrada — inconsistências desta competência já recalculadas.")
+                        st.rerun()
+
+            with col_ncm:
+                st.markdown("**Por NCM**")
+                if df.empty:
+                    st.caption("Nenhum item nesta grade para derivar o CST.")
+                else:
+                    ncms_disp = sorted(df["ncm"].dropna().unique().tolist())
+                    if not ncms_disp:
+                        st.caption("Nenhum NCM nos itens carregados.")
+                    else:
+                        ncm_sel = st.selectbox(
+                            "NCM", ncms_disp, key=f"pres_grade_regra_ncm_{tipo_operacao}",
+                            help="O filtro de NCM acima é por prefixo — escolha aqui o NCM exato que vai virar regra.",
+                        )
+                        csts_do_ncm = sorted(df.loc[df["ncm"] == ncm_sel, "cst"].dropna().unique().tolist())
+                        if len(csts_do_ncm) == 1:
+                            cst_ncm_sel = int(csts_do_ncm[0])
+                            st.caption(f"CST único encontrado nos itens deste NCM: **{cst_ncm_sel}**.")
+                        else:
+                            cst_ncm_sel = st.selectbox(
+                                "CST a cadastrar", [int(c) for c in csts_do_ncm],
+                                key=f"pres_grade_regra_ncm_cst_{tipo_operacao}",
+                                help="Este NCM tem mais de um CST nos itens carregados — escolha qual vira regra.",
+                            )
+                        if st.button(
+                            f"➕ Cadastrar NCM {ncm_sel} × CST {cst_ncm_sel} ({tipo_operacao})",
+                            key=f"pres_grade_add_regra_ncm_{tipo_operacao}",
+                        ):
+                            adicionar_regra_ncm(
+                                session, cst_ncm_sel, ncm_sel, tipo_operacao,
+                                observacao=f"Cadastrada a partir da grade editável ({tipo_operacao}), competência "
+                                           f"{competencia_id}.",
+                            )
+                            with st.spinner("Recalculando inconsistências..."):
+                                _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
+                            _cache_regras_ncm.clear()
+                            _cache_inconsistencias.clear()
+                            _cache_itens_editavel.clear()
+                            st.success("Regra de NCM cadastrada — inconsistências desta competência já recalculadas.")
+                            st.rerun()
+
     with st.expander("📝 Histórico de edições desta grade (mais recentes primeiro)"):
         hist = _cache_historico_edicoes(session, competencia_id, tipo_operacao)
         if hist.empty:
@@ -576,7 +709,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
         "editável acima em vez de vir até aqui."
     )
     _secao_inconsistencias_operacao(session, df_inc, tipo_operacao, csts_disponiveis, f"pres_inc_{tipo_operacao}",
-                                     competencia_id)
+                                     competencia_id, empresa_ids)
 
 
 def _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids):
@@ -1140,7 +1273,8 @@ with aba_inconsist:
             _mostrar_resumo_por_tipo(df_filtrado, "pres_inc_geral")
             st.divider()
             for _, row in df_filtrado.iterrows():
-                _card_inconsistencia(session, row, csts_disponiveis, "pres_inc_geral", competencia_id)
+                _card_inconsistencia(session, row, csts_disponiveis, "pres_inc_geral", competencia_id,
+                                      empresa_ids_grupo)
 
     st.divider()
     st.subheader("Histórico de ajustes manuais de CST")

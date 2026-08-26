@@ -82,6 +82,47 @@ def get_engine():
 
 
 def get_session():
+    """CORREÇÃO "TimeoutError: QueuePool limit... connection timed out" (produção, sessão de continuação,
+    21/08/2026 à noite — erro ocorreu em `Home.py`, uma página que este trabalho nem tocou, confirmando que
+    a causa é estrutural/pré-existente, não algo introduzido pelas features desta sessão): TODA página do
+    app chama `get_session()` uma única vez por execução do script (`Home.py`, `1_Importar_Relatorios.py`,
+    `2_PIS_COFINS_Lucro_Real.py`, `3_Empresas.py`, `4_CFOP_CST.py`, `5_PIS_COFINS_Lucro_Presumido.py`) e
+    NUNCA chama `session.close()` no fim (ver docstring do módulo, comentário "IDLE IN TRANSACTION" de
+    06/08/2026 — já sabia disso, mas só tratou o sintoma de transação pendurada via AUTOCOMMIT, não o
+    vazamento de conexão em si). Antes desta correção, cada nova chamada criava um `Session` novo (via
+    `_SessionLocal()`), que assim que executa a primeira query fica com uma conexão do pool amarrada até
+    o objeto Session ser coletado pelo GC — e como `Session` tem referências cíclicas internas, o
+    refcounting do Python não libera na hora, só o GC cíclico (que roda esporadicamente). Streamlit reexecuta
+    o script inteiro a CADA interação (clique, digitação, etc.) — então cada rerun deixava um Session/conexão
+    "no limbo" esperando o GC, e com pool pequeno (`pool_size=5, max_overflow=5` — só 10 conexões) e mais de
+    um usuário/aba ativa ao mesmo tempo, o pool esgotava antes do GC dar conta, gerando exatamente esse
+    `TimeoutError`.
+
+    CORRIGIDO reaproveitando a MESMA Session entre reruns do Streamlit via `st.session_state` (que já é,
+    por natureza, escopado por aba/sessão do navegador — não é compartilhado entre usuários/abas
+    diferentes): em vez de 1 conexão vazada por rerun, agora é NO MÁXIMO 1 conexão mantida por aba ativa,
+    reaproveitada entre reruns em vez de acumular. `session.rollback()` defensivo ao reaproveitar (mesmo sob
+    AUTOCOMMIT, o `Session` do SQLAlchemy pode marcar sua transação lógica como "precisa rollback" depois de
+    um erro no meio de uma query anterior — sem isso, uma falha num rerun deixaria a mesma sessão inutilizável
+    nos reruns seguintes). Fora do Streamlit (scripts/testes que chamam `get_session()` direto), cai no
+    mesmo fallback de `Session` global de sempre (`_SessionLocal`), sem mudança de comportamento aí.
+
+    NÃO precisou tocar nenhuma página (`Home.py`, `2_PIS_COFINS_Lucro_Real.py` incluído) — a correção é só
+    aqui dentro, e não muda nenhuma query nem resultado, só QUANDO a conexão é devolvida ao pool."""
+    try:
+        import streamlit as st
+        if "_db_session" not in st.session_state or st.session_state["_db_session"] is None:
+            st.session_state["_db_session"] = sessionmaker(bind=get_engine())()
+        else:
+            try:
+                st.session_state["_db_session"].rollback()
+            except Exception:
+                # Sessão realmente morta (ex.: conexão caiu e pool_pre_ping não deu conta) -- descarta e
+                # cria uma nova, em vez de propagar erro de uma sessão zumbi pro resto da página.
+                st.session_state["_db_session"] = sessionmaker(bind=get_engine())()
+        return st.session_state["_db_session"]
+    except Exception:
+        pass
     global _SessionLocal
     if _SessionLocal is None:
         _SessionLocal = sessionmaker(bind=get_engine())

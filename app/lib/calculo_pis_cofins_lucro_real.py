@@ -92,7 +92,14 @@ ALIQ_COFINS = Decimal("0.0760")
 # CSTs de PIS/COFINS que não geram crédito/débito (entrada: sem direito a crédito/isenção/sem incidência;
 # saída: espelho — ver metodologia "Regras confirmadas" no projeto) — usados para excluir da base o valor
 # desses itens do Relatório 1096 (ver _somar_exclusao_cst_por_cfop), decisão do usuário em 19/08/2026.
-CSTS_EXCLUSAO_ENTRADA = (70, 71, 74)
+# CST 98 ("Outras Operações de Entrada") ADICIONADO em 22/09/2026 (sessão de continuação) — achado real:
+# CFOPs 1303/1407/1933/2933 (grupo "5.8 Outras Entradas") tinham itens CST 98 com valor_nao_tributado ==
+# valor_contabil (R$ 289.840,09 no total, competência de referência) sendo tratados como ICMS real e
+# descontados por _somar_icms_nao_excluido_por_cfop — mas a própria tabela oficial de CST (Receita
+# Federal, ver seção "Tabela CST de PIS/COFINS" na metodologia) já classifica 70-75/98/99 inteiros como
+# "sem crédito": CST 98 sempre deveria ter estado nesta lista, não é uma exceção pontual por CFOP (ver
+# "Causa raiz 4" em claude/metodologia-pis-cofins-lucro-real.md — decisão confirmada por AskUserQuestion).
+CSTS_EXCLUSAO_ENTRADA = (70, 71, 74, 98)
 CSTS_EXCLUSAO_SAIDA = (6, 7)
 
 # --- Lei Complementar 224/2025 — incidência residual sobre produtos isentos (20/08/2026, tabela desde a
@@ -329,15 +336,28 @@ def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, cs
     `Vl.Tributado = Vl.Contábil − Vl.Não Tributado` é uma propriedade do próprio formato do relatório
     "Analítico" do Winthor (mesmo gerador para Entrada e Saída, qualquer regime) — não foi reconfirmada
     independentemente aqui para Entrada/CST 70-71-74, mas a mecânica do relatório é a mesma; vale re-
-    conferir contra um relatório de conferência real de Entrada antes de confiar 100% se algo não bater."""
+    conferir contra um relatório de conferência real de Entrada antes de confiar 100% se algo não bater.
+
+    EXCEÇÃO PONTUAL (22/09/2026, sessão de continuação, tabela `icms_zero_excecao_pc` — migração 011):
+    a identidade acima confirma que `valor_nao_tributado = valor_contábil − valor_tributado`, mas NÃO
+    garante que `valor_nao_tributado` seja sempre literalmente "o ICMS do item" quando ele não é excluído
+    por CST — em alguns CFOP+CST específicos (achados reais: 5906/CST49, 5411/CST49, 6551/CST70, 6915/CST1,
+    todos saída) é só um "Outras" do Winthor sem relação com ICMS real (livro RAICMS mostra R$ 0,00 de
+    ICMS para o CFOP). Por decisão do usuário (NÃO generalizar via checagem item a item — ver
+    "Causa raiz 1" na metodologia), esses casos são cadastrados manualmente em `icms_zero_excecao_pc` e
+    excluídos aqui via NOT EXISTS, sem alterar `csts_excluidos`."""
     placeholders = ", ".join(f":c{i}" for i in range(len(csts_excluidos)))
     params = {"cid": competencia_id, "tipo": tipo_operacao}
     params.update({f"c{i}": c for i, c in enumerate(csts_excluidos)})
     rows = session.execute(text(f"""
-        select cfop, sum(valor_nao_tributado) as valor
-        from relatorio_pc_itens
-        where competencia_id = :cid and tipo_operacao = :tipo and cst not in ({placeholders})
-        group by cfop
+        select ri.cfop, sum(ri.valor_nao_tributado) as valor
+        from relatorio_pc_itens ri
+        where ri.competencia_id = :cid and ri.tipo_operacao = :tipo and ri.cst not in ({placeholders})
+          and not exists (
+              select 1 from icms_zero_excecao_pc e
+              where e.tipo_operacao = ri.tipo_operacao and e.cfop = ri.cfop and e.cst = ri.cst and e.ativo
+          )
+        group by ri.cfop
     """), params).mappings().all()
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 

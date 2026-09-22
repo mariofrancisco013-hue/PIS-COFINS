@@ -263,12 +263,20 @@ def _dec(v):
     return Decimal(str(v)) if v is not None else Decimal("0")
 
 
-def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, icms_correto_por_cfop):
+def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, icms_correto_por_cfop,
+                     override_contabil_1096_por_cfop=None):
     """Soma valor_contábil (bruto) e valor_contábil − ICMS_correto − exclusão_cst (líquido) de todas as
     linhas do resumo_1024_pc (já somando todas as filiais da competência) cujo CFOP pertence a este grupo.
     Devolve (base_bruta, base_liquida, detalhe_por_cfop) — o líquido é o que efetivamente entra no PIS/COFINS
     (base_liquida × alíquota); o bruto é só para exibir a "Receita" antes das exclusões, pra ficar visível na
     tela que as linhas 2.x/6.x realmente saem da base bruta.
+
+    `override_contabil_1096_por_cfop` (NOVO em 22/09/2026, ver `_carregar_override_1096_por_cfop`): para
+    CFOPs marcados `cfop_pis_cofins.usa_base_1096 = true`, SUBSTITUI o Valor Contábil vindo da Rotina 1024
+    pelo Valor Contábil somado do Relatório 1096 — achado real: CFOPs de aquisição de serviço tributado
+    pelo ISSQN (1933/2933) têm Valor Contábil muito menor na Rotina 1024 (livro de ICMS, que não foi feito
+    para capturar serviço) do que no Relatório 1096 (relatório operacional completo). Decisão do usuário
+    confirmada por AskUserQuestion.
 
     CORRIGIDOS DOIS BUGS em 20/08/2026 (ver seção "Bug real..." na metodologia do Presumido, mesma causa
     raiz aplicada aqui — usuário pediu pra ajustar o Real também depois de confirmar com dados reais no
@@ -294,6 +302,11 @@ def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, ic
         if r["tipo_operacao"] != tipo_operacao or r["grupo"] != grupo:
             continue
         contabil_por_cfop[r["cfop"]] = contabil_por_cfop.get(r["cfop"], Decimal("0")) + _dec(r["valor_contabil"])
+
+    # Override 1096 (22/09/2026) — SUBSTITUI (não soma) o valor da Rotina 1024 pelos CFOPs marcados
+    # usa_base_1096, já filtrados para este grupo/tipo_operacao por quem chamou esta função.
+    if override_contabil_1096_por_cfop:
+        contabil_por_cfop.update(override_contabil_1096_por_cfop)
 
     base_bruta = Decimal("0")
     base_liquida = Decimal("0")
@@ -362,6 +375,24 @@ def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, cs
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
+def _carregar_override_1096_por_cfop(session, competencia_id, tipo_operacao):
+    """{cfop: (grupo, Decimal(valor))} para CFOPs marcados `cfop_pis_cofins.usa_base_1096 = true`
+    (migração 013, 22/09/2026) — nesses casos, a base de PIS/COFINS (Valor Contábil) vem do Relatório 1096
+    em vez da Rotina 1024. Achado real: CFOPs de aquisição de serviço tributado pelo ISSQN (1933/2933) têm
+    Valor Contábil muito menor na Rotina 1024 (R$ 6.558,26 no CFOP 1933, competência de referência) do que
+    no Relatório 1096 (R$ 316.676,33) — a Rotina 1024 é o livro de apuração do ICMS, e ISSQN não é ICMS, "
+    então ela não foi desenhada para capturar o valor cheio dessas operações. Soma o Valor Contábil BRUTO
+    (todos os itens, sem filtrar por CST — mesma unidade que a Rotina 1024 usaria) por CFOP."""
+    rows = session.execute(text("""
+        select ri.cfop, cpe.grupo, sum(ri.valor_contabil) as valor
+        from relatorio_pc_itens ri
+        join cfop_pis_cofins_efetivo cpe on cpe.codigo = ri.cfop
+        where ri.competencia_id = :cid and ri.tipo_operacao = :tipo and cpe.usa_base_1096
+        group by ri.cfop, cpe.grupo
+    """), {"cid": competencia_id, "tipo": tipo_operacao}).mappings().all()
+    return {r["cfop"]: (r["grupo"], _dec(r["valor"])) for r in rows}
+
+
 def _somar_lc224_saida_por_cfop_ncm(session, competencia_id):
     """[{cfop, ncm, valor}] Valor Contábil (Relatório 1096, saída) agrupado por CFOP+NCM, só itens CST 6/7
     (excluídos em "2.7") — casado depois, em Python, contra o lookup de `_carregar_ncms_lc224` (mesma
@@ -410,6 +441,12 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     # dentro do cálculo da base líquida, pra não descontar duas vezes o ICMS dos itens já excluídos por CST.
     icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
     icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
+    # Override 1096 (22/09/2026, ver docstring de _carregar_override_1096_por_cfop e migração 013) — CFOPs
+    # marcados cfop_pis_cofins.usa_base_1096 (ex.: 1933/2933, aquisição de serviço tributado pelo ISSQN) usam
+    # o Valor Contábil do Relatório 1096 em vez da Rotina 1024 como base de PIS/COFINS. Dict {cfop: (grupo,
+    # valor)}; filtrado por grupo dentro de cada loop abaixo antes de passar pra _base_por_grupo.
+    override_1096_entrada = _carregar_override_1096_por_cfop(session, competencia_id, "entrada")
+    override_1096_saida = _carregar_override_1096_por_cfop(session, competencia_id, "saida")
 
     linhas: list[LinhaApuracaoPC] = []
 
@@ -420,8 +457,9 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     debito_base_liquida_total = Decimal("0")  # = base bruta - ICMS - Outras - CST 6/7 — é o que vira PIS/COFINS
     outras_bruta_saida = Decimal("0")  # = valor bruto do grupo "1.4" (ver nota abaixo em "2.5")
     for grupo, descricao in GRUPOS_DEBITO.items():
+        override_deste_grupo = {cfop: v for cfop, (g, v) in override_1096_saida.items() if g == grupo}
         base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "saida", grupo, exclusao_cst_saida,
-                                                          icms_correto_saida)
+                                                          icms_correto_saida, override_deste_grupo)
         if grupo == "1.4":
             # "1.4 Outras Saídas" (catch-all de CFOP da Rotina 1024) — pedido do usuário em 19/08/2026, 2ª
             # revisão: a exclusão desse grupo NÃO depende mais da coluna "Outras" do PDF (valor_outras, que
@@ -642,8 +680,9 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     credito_base_liquida_total = Decimal("0")
     outras_bruta_entrada = Decimal("0")  # = valor bruto do grupo "5.8" (mesmo padrão de "1.4"/"2.5")
     for grupo, descricao in GRUPOS_CREDITO.items():
+        override_deste_grupo = {cfop: v for cfop, (g, v) in override_1096_entrada.items() if g == grupo}
         base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "entrada", grupo, exclusao_cst_entrada,
-                                                          icms_correto_entrada)
+                                                          icms_correto_entrada, override_deste_grupo)
         if grupo == "5.8":
             # "5.8 Outras Entradas" — mesmo tratamento de "1.4"/"2.5" (ver nota lá): grupo inteiro excluído
             # da base líquida (não gera crédito de PIS/COFINS), valor bruto replicado na linha "6.7".

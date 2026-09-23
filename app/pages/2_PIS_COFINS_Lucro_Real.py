@@ -1012,12 +1012,15 @@ with aba_conferencia:
         "Comparação por CFOP entre o resultado da Rotina 1024 (usado na apuração) e a soma direta de "
         "valor_pis/valor_cofins do Relatório 1096 (item a item) — só leitura, não muda nenhum valor "
         "calculado. Diferenças acima de R$ 1,00 aparecem como 'Divergente'; CFOPs que só aparecem em uma "
-        "das duas fontes também são sinalizados. Desde 22/09/2026, também compara o ICMS por CFOP (coluna "
-        "'Situação ICMS'): o ICMS declarado na Rotina 1024 (`valor_icms`) contra o ICMS que o Relatório 1096 "
-        "implica (item a item, já excluindo CST sem direito a crédito/isenção e as exceções pontuais "
-        "cadastradas) — essa comparação é só informativa, não altera as linhas '2.3'/'6.4' nem nenhum "
-        "valor da apuração; serve pra apontar CFOPs candidatos ao mesmo tipo de divergência já encontrado "
-        "em 5403/6108/6403 (itens CST 6/7 com ICMS real) ou 6202 (CST não-excluído com ICMS só parcial)."
+        "das duas fontes também são sinalizados. Coluna 'Situação ICMS' (desde 22/09/2026; RESSIGNIFICADA "
+        "em 23/09/2026): compara, por CFOP, o ICMS declarado na Rotina 1024 (`valor_icms`) contra o ICMS "
+        "que o Relatório 1096 implica (item a item, já excluindo CST sem direito a crédito/isenção e as "
+        "exceções pontuais cadastradas). Desde 23/09/2026, as linhas '2.3'/'6.4' da apuração passaram a "
+        "exibir exatamente o valor da Rotina 1024 (pedido do usuário) — a base/DARF continua sendo "
+        "calculada com o ICMS do Relatório 1096, sem mudança. Por isso, 'Divergente ICMS' aqui indica, "
+        "CFOP a CFOP, que o valor exibido em '2.3'/'6.4' é diferente do que de fato foi deduzido da base "
+        "— não afeta o DARF, mas é o sinal de onde investigar (mesmo padrão já encontrado em 5403/6108/"
+        "6403/6551, ver metodologia)."
     )
     linhas_conf = _cache_conferencia(session, competencia_id)
     if not linhas_conf:
@@ -1050,9 +1053,10 @@ with aba_conferencia:
             st.success("Todos os CFOPs batem em PIS/COFINS entre Rotina 1024 e Relatório 1096 (dentro da "
                        "tolerância).")
         if n_div_icms:
-            st.warning(f"{n_div_icms} CFOP(s) com ICMS divergente entre Rotina 1024 e Relatório 1096 (no "
-                       f"total, sem considerar o filtro acima) — não afeta o DARF, mas vale investigar se "
-                       f"é o mesmo padrão de 5403/6108/6403/6202 (ver metodologia, 'Causa raiz 3').")
+            st.warning(f"{n_div_icms} CFOP(s) onde o ICMS exibido em '2.3'/'6.4' (Rotina 1024) difere do "
+                       f"ICMS de fato deduzido da base/DARF (Relatório 1096) — no total, sem considerar o "
+                       f"filtro acima. Não afeta o DARF, mas vale investigar se é o mesmo padrão de "
+                       f"5403/6108/6403/6551 (ver metodologia).")
 
         if not linhas_filtradas:
             st.info("Nenhum CFOP corresponde aos filtros selecionados.")

@@ -452,6 +452,32 @@ def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, cs
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
+def _somar_icms_1024_por_cfop(resumo_1024, tipo_operacao):
+    """{cfop: Decimal} com o ICMS (resumo_1024_pc.valor_icms) somado por CFOP, direto da Rotina 1024 — NOVO
+    em 23/09/2026 (sessão de continuação: "Esqueça a 1096 pra fins do ICMS, vamos pegar diretamente pela
+    1024", "por CFOP", "no caso das outras entradas", "e outras saidas" — pedido explícito do usuário).
+    `resumo_1024` é a lista já carregada no início de `calcular_apuracao_pc` (mesma consulta usada pra tudo
+    mais ali) — esta função não faz SELECT novo, só agrupa em Python.
+
+    Usado SÓ para os totais de EXIBIÇÃO das linhas "2.3"/"6.4" (via `_somar_exclusao_cst_escopada`, que
+    restringe aos CFOPs presentes nos grupos de débito/crédito desta competência — inclui os catch-all
+    "1.4"/"5.8", satisfazendo o pedido de cobrir "outras entradas"/"outras saídas" também). NÃO substitui
+    `icms_correto_saida`/`icms_correto_entrada` (que continuam vindo do Relatório 1096 via
+    `_somar_icms_nao_excluido_por_cfop`) — aquelas continuam alimentando `_base_por_grupo`/a base líquida
+    real (DARF), sem nenhuma mudança, pra não reintroduzir o bug do "duplo desconto" de 20/08/2026 (ver
+    docstring de `_base_por_grupo`). Efeito prático: "2.3"/"6.4" passam a bater, por definição, com o que a
+    própria Rotina 1024 declara — inclusive nos CFOPs com defeito de dados do Winthor (6551/5403/6108/6403)
+    já mapeados na metodologia, cujo desvio deixa de aparecer aqui e passa a aparecer só na Conferência
+    1024×1096 (coluna "Situação ICMS"), que passa a ser o sinal de que a base/DARF usa um ICMS diferente do
+    exibido em "2.3"/"6.4" para aquele CFOP."""
+    valores = {}
+    for r in resumo_1024:
+        if r["tipo_operacao"] != tipo_operacao:
+            continue
+        valores[r["cfop"]] = valores.get(r["cfop"], Decimal("0")) + _dec(r["valor_icms"])
+    return valores
+
+
 def _carregar_override_1096_por_cfop(session, competencia_id, tipo_operacao):
     """{cfop: (grupo, Decimal(valor))} para CFOPs marcados `cfop_pis_cofins.usa_base_1096 = true`
     (migração 013, 22/09/2026) — nesses casos, a base de PIS/COFINS (Valor Contábil) vem do Relatório 1096
@@ -612,7 +638,11 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         debito_base_bruta_total += base_bruta
         debito_base_liquida_total += base_liquida
 
-    icms_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), icms_correto_saida)
+    # "2.3" exibida (NOVO em 23/09/2026, ver docstring de _somar_icms_1024_por_cfop) — fonte trocada do
+    # Relatório 1096 (icms_correto_saida) pra soma direta de valor_icms da Rotina 1024, escopada aos mesmos
+    # CFOPs de sempre. icms_correto_saida continua intocada, alimentando só _base_por_grupo (base/DARF).
+    icms_1024_saida = _somar_icms_1024_por_cfop(resumo_1024, "saida")
+    icms_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), icms_1024_saida)
     cst_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), exclusao_cst_saida)
     total_exclusoes_debito = icms_excluido_saida + outras_bruta_saida + cst_excluido_saida
 
@@ -670,11 +700,16 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_saida),
-            "nota": "CORRIGIDO em 20/08/2026: soma de relatorio_pc_itens.valor_nao_tributado (Relatório "
-                    "1096, saída) dos itens que NÃO são CST 6/7, todas as filiais — já é, item a item, o "
-                    "ICMS destacado de cada item com direito a débito. Antes somava valor_icms da Rotina "
-                    "1024 por CFOP inteiro (inclusive itens CST 6/7), descontando o ICMS deles duas vezes "
-                    "junto com a linha \"2.7\" — ver metodologia (\"Bug real encontrado...\").",
+            "nota": "FONTE TROCADA em 23/09/2026 (pedido do usuário: \"esqueça a 1096 pra fins do ICMS, "
+                    "vamos pegar diretamente pela 1024\"): agora soma resumo_1024_pc.valor_icms por CFOP, "
+                    "direto da Rotina 1024 (não mais do Relatório 1096), restrito aos CFOPs presentes nos "
+                    "grupos de débito desta competência (inclui \"1.4\"). Por definição, este valor bate com "
+                    "o que a própria Rotina 1024 declara de ICMS para esses CFOPs — inclusive nos que têm "
+                    "defeito de dados conhecido no Winthor (6551/5403/6108/6403, ver metodologia). IMPORTANTE: "
+                    "a base/DARF (linhas \"1.x\") continua calculada com o ICMS do Relatório 1096 (item a "
+                    "item, sem duplo desconto — regra de 20/08/2026, inalterada), então pode haver diferença "
+                    "entre o valor exibido aqui e o ICMS de fato deduzido da base; ver aba \"Conferência\", "
+                    "coluna \"Situação ICMS\", pra ver esse desvio CFOP a CFOP.",
             "icms_destacado_saida_total": str(icms_excluido_saida),
         },
     ))
@@ -831,7 +866,9 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         credito_base_bruta_total += base_bruta
         credito_base_liquida_total += base_liquida
 
-    icms_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), icms_correto_entrada)
+    # "6.4" exibida (NOVO em 23/09/2026, mesmo racional de "2.3" — ver docstring de _somar_icms_1024_por_cfop).
+    icms_1024_entrada = _somar_icms_1024_por_cfop(resumo_1024, "entrada")
+    icms_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), icms_1024_entrada)
     cst_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), exclusao_cst_entrada)
     total_exclusoes_credito = icms_excluido_entrada + outras_bruta_entrada + cst_excluido_entrada
 
@@ -884,11 +921,12 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "6.4", "(-) ICMS Apuração - Destacado Entradas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_entrada),
-            "nota": "CORRIGIDO em 20/08/2026: soma de relatorio_pc_itens.valor_nao_tributado (Relatório "
-                    "1096, entrada) dos itens que NÃO são CST 70/71/74, todas as filiais — já é, item a "
-                    "item, o ICMS destacado de cada item com direito a crédito. Antes somava valor_icms da "
-                    "Rotina 1024 por CFOP inteiro (inclusive itens CST 70/71/74), descontando o ICMS deles "
-                    "duas vezes junto com a linha \"6.5\" — ver metodologia (\"Bug real encontrado...\").",
+            "nota": "FONTE TROCADA em 23/09/2026 (mesmo pedido/racional da linha \"2.3\" — ver nota lá): "
+                    "agora soma resumo_1024_pc.valor_icms por CFOP, direto da Rotina 1024, restrito aos CFOPs "
+                    "presentes nos grupos de crédito desta competência (inclui \"5.8\"). A base/DARF (linhas "
+                    "\"5.x\") continua calculada com o ICMS do Relatório 1096 (regra de 20/08/2026, "
+                    "inalterada); ver aba \"Conferência\", coluna \"Situação ICMS\", pro desvio CFOP a CFOP "
+                    "entre o valor exibido aqui e o efetivamente deduzido da base.",
             "icms_destacado_entrada_total": str(icms_excluido_entrada),
         },
     ))
@@ -1012,7 +1050,19 @@ def conferencia_1024_x_1096(session, competencia_id: int) -> list[dict]:
     metodologia). `valor_outras` continua fora da base (mesmo motivo de calcular_apuracao_pc: grupos "1.4"/
     "5.8" são zerados por inteiro, não usam mais essa coluna). `1096` = soma direta de valor_pis/valor_cofins
     dos itens. Não usa cfop_pis_cofins (mostra TODO CFOP encontrado, mesmo sem grupo) — o objetivo aqui é
-    auditoria, não o cálculo da apuração."""
+    auditoria, não o cálculo da apuração.
+
+    ICMS (colunas `icms_1024`/`icms_1096`/`situacao_icms`) — RESSIGNIFICADO em 23/09/2026: até então, essa
+    comparação era só informativa (as linhas "2.3"/"6.4" da Apuração não usavam `valor_icms` da Rotina 1024
+    de jeito nenhum). Desde a mudança pedida pelo usuário ("esqueça a 1096 pra fins do ICMS, vamos pegar
+    diretamente pela 1024" — ver `_somar_icms_1024_por_cfop`), "2.3"/"6.4" PASSARAM a exibir exatamente
+    `icms_1024` (escopado aos CFOPs dos grupos de débito/crédito). Ou seja: `icms_1024` aqui = o que a
+    Apuração agora EXIBE; `icms_1096` aqui = `icms_correto_saida/entrada`, que é o ICMS que a Apuração
+    efetivamente DEDUZ da base/DARF (Relatório 1096, sem duplo desconto). `situacao_icms`/`diff_icms`
+    passam a ser, na prática, o sinal definitivo de "para este CFOP, o valor exibido em '2.3'/'6.4' é
+    diferente do que foi de fato subtraído da base" — útil sobretudo nos CFOPs com defeito de dados
+    conhecido no Winthor (6551/5403/6108/6403, ver metodologia), que agora "somem" das linhas "2.3"/"6.4"
+    mas continuam aparecendo aqui."""
     linhas_1024 = session.execute(text("""
         select cfop, tipo_operacao, sum(valor_contabil) as valor_contabil, sum(valor_icms) as valor_icms,
                sum(valor_outras) as valor_outras
@@ -1082,14 +1132,17 @@ def _linha_conferencia(cfop, tipo_operacao, pis_1024, cofins_1024, pis_1096, cof
         diff = abs(pis_1024 - pis_1096) + abs(cofins_1024 - cofins_1096)
         situacao = "OK" if diff <= TOLERANCIA_CONFERENCIA else "Divergente"
 
-    # Checagem de ICMS por CFOP (22/09/2026, sessão de continuação) — comparação NOVA, só informativa: NÃO
-    # afeta "situacao"/"diff_pis"/"diff_cofins" acima (que continuam comparando só PIS/COFINS, como sempre),
-    # nem qualquer valor calculado na Apuração (linhas "2.3"/"6.4" continuam exatamente como já eram
-    # calculadas, via _somar_icms_nao_excluido_por_cfop). Serve só para o usuário enxergar, CFOP a CFOP,
-    # quando o ICMS que a Rotina 1024 declara diverge do ICMS que o Relatório 1096 implica (item a item,
-    # já excluindo CST 70/71/74/6/7 e as exceções pontuais de icms_zero_excecao_pc) — sinal de que aquele
-    # CFOP pode ter o mesmo tipo de problema já encontrado em 5403/6108/6403 (CST 6/7 com ICMS real que a
-    # exclusão de CST tira do "2.3"/"6.4") ou em 6202 (CST não-excluído com ICMS só parcialmente real).
+    # Checagem de ICMS por CFOP (22/09/2026; RESSIGNIFICADA em 23/09/2026 — ver docstring de
+    # conferencia_1024_x_1096). NÃO afeta "situacao"/"diff_pis"/"diff_cofins" acima (que continuam
+    # comparando só PIS/COFINS, como sempre) — mas, diferente de quando foi criada, esta checagem AGORA
+    # explica diretamente a linha "2.3"/"6.4" da Apuração: desde 23/09/2026 elas exibem `icms_1024` (soma
+    # direta de valor_icms da Rotina 1024, ver _somar_icms_1024_por_cfop), enquanto a base/DARF continua
+    # deduzindo `icms_1096` (= icms_correto_saida/entrada, Relatório 1096, sem duplo desconto). Ou seja:
+    # "Divergente ICMS" aqui significa "para este CFOP, o valor exibido em '2.3'/'6.4' é diferente do que
+    # foi de fato subtraído da base" — sinal de que o CFOP pode ter o mesmo tipo de problema já encontrado
+    # em 5403/6108/6403 (CST 6/7 com ICMS real que a exclusão de CST tira da base) ou em 6551 (defeito de
+    # dado no Winthor) — casos que, desde a mudança de fonte, "somem" das linhas "2.3"/"6.4" mas continuam
+    # visíveis aqui.
     if icms_1024 is None:
         situacao_icms = "N/A (sem Rotina 1024 para este CFOP)"
     else:

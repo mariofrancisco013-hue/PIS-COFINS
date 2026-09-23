@@ -1012,39 +1012,55 @@ with aba_conferencia:
         "Comparação por CFOP entre o resultado da Rotina 1024 (usado na apuração) e a soma direta de "
         "valor_pis/valor_cofins do Relatório 1096 (item a item) — só leitura, não muda nenhum valor "
         "calculado. Diferenças acima de R$ 1,00 aparecem como 'Divergente'; CFOPs que só aparecem em uma "
-        "das duas fontes também são sinalizados."
+        "das duas fontes também são sinalizados. Desde 22/09/2026, também compara o ICMS por CFOP (coluna "
+        "'Situação ICMS'): o ICMS declarado na Rotina 1024 (`valor_icms`) contra o ICMS que o Relatório 1096 "
+        "implica (item a item, já excluindo CST sem direito a crédito/isenção e as exceções pontuais "
+        "cadastradas) — essa comparação é só informativa, não altera as linhas '2.3'/'6.4' nem nenhum "
+        "valor da apuração; serve pra apontar CFOPs candidatos ao mesmo tipo de divergência já encontrado "
+        "em 5403/6108/6403 (itens CST 6/7 com ICMS real) ou 6202 (CST não-excluído com ICMS só parcial)."
     )
     linhas_conf = _cache_conferencia(session, competencia_id)
     if not linhas_conf:
         st.info("Nenhum dado de Rotina 1024 nem de Relatório 1096 importado ainda para este grupo/período.")
     else:
-        fc1, fc2, fc3 = st.columns([1.3, 1.7, 1.5])
+        fc1, fc2, fc3, fc4 = st.columns([1.1, 1.5, 1.3, 1.3])
         f_operacao = fc1.selectbox("Operação", ["Todas", "entrada", "saida"], key="conf_f_operacao")
         situacoes_disponiveis = sorted({l["situacao"] for l in linhas_conf})
-        f_situacao = fc2.multiselect("Situação", situacoes_disponiveis, default=situacoes_disponiveis,
+        f_situacao = fc2.multiselect("Situação (PIS/COFINS)", situacoes_disponiveis, default=situacoes_disponiveis,
                                       key="conf_f_situacao")
-        f_cfop = fc3.text_input("Filtrar por CFOP", key="conf_f_cfop")
+        situacoes_icms_disponiveis = sorted({l["situacao_icms"] for l in linhas_conf})
+        f_situacao_icms = fc3.multiselect("Situação ICMS", situacoes_icms_disponiveis,
+                                           default=situacoes_icms_disponiveis, key="conf_f_situacao_icms")
+        f_cfop = fc4.text_input("Filtrar por CFOP", key="conf_f_cfop")
 
         linhas_filtradas = [
             l for l in linhas_conf
             if (f_operacao == "Todas" or l["tipo_operacao"] == f_operacao)
             and l["situacao"] in f_situacao
+            and l["situacao_icms"] in f_situacao_icms
             and (not f_cfop.strip() or str(l["cfop"]).startswith(f_cfop.strip()))
         ]
 
         n_div = sum(1 for l in linhas_conf if l["situacao"] not in ("OK",))
+        n_div_icms = sum(1 for l in linhas_conf if l["situacao_icms"] not in ("OK", "N/A (sem Rotina 1024 para este CFOP)"))
         if n_div:
-            st.warning(f"{n_div} CFOP(s) com divergência ou presentes em só uma das fontes (no total, sem "
-                       f"considerar o filtro acima).")
+            st.warning(f"{n_div} CFOP(s) com divergência de PIS/COFINS ou presentes em só uma das duas "
+                       f"fontes (no total, sem considerar o filtro acima).")
         else:
-            st.success("Todos os CFOPs batem entre Rotina 1024 e Relatório 1096 (dentro da tolerância).")
+            st.success("Todos os CFOPs batem em PIS/COFINS entre Rotina 1024 e Relatório 1096 (dentro da "
+                       "tolerância).")
+        if n_div_icms:
+            st.warning(f"{n_div_icms} CFOP(s) com ICMS divergente entre Rotina 1024 e Relatório 1096 (no "
+                       f"total, sem considerar o filtro acima) — não afeta o DARF, mas vale investigar se "
+                       f"é o mesmo padrão de 5403/6108/6403/6202 (ver metodologia, 'Causa raiz 3').")
 
         if not linhas_filtradas:
             st.info("Nenhum CFOP corresponde aos filtros selecionados.")
         else:
             st.caption(f"Mostrando {len(linhas_filtradas)} de {len(linhas_conf)} CFOP(s).")
             df_conf = pd.DataFrame(linhas_filtradas)
-            for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins"):
+            for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins",
+                        "icms_1024", "icms_1096", "diff_icms"):
                 df_conf[col] = df_conf[col].apply(lambda v: formatar_moeda(v) if v is not None else "—")
             st.dataframe(df_conf, use_container_width=True, hide_index=True)
 

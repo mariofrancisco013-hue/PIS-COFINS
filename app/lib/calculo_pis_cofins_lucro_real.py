@@ -984,20 +984,27 @@ def conferencia_1024_x_1096(session, competencia_id: int) -> list[dict]:
         r1096 = por_cfop_1096.get(chave)
         pis_1096 = _dec(r1096["valor_pis"]) if r1096 else None
         cofins_1096 = _dec(r1096["valor_cofins"]) if r1096 else None
-        resultado.append(_linha_conferencia(r["cfop"], r["tipo_operacao"], pis_1024, cofins_1024, pis_1096, cofins_1096))
+        icms_1024 = _dec(r["valor_icms"])
+        resultado.append(_linha_conferencia(
+            r["cfop"], r["tipo_operacao"], pis_1024, cofins_1024, pis_1096, cofins_1096,
+            icms_1024=icms_1024, icms_1096=icms_correto,
+        ))
 
     for chave, r1096 in por_cfop_1096.items():
         if chave in vistos:
             continue
+        icms_correto_dict = icms_correto_entrada if chave[1] == "entrada" else icms_correto_saida
         resultado.append(_linha_conferencia(
             chave[0], chave[1], None, None, _dec(r1096["valor_pis"]), _dec(r1096["valor_cofins"]),
+            icms_1024=None, icms_1096=icms_correto_dict.get(chave[0], Decimal("0")),
         ))
 
     resultado.sort(key=lambda r: (r["tipo_operacao"], r["cfop"]))
     return resultado
 
 
-def _linha_conferencia(cfop, tipo_operacao, pis_1024, cofins_1024, pis_1096, cofins_1096):
+def _linha_conferencia(cfop, tipo_operacao, pis_1024, cofins_1024, pis_1096, cofins_1096,
+                        icms_1024=None, icms_1096=None):
     if pis_1024 is None:
         situacao = "Só no 1096 (sem Rotina 1024 para este CFOP)"
     elif pis_1096 is None:
@@ -1005,6 +1012,21 @@ def _linha_conferencia(cfop, tipo_operacao, pis_1024, cofins_1024, pis_1096, cof
     else:
         diff = abs(pis_1024 - pis_1096) + abs(cofins_1024 - cofins_1096)
         situacao = "OK" if diff <= TOLERANCIA_CONFERENCIA else "Divergente"
+
+    # Checagem de ICMS por CFOP (22/09/2026, sessão de continuação) — comparação NOVA, só informativa: NÃO
+    # afeta "situacao"/"diff_pis"/"diff_cofins" acima (que continuam comparando só PIS/COFINS, como sempre),
+    # nem qualquer valor calculado na Apuração (linhas "2.3"/"6.4" continuam exatamente como já eram
+    # calculadas, via _somar_icms_nao_excluido_por_cfop). Serve só para o usuário enxergar, CFOP a CFOP,
+    # quando o ICMS que a Rotina 1024 declara diverge do ICMS que o Relatório 1096 implica (item a item,
+    # já excluindo CST 70/71/74/6/7 e as exceções pontuais de icms_zero_excecao_pc) — sinal de que aquele
+    # CFOP pode ter o mesmo tipo de problema já encontrado em 5403/6108/6403 (CST 6/7 com ICMS real que a
+    # exclusão de CST tira do "2.3"/"6.4") ou em 6202 (CST não-excluído com ICMS só parcialmente real).
+    if icms_1024 is None:
+        situacao_icms = "N/A (sem Rotina 1024 para este CFOP)"
+    else:
+        diff_icms_val = abs(icms_1024 - icms_1096)
+        situacao_icms = "OK" if diff_icms_val <= TOLERANCIA_CONFERENCIA else "Divergente ICMS"
+
     return {
         "cfop": cfop, "tipo_operacao": tipo_operacao,
         "pis_1024": pis_1024, "cofins_1024": cofins_1024,
@@ -1012,4 +1034,8 @@ def _linha_conferencia(cfop, tipo_operacao, pis_1024, cofins_1024, pis_1096, cof
         "diff_pis": (pis_1024 - pis_1096) if (pis_1024 is not None and pis_1096 is not None) else None,
         "diff_cofins": (cofins_1024 - cofins_1096) if (cofins_1024 is not None and cofins_1096 is not None) else None,
         "situacao": situacao,
+        "icms_1024": icms_1024,
+        "icms_1096": icms_1096,
+        "diff_icms": (icms_1024 - icms_1096) if icms_1024 is not None else None,
+        "situacao_icms": situacao_icms,
     }

@@ -264,7 +264,7 @@ def _dec(v):
 
 
 def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, icms_correto_por_cfop,
-                     override_contabil_1096_por_cfop=None):
+                     override_contabil_1096_por_cfop=None, fallback_1096_ausentes_por_cfop=None):
     """Soma valor_contábil (bruto) e valor_contábil − ICMS_correto − exclusão_cst (líquido) de todas as
     linhas do resumo_1024_pc (já somando todas as filiais da competência) cujo CFOP pertence a este grupo.
     Devolve (base_bruta, base_liquida, detalhe_por_cfop) — o líquido é o que efetivamente entra no PIS/COFINS
@@ -277,6 +277,14 @@ def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, ic
     pelo ISSQN (1933/2933) têm Valor Contábil muito menor na Rotina 1024 (livro de ICMS, que não foi feito
     para capturar serviço) do que no Relatório 1096 (relatório operacional completo). Decisão do usuário
     confirmada por AskUserQuestion.
+
+    `fallback_1096_ausentes_por_cfop` (NOVO em 22/09/2026, ver `_carregar_fallback_1096_cfops_ausentes_
+    1024`): PREENCHE (não substitui) — só entra para CFOPs que nem aparecem em `contabil_por_cfop` ainda
+    (CFOP totalmente ausente da Rotina 1024 nesta competência). Regra geral confirmada pelo usuário, restrita
+    aos grupos catch-all "1.4"/"5.8": se a Rotina 1024 não trouxe NADA de um CFOP cadastrado no grupo, usa o
+    Valor Contábil do Relatório 1096 em vez de deixar o CFOP sumir da linha. Aplicado com `setdefault` — se
+    o CFOP já tem valor (mesmo que pareça errado/baixo), este fallback não mexe nele; quem cobre esse caso é
+    o `override_contabil_1096_por_cfop` acima, cadastrado CFOP a CFOP.
 
     CORRIGIDOS DOIS BUGS em 20/08/2026 (ver seção "Bug real..." na metodologia do Presumido, mesma causa
     raiz aplicada aqui — usuário pediu pra ajustar o Real também depois de confirmar com dados reais no
@@ -302,6 +310,14 @@ def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, ic
         if r["tipo_operacao"] != tipo_operacao or r["grupo"] != grupo:
             continue
         contabil_por_cfop[r["cfop"]] = contabil_por_cfop.get(r["cfop"], Decimal("0")) + _dec(r["valor_contabil"])
+
+    # Fallback 1096 para CFOPs ausentes (22/09/2026) — só PREENCHE lacunas (setdefault), nunca sobrescreve
+    # um valor que a Rotina 1024 já trouxe. Aplicado ANTES do override abaixo, mas a ordem não importa na
+    # prática: por construção, `fallback_1096_ausentes_por_cfop` só contém CFOPs que não estavam em
+    # contabil_por_cfop, então nunca colide com o que o override troca.
+    if fallback_1096_ausentes_por_cfop:
+        for cfop, valor in fallback_1096_ausentes_por_cfop.items():
+            contabil_por_cfop.setdefault(cfop, valor)
 
     # Override 1096 (22/09/2026) — SUBSTITUI (não soma) o valor da Rotina 1024 pelos CFOPs marcados
     # usa_base_1096, já filtrados para este grupo/tipo_operacao por quem chamou esta função.
@@ -393,6 +409,42 @@ def _carregar_override_1096_por_cfop(session, competencia_id, tipo_operacao):
     return {r["cfop"]: (r["grupo"], _dec(r["valor"])) for r in rows}
 
 
+def _carregar_fallback_1096_cfops_ausentes_1024(session, competencia_id, tipo_operacao, grupo,
+                                                 cfops_presentes_1024):
+    """{cfop: Decimal} — REGRA GERAL confirmada pelo usuário em 22/09/2026 (sessão de continuação, ver
+    "Causa raiz 6" na metodologia): para CFOPs cadastrados no `grupo` catch-all ("1.4"/"5.8") que NÃO
+    aparecem em NENHUMA linha de `resumo_1024_pc` desta competência/tipo_operacao (nenhuma filial reportou
+    o CFOP na Rotina 1024 neste mês — por qualquer motivo: filial cuja Rotina 1024 ainda não foi importada,
+    CFOP que simplesmente não apareceu naquele PDF específico etc.), usa o Valor Contábil somado do
+    Relatório 1096 (todos os itens, qualquer CST — mesma unidade que a Rotina 1024 usaria) como base, em vez
+    de deixar o CFOP simplesmente sumir da linha.
+
+    Diferença importante em relação a `_carregar_override_1096_por_cfop` (`usa_base_1096`): aquele é um
+    override PONTUAL e INCONDICIONAL, cadastrado CFOP a CFOP (hoje só 1933/2933) — substitui o valor da
+    Rotina 1024 mesmo quando ela TEM um valor (só que um valor estruturalmente errado, caso do serviço
+    ISSQN). Este aqui é um FALLBACK GERAL, automático para qualquer CFOP do grupo, que só entra em ação
+    quando a Rotina 1024 não tem NADA daquele CFOP nesta competência — se houver qualquer linha (mesmo que
+    o valor pareça baixo/errado), este fallback NÃO se aplica; ele não compete com `usa_base_1096`, só
+    preenche o vazio que sobra. Por isso o parâmetro `cfops_presentes_1024` já vem calculado por quem chama
+    (conjunto de CFOPs que aparecem em `resumo_1024` para este tipo_operacao, olhando TODOS os grupos — o
+    cálculo é feito uma vez só em `calcular_apuracao_pc`, não por grupo).
+
+    Escopo deliberadamente restrito aos grupos catch-all ("1.4 Outras Saídas"/"5.8 Outras Entradas", cuja
+    base líquida já é zerada por definição — ver `calcular_apuracao_pc`) — não muda o DARF, só evita que um
+    CFOP inteiro fique invisível na linha quando a Rotina 1024 não trouxe nada dele. **Mesmo aviso do
+    override**: se o Relatório 1096 desta competência/CFOP tiver sido importado em duplicidade, este
+    fallback herda a duplicação (soma sem deduplicar) — checar `n_itens`/`importado_em` antes de confiar
+    cegamente num valor muito alto."""
+    rows = session.execute(text("""
+        select ri.cfop, sum(ri.valor_contabil) as valor
+        from relatorio_pc_itens ri
+        join cfop_pis_cofins_efetivo cpe on cpe.codigo = ri.cfop
+        where ri.competencia_id = :cid and ri.tipo_operacao = :tipo and cpe.grupo = :grupo
+        group by ri.cfop
+    """), {"cid": competencia_id, "tipo": tipo_operacao, "grupo": grupo}).mappings().all()
+    return {r["cfop"]: _dec(r["valor"]) for r in rows if r["cfop"] not in cfops_presentes_1024}
+
+
 def _somar_lc224_saida_por_cfop_ncm(session, competencia_id):
     """[{cfop, ncm, valor}] Valor Contábil (Relatório 1096, saída) agrupado por CFOP+NCM, só itens CST 6/7
     (excluídos em "2.7") — casado depois, em Python, contra o lookup de `_carregar_ncms_lc224` (mesma
@@ -447,6 +499,16 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     # valor)}; filtrado por grupo dentro de cada loop abaixo antes de passar pra _base_por_grupo.
     override_1096_entrada = _carregar_override_1096_por_cfop(session, competencia_id, "entrada")
     override_1096_saida = _carregar_override_1096_por_cfop(session, competencia_id, "saida")
+    # Fallback 1096 para CFOPs ausentes da Rotina 1024 (22/09/2026, regra geral confirmada pelo usuário,
+    # restrita aos grupos catch-all "1.4"/"5.8" — ver docstring de _carregar_fallback_1096_cfops_ausentes_
+    # 1024). Precisa do conjunto de CFOPs que a Rotina 1024 desta competência realmente trouxe, por direção
+    # (qualquer grupo — um CFOP só pertence a um grupo, então basta saber se apareceu em ALGUMA linha).
+    cfops_presentes_1024_entrada = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "entrada"}
+    cfops_presentes_1024_saida = {r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida"}
+    fallback_1096_saida_14 = _carregar_fallback_1096_cfops_ausentes_1024(
+        session, competencia_id, "saida", "1.4", cfops_presentes_1024_saida)
+    fallback_1096_entrada_58 = _carregar_fallback_1096_cfops_ausentes_1024(
+        session, competencia_id, "entrada", "5.8", cfops_presentes_1024_entrada)
 
     linhas: list[LinhaApuracaoPC] = []
 
@@ -458,8 +520,10 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     outras_bruta_saida = Decimal("0")  # = valor bruto do grupo "1.4" (ver nota abaixo em "2.5")
     for grupo, descricao in GRUPOS_DEBITO.items():
         override_deste_grupo = {cfop: v for cfop, (g, v) in override_1096_saida.items() if g == grupo}
+        fallback_deste_grupo = fallback_1096_saida_14 if grupo == "1.4" else None
         base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "saida", grupo, exclusao_cst_saida,
-                                                          icms_correto_saida, override_deste_grupo)
+                                                          icms_correto_saida, override_deste_grupo,
+                                                          fallback_deste_grupo)
         if grupo == "1.4":
             # "1.4 Outras Saídas" (catch-all de CFOP da Rotina 1024) — pedido do usuário em 19/08/2026, 2ª
             # revisão: a exclusão desse grupo NÃO depende mais da coluna "Outras" do PDF (valor_outras, que
@@ -681,8 +745,10 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     outras_bruta_entrada = Decimal("0")  # = valor bruto do grupo "5.8" (mesmo padrão de "1.4"/"2.5")
     for grupo, descricao in GRUPOS_CREDITO.items():
         override_deste_grupo = {cfop: v for cfop, (g, v) in override_1096_entrada.items() if g == grupo}
+        fallback_deste_grupo = fallback_1096_entrada_58 if grupo == "5.8" else None
         base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "entrada", grupo, exclusao_cst_entrada,
-                                                          icms_correto_entrada, override_deste_grupo)
+                                                          icms_correto_entrada, override_deste_grupo,
+                                                          fallback_deste_grupo)
         if grupo == "5.8":
             # "5.8 Outras Entradas" — mesmo tratamento de "1.4"/"2.5" (ver nota lá): grupo inteiro excluído
             # da base líquida (não gera crédito de PIS/COFINS), valor bruto replicado na linha "6.7".

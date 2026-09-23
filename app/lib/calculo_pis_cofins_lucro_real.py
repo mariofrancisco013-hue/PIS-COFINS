@@ -99,8 +99,25 @@ ALIQ_COFINS = Decimal("0.0760")
 # Federal, ver seção "Tabela CST de PIS/COFINS" na metodologia) já classifica 70-75/98/99 inteiros como
 # "sem crédito": CST 98 sempre deveria ter estado nesta lista, não é uma exceção pontual por CFOP (ver
 # "Causa raiz 4" em claude/metodologia-pis-cofins-lucro-real.md — decisão confirmada por AskUserQuestion).
-CSTS_EXCLUSAO_ENTRADA = (70, 71, 74, 98)
+# CST 73 ADICIONADO em 23/09/2026 (sessão de continuação, "Causa raiz 8") — mesma lacuna do CST 98: a
+# tabela oficial da Receita já classifica 70-75/98/99 como "sem crédito" desde sempre, mas só 70/71/74/98
+# tinham entrado nesta lista. Achado real: 12 itens CST 73 na Entrada da Filial 6 (R$ 275.230,27, 100% não
+# tributados, nenhum com valor_tributado > 0) estavam sendo somados como ICMS real nos CFOPs 1403/2403.
+CSTS_EXCLUSAO_ENTRADA = (70, 71, 73, 74, 98)
 CSTS_EXCLUSAO_SAIDA = (6, 7)
+
+# CFOPs onde a exclusão por CST não reflete a realidade do item — o mesmo CST (49) mistura itens
+# genuinamente tributados (ICMS real, valor_tributado > 0) com itens genuinamente isentos (valor_tributado
+# == 0, sem gerar PIS/COFINS nenhum no próprio Relatório 1096) — NOVO em 23/09/2026 ("Causa raiz 8").
+# Confirmado com dados reais: CFOP 6202 tem 5 itens tributados (ICMS real somando R$ 226,72, batendo quase
+# exato com o livro oficial R$ 225,39) e 1 item isento (NCM 17019900, na própria lista de isenção da LC
+# 224/2025, valor_pis=valor_cofins=0,00 no 1096). Para os CFOPs desta lista, tanto
+# `_somar_icms_nao_excluido_por_cfop` quanto `_somar_exclusao_cst_por_cfop` usam `valor_tributado` do
+# próprio item (não o CST) para decidir a classificação — decisão do usuário confirmada por
+# `AskUserQuestion`, deliberadamente restrita a estes CFOPs (NÃO generalizada para todos, mesma cautela já
+# decidida em 18/09/2026, "Causa raiz 1").
+CFOPS_ITEM_A_ITEM_SAIDA = (6202,)
+CFOPS_ITEM_A_ITEM_ENTRADA = ()
 
 # --- Lei Complementar 224/2025 — incidência residual sobre produtos isentos (20/08/2026, tabela desde a
 # migração 009) ------------------------------------------------------------------------------------------
@@ -337,27 +354,50 @@ def _base_por_grupo(resumo_1024, tipo_operacao, grupo, exclusao_cst_por_cfop, ic
     return base_bruta, base_liquida, det
 
 
-def _somar_exclusao_cst_por_cfop(session, competencia_id, tipo_operacao, csts):
+def _somar_exclusao_cst_por_cfop(session, competencia_id, tipo_operacao, csts, cfops_item_a_item=()):
     """{cfop: Decimal(soma de valor_contabil)} dos itens do Relatório 1096 desta competência (todas as
     filiais) com CST em `csts`, agrupado por CFOP — usado para excluir da base o valor de itens que, pela
     própria definição do CST (sem direito a crédito/isenção/sem incidência — CST 70/71/74 na entrada, 6/7 na
     saída), não deveriam gerar crédito/débito de PIS/COFINS, mesmo que o CFOP deles esteja dentro de um
     grupo que a Rotina 1024 soma inteiro. Decisão do usuário em 19/08/2026: somar o Valor Contábil (bruto),
     mesma unidade que a Rotina 1024 usa como base — não o Valor Tributado (que no 1096 já vem líquido do que
-    o próprio CST exclui, e teria pouco ou nenhum efeito prático aqui)."""
+    o próprio CST exclui, e teria pouco ou nenhum efeito prático aqui).
+
+    NOVO (23/09/2026, "Causa raiz 8"): para os CFOPs em `cfops_item_a_item` (ver `CFOPS_ITEM_A_ITEM_SAIDA`/
+    `_ENTRADA`), a exclusão ignora `csts` e usa `valor_tributado == 0` do próprio item como critério — o
+    valor INTEIRO do item some da base (mesmo tratamento que um item CST 6/7 recebe), mas só quando o item
+    é genuinamente isento (sem gerar PIS/COFINS no 1096), não porque seu CST está numa lista fixa. Mantém
+    a base líquida final idêntica ao que já era calculado antes desta mudança para esses CFOPs — só
+    reclassifica QUANTO desse valor sai como "ICMS" (ver `_somar_icms_nao_excluido_por_cfop`) e quanto sai
+    aqui, como exclusão de item isento."""
     placeholders = ", ".join(f":c{i}" for i in range(len(csts)))
     params = {"cid": competencia_id, "tipo": tipo_operacao}
     params.update({f"c{i}": c for i, c in enumerate(csts)})
+
+    if cfops_item_a_item:
+        placeholders_item = ", ".join(f":ii{i}" for i in range(len(cfops_item_a_item)))
+        params.update({f"ii{i}": c for i, c in enumerate(cfops_item_a_item)})
+        condicao = f"""
+            (
+                (cfop in ({placeholders_item}) and valor_tributado = 0)
+                or
+                (cfop not in ({placeholders_item}) and cst in ({placeholders}))
+            )
+        """
+    else:
+        condicao = f"cst in ({placeholders})"
+
     rows = session.execute(text(f"""
         select cfop, sum(valor_contabil) as valor
         from relatorio_pc_itens
-        where competencia_id = :cid and tipo_operacao = :tipo and cst in ({placeholders})
+        where competencia_id = :cid and tipo_operacao = :tipo and {condicao}
         group by cfop
     """), params).mappings().all()
     return {r["cfop"]: _dec(r["valor"]) for r in rows}
 
 
-def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, csts_excluidos):
+def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, csts_excluidos,
+                                       cfops_item_a_item=()):
     """{cfop: Decimal} com o ICMS destacado (`relatorio_pc_itens.valor_nao_tributado`) dos itens de
     `tipo_operacao` cujo CST NÃO está em `csts_excluidos`, somado entre todas as filiais — NOVO em
     20/08/2026, ver docstring de `_base_por_grupo` para a explicação completa do bug que isso corrige.
@@ -374,14 +414,35 @@ def _somar_icms_nao_excluido_por_cfop(session, competencia_id, tipo_operacao, cs
     todos saída) é só um "Outras" do Winthor sem relação com ICMS real (livro RAICMS mostra R$ 0,00 de
     ICMS para o CFOP). Por decisão do usuário (NÃO generalizar via checagem item a item — ver
     "Causa raiz 1" na metodologia), esses casos são cadastrados manualmente em `icms_zero_excecao_pc` e
-    excluídos aqui via NOT EXISTS, sem alterar `csts_excluidos`."""
+    excluídos aqui via NOT EXISTS, sem alterar `csts_excluidos`.
+
+    NOVO (23/09/2026, "Causa raiz 8"): para os CFOPs em `cfops_item_a_item`, ignora `csts_excluidos` e usa
+    `valor_tributado > 0` do próprio item como critério de inclusão — o mesmo CST pode misturar itens
+    genuinamente tributados (ICMS real) com itens genuinamente isentos (achado real: CFOP 6202/CST 49).
+    Complementar a `_somar_exclusao_cst_por_cfop` com o mesmo `cfops_item_a_item` — juntas, as duas mantêm
+    a base líquida final igual à de antes desta mudança, só reclassificando o que conta como "ICMS" vs.
+    "item isento excluído"."""
     placeholders = ", ".join(f":c{i}" for i in range(len(csts_excluidos)))
     params = {"cid": competencia_id, "tipo": tipo_operacao}
     params.update({f"c{i}": c for i, c in enumerate(csts_excluidos)})
+
+    if cfops_item_a_item:
+        placeholders_item = ", ".join(f":ii{i}" for i in range(len(cfops_item_a_item)))
+        params.update({f"ii{i}": c for i, c in enumerate(cfops_item_a_item)})
+        condicao_inclusao = f"""
+            (
+                (ri.cfop in ({placeholders_item}) and ri.valor_tributado > 0)
+                or
+                (ri.cfop not in ({placeholders_item}) and ri.cst not in ({placeholders}))
+            )
+        """
+    else:
+        condicao_inclusao = f"ri.cst not in ({placeholders})"
+
     rows = session.execute(text(f"""
         select ri.cfop, sum(ri.valor_nao_tributado) as valor
         from relatorio_pc_itens ri
-        where ri.competencia_id = :cid and ri.tipo_operacao = :tipo and ri.cst not in ({placeholders})
+        where ri.competencia_id = :cid and ri.tipo_operacao = :tipo and {condicao_inclusao}
           and not exists (
               select 1 from icms_zero_excecao_pc e
               where e.tipo_operacao = ri.tipo_operacao and e.cfop = ri.cfop and e.cst = ri.cst and e.ativo
@@ -487,12 +548,16 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     # Exclusão por CST (19/08/2026) — Valor Contábil dos itens do 1096 com CST 70/71/74 (entrada) / 6/7
     # (saída), agrupado por CFOP, calculado uma vez aqui e reusado tanto dentro de _base_por_grupo (embutido
     # na base líquida de cada grupo) quanto nos totais de exibição das linhas 6.5/2.7 abaixo.
-    exclusao_cst_entrada = _somar_exclusao_cst_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
-    exclusao_cst_saida = _somar_exclusao_cst_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
+    exclusao_cst_entrada = _somar_exclusao_cst_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA,
+                                                         cfops_item_a_item=CFOPS_ITEM_A_ITEM_ENTRADA)
+    exclusao_cst_saida = _somar_exclusao_cst_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA,
+                                                       cfops_item_a_item=CFOPS_ITEM_A_ITEM_SAIDA)
     # ICMS correto (20/08/2026, ver docstring de _base_por_grupo) — substitui resumo_1024_pc.valor_icms
     # dentro do cálculo da base líquida, pra não descontar duas vezes o ICMS dos itens já excluídos por CST.
-    icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
-    icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
+    icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA,
+                                                              cfops_item_a_item=CFOPS_ITEM_A_ITEM_ENTRADA)
+    icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA,
+                                                            cfops_item_a_item=CFOPS_ITEM_A_ITEM_SAIDA)
     # Override 1096 (22/09/2026, ver docstring de _carregar_override_1096_por_cfop e migração 013) — CFOPs
     # marcados cfop_pis_cofins.usa_base_1096 (ex.: 1933/2933, aquisição de serviço tributado pelo ISSQN) usam
     # o Valor Contábil do Relatório 1096 em vez da Rotina 1024 como base de PIS/COFINS. Dict {cfop: (grupo,
@@ -955,10 +1020,14 @@ def conferencia_1024_x_1096(session, competencia_id: int) -> list[dict]:
         group by cfop, tipo_operacao
     """), {"cid": competencia_id}).mappings().all()
 
-    exclusao_cst_entrada = _somar_exclusao_cst_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
-    exclusao_cst_saida = _somar_exclusao_cst_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
-    icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA)
-    icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
+    exclusao_cst_entrada = _somar_exclusao_cst_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA,
+                                                         cfops_item_a_item=CFOPS_ITEM_A_ITEM_ENTRADA)
+    exclusao_cst_saida = _somar_exclusao_cst_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA,
+                                                       cfops_item_a_item=CFOPS_ITEM_A_ITEM_SAIDA)
+    icms_correto_entrada = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "entrada", CSTS_EXCLUSAO_ENTRADA,
+                                                              cfops_item_a_item=CFOPS_ITEM_A_ITEM_ENTRADA)
+    icms_correto_saida = _somar_icms_nao_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA,
+                                                            cfops_item_a_item=CFOPS_ITEM_A_ITEM_SAIDA)
 
     linhas_1096 = session.execute(text("""
         select cfop, tipo_operacao, sum(valor_pis) as valor_pis, sum(valor_cofins) as valor_cofins

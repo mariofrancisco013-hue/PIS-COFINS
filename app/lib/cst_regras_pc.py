@@ -199,6 +199,15 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
     params = {"cid": competencia_id, "eid": empresa_id}
     clausula_excluidos = _clausula_cfops_excluidos(session, empresa_id, "ri", params)
     clausula_entrada = clausula_entrada_permitida_presumido(session, competencia_id, "ri", params)
+    # Precedência NCM > CFOP (pedido do usuário, 23/09/2026, sessão de continuação): quando um item tem
+    # regra cadastrada tanto por CFOP (cst_regra_cfop_pc) quanto por NCM (cst_regra_ncm_pc) ao mesmo tempo,
+    # a checagem por CFOP é PULADA para esse item — só a regra de NCM decide se há inconsistência. Achado
+    # real que motivou a pergunta: um item pode estar num CFOP com regra cadastrada (ex.: 1407, CST 70
+    # esperado) mas ter um NCM que também tem regra própria (ex.: NCM da lista de CST 71/74) — sem essa
+    # exclusão, o mesmo item podia gerar dois alertas concorrentes (um de CFOP, um de NCM), às vezes com
+    # CSTs esperados diferentes para o mesmo item. O NOT EXISTS abaixo filtra a nível de ITEM (antes do
+    # GROUP BY), então vale tanto para a checagem "CFOP tem regra e CST bateu errado" quanto para a checagem
+    # "CST é um dos regrados mas o CFOP está fora da lista" (as duas usam o mesmo `achados`, ver abaixo).
     achados = session.execute(text(f"""
         select ri.cfop, ri.cst, ri.tipo_operacao, count(*) as quantidade,
                (select r.cst from cst_regra_cfop_pc r
@@ -213,6 +222,8 @@ def _checar_regra_cfop(session, competencia_id, empresa_id):
           )
           and not exists (select 1 from cst_regra_cfop_pc r
                            where r.cfop = ri.cfop and r.cst = ri.cst and r.tipo_operacao = ri.tipo_operacao)
+          and not exists (select 1 from cst_regra_ncm_pc rn
+                           where rn.ncm = ri.ncm and rn.tipo_operacao = ri.tipo_operacao)
           {clausula_excluidos}
           {clausula_entrada}
         group by ri.cfop, ri.cst, ri.tipo_operacao

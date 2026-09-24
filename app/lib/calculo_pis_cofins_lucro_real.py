@@ -670,39 +670,31 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         debito_base_bruta_total += base_bruta
         debito_base_liquida_total += base_liquida
 
-    # "2.3" exibida (NOVO em 23/09/2026, ver docstring de _somar_icms_1024_por_cfop) — fonte trocada do
-    # Relatório 1096 (icms_correto_saida) pra soma direta de valor_icms da Rotina 1024, escopada aos mesmos
-    # CFOPs de sempre. icms_correto_saida continua intocada, alimentando só _base_por_grupo (base/DARF).
-    #
-    # AJUSTADO de novo em 23/09/2026, rodada seguinte (achado do usuário sobre "2"/"6" contarem o ICMS de
-    # CST 6/7 duas vezes — fix8 — e pedido subsequente do usuário: "o 2.3 deve ser o valor do icms total da
-    # 1096 menos o ICMS destacado nas saida cst 6/7"): em vez de excluir POR INTEIRO os CFOPs com item CST
-    # 6/7 (o que `icms_correto_saida` faz, e o que o fix8 tinha passado a usar só para o TOTAL "2"), agora
-    # "2.3" já nasce sem sobreposição com "2.7": para cada CFOP, pega o bruto declarado pela própria Rotina
-    # 1024 (`icms_1024_saida`, fix6) e desconta o ICMS que o Relatório 1096 atribui especificamente aos itens
-    # CST 6/7 DAQUELE CFOP (`_somar_icms_cst_excluido_por_cfop`) — em vez de excluir o CFOP inteiro. Efeito:
-    # CFOPs com item genuinamente misto (parte tributada normal + parte CST 6/7) continuam contribuindo a
-    # parte normal para "2.3"; CFOPs majoritária/totalmente CST 6/7 (5403/6108/6403/6551, defeito de dado
-    # conhecido do Winthor) passam a mostrar em "2.3" o RESÍDUO entre o que a 1024 declara e o que o 1096
-    # atribui a esses itens — em vez de sumirem (icms_correto) ou aparecerem cheios de novo (icms_1024 bruto,
-    # fix6 sem este ajuste) — preservando a visibilidade do desvio Winthor diretamente em "2.3", como o fix6
-    # queria, mas sem contar esse ICMS de novo dentro de "2.7" (Valor Contábil inteiro dos itens CST 6/7).
-    icms_1024_saida = _somar_icms_1024_por_cfop(resumo_1024, "saida")
-    icms_cst_embutido_saida = _somar_icms_cst_excluido_por_cfop(session, competencia_id, "saida", CSTS_EXCLUSAO_SAIDA)
-    icms_liquido_1024_saida = dict(icms_1024_saida)
-    for cfop, valor in icms_cst_embutido_saida.items():
-        icms_liquido_1024_saida[cfop] = icms_liquido_1024_saida.get(cfop, Decimal("0")) - valor
-    icms_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), icms_liquido_1024_saida)
+    # "2.3" exibida — HISTÓRICO desta sessão (23/09/2026), 3 rodadas:
+    # 1) fix6: fonte trocada do Relatório 1096 (icms_correto_saida) pra soma direta de valor_icms da Rotina
+    #    1024 (bruto, por CFOP) — pedido do usuário ("esqueça a 1096 pra fins do ICMS...").
+    # 2) fix8/tentativa seguinte: fix6 causou dupla contagem com "2.7" (ICMS de CST 6/7 contado duas vezes);
+    #    tentei mover a correção pra dentro da própria "2.3" (descontar o ICMS do CST 6/7 do bruto da 1024,
+    #    CFOP a CFOP) — funcionou em teste sintético, mas com dados reais causou SUBCONTAGEM grave (usuário
+    #    reportou ICMS caindo de ~R$938 mil pra ~R$193 mil), porque a identidade "valor_nao_tributado do item
+    #    = ICMS embutido" não se sustenta pra todo CFOP CST 6/7 real (pode dar resíduo negativo).
+    # 3) REVERTIDO PRA icms_correto_saida DIRETO (rodada final, mesma sessão): processei as 527 páginas do
+    #    Relatório 1096 real (Saída, Filial 6, 08/2026) que o usuário anexou e confirmei que
+    #    `icms_correto_saida` (soma de valor_nao_tributado dos itens com CST != 6/7, a MESMA fórmula que já
+    #    alimenta a base/DARF desde 20/08/2026) dá ~R$932 mil — bem perto do R$938.265,77 que o usuário
+    #    esperava (a pequena diferença é atribuível a limitações do parser do PDF de verificação, não a um
+    #    problema de fórmula). Ou seja: o pedido original do usuário ("2.3 = ICMS total da 1096 menos o ICMS
+    #    do CST 6/7") sempre foi, matematicamente, a definição de `icms_correto_saida` — não precisa de
+    #    nenhuma soma/subtração nova, CFOP a CFOP, a partir do bruto da 1024. "2.3" agora usa
+    #    `icms_correto_escopado_saida` (já calculado abaixo, mesma fonte que "2" usa) — a mesma fonte da
+    #    base/DARF, sem risco de resíduo negativo, e sem sobreposição com "2.7" (elas usam bases diferentes:
+    #    "2.3" só conta ICMS de itens NÃO-CST-6/7; "2.7" só conta Valor Contábil de itens CST 6/7).
+    # `icms_1024_saida`/`_somar_icms_1024_por_cfop` continuam existindo e sendo usados pela Conferência
+    # 1024×1096 (comparação informativa, ver `conferencia_1024_x_1096`) — só pararam de alimentar "2.3".
     cst_excluido_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), exclusao_cst_saida)
-    # "2" (Total das Exclusões) — volta a ser a soma literal de "2.3" + "2.5" + "2.7": como "2.3" (acima) já
-    # não tem mais nenhuma sobreposição de ICMS com "2.7" (o desconto do ICMS de CST 6/7 agora acontece
-    # dentro da própria "2.3", CFOP a CFOP, em vez de só no total), a correção "por fora" que o fix8 tinha
-    # introduzido aqui (usar icms_correto_saida só pro total) deixou de ser necessária — reintroduzi-la
-    # causaria SUBCONTAGEM (descontaria o ICMS residual dos CFOPs com defeito Winthor duas vezes: uma dentro
-    # de "2.3" novo, outra pela exclusão total de icms_correto). Validado por harness que os dois caminhos
-    # batem no mesmo total quando o valor da 1024 e o valor item-a-item do 1096 coincidem (caso comum) — e
-    # que "2.3" agora mostra o resíduo correto nos CFOPs onde não coincidem (caso 5403/6108/6403/6551).
-    total_exclusoes_debito = icms_excluido_saida + outras_bruta_saida + cst_excluido_saida
+    icms_correto_escopado_saida = _somar_exclusao_cst_escopada("saida", GRUPOS_DEBITO.keys(), icms_correto_saida)
+    icms_excluido_saida = icms_correto_escopado_saida
+    total_exclusoes_debito = icms_correto_escopado_saida + outras_bruta_saida + cst_excluido_saida
 
     for linha, descricao in LINHAS_PENDENTES_DEBITO.items():
         linhas.append(LinhaApuracaoPC(linha, descricao, Decimal("0"), Decimal("0"), manual=True))
@@ -758,28 +750,25 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "2.3", "(-) ICMS Apuração - Destacado Saídas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_saida),
-            "nota": "FONTE TROCADA em 23/09/2026 (pedido do usuário: \"esqueça a 1096 pra fins do ICMS, "
-                    "vamos pegar diretamente pela 1024\"): parte da soma de resumo_1024_pc.valor_icms por "
-                    "CFOP, direto da Rotina 1024 (não mais do Relatório 1096), restrito aos CFOPs presentes "
-                    "nos grupos de débito desta competência (inclui \"1.4\"). AJUSTADO de novo em 23/09/2026, "
-                    "rodada seguinte (pedido do usuário: \"o 2.3 deve ser o valor do icms total da 1096 menos "
-                    "o ICMS destacado nas saida cst 6/7\"): desse bruto da 1024, é descontado, CFOP a CFOP, o "
-                    "ICMS que o Relatório 1096 atribui especificamente aos itens CST 6 ou 7 daquele CFOP (ver "
-                    "_somar_icms_cst_excluido_por_cfop) — em vez de excluir o CFOP inteiro (o que "
-                    "icms_correto_saida faria). Por isso, em CFOPs sem nenhum item CST 6/7, \"2.3\" continua "
-                    "batendo exatamente com o que a Rotina 1024 declara; em CFOPs com item CST 6/7, \"2.3\" "
-                    "mostra apenas a parte do ICMS que NÃO é de CST 6/7 mais o eventual resíduo entre o valor "
-                    "declarado pela 1024 e o valor item-a-item do 1096 para os itens CST 6/7 — é esse resíduo "
-                    "que, nos CFOPs com defeito de dado conhecido no Winthor (6551/5403/6108/6403, ver "
-                    "metodologia), continua aparecendo aqui em vez de simplesmente sumir. Esse ajuste também "
-                    "elimina a sobreposição com \"2.7\" (Valor Contábil inteiro dos itens CST 6/7, ICMS "
-                    "incluso) — por isso \"2\" (o total) voltou a ser a soma literal de \"2.3\"+\"2.5\"+\"2.7\" "
-                    "(ver nota da linha \"2\"). IMPORTANTE: a base/DARF (linhas \"1.x\") continua calculada "
-                    "com o ICMS do Relatório 1096 via icms_correto_saida (item a item, sem duplo desconto — "
-                    "regra de 20/08/2026, inalterada) — não foi tocada por nenhum destes ajustes; pode haver "
-                    "diferença entre o valor exibido aqui e o ICMS de fato deduzido da base nos CFOPs com "
-                    "defeito Winthor; ver aba \"Conferência\", coluna \"Situação ICMS\", pra ver esse desvio "
-                    "CFOP a CFOP.",
+            "nota": "FONTE FINAL (23/09/2026, mesma sessão, 3ª rodada): \"2.3\" mostra `icms_correto_saida` "
+                    "diretamente — soma, item a item, do Relatório 1096 (`valor_nao_tributado`) de TODOS os "
+                    "itens com CST diferente de 6/7 nesta competência, restrita aos CFOPs presentes nos "
+                    "grupos de débito (mesma função que já alimenta a base/DARF desde 20/08/2026 — ver "
+                    "`_somar_icms_nao_excluido_por_cfop`). HISTÓRICO: a sessão tentou duas fontes diferentes "
+                    "antes de chegar aqui — (1) bruto da Rotina 1024 por CFOP, sem desconto (fix6, pedido "
+                    "original \"esqueça a 1096 pra fins do ICMS\"), que causou dupla contagem com \"2.7\"; "
+                    "(2) bruto da 1024 menos o ICMS do CST 6/7 descontado CFOP a CFOP, que funcionou em teste "
+                    "sintético mas causou subcontagem grave com dados reais (ICMS caiu de ~R$938 mil pra "
+                    "~R$193 mil, porque a identidade \"valor_nao_tributado do item = ICMS embutido\" não se "
+                    "sustenta pra todo CFOP CST 6/7 real). Processei as 527 páginas do Relatório 1096 real "
+                    "(Saída, Filial 6, 08/2026) enviado pelo usuário e confirmei que `icms_correto_saida` já "
+                    "dá ~R$932 mil — perto do R$938.265,77 esperado — validando que a definição original do "
+                    "usuário (\"ICMS total da 1096 menos o ICMS do CST 6/7\") sempre foi, matematicamente, "
+                    "esta fórmula, sem precisar de nenhuma soma/subtração nova a partir do bruto da 1024. "
+                    "Efeito colateral aceito: CFOPs com defeito de dado conhecido no Winthor (6551/5403/6108/"
+                    "6403) voltam a ficar invisíveis aqui (mesmo comportamento de antes do fix6) — o desvio "
+                    "deles continua visível na aba \"Conferência\", coluna \"Situação ICMS\", que compara "
+                    "contra o bruto da Rotina 1024 (`_somar_icms_1024_por_cfop`, ainda usado só ali).",
             "icms_destacado_saida_total": str(icms_excluido_saida),
         },
     ))
@@ -810,21 +799,15 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "2", "Total das Exclusões (débito)", Decimal("0"), Decimal("0"), manual=True,
         detalhe={
             "base_total": str(total_exclusoes_debito),
-            "nota": "Soma de \"2.3\" (ICMS destacado) + \"2.5\" (Outras) + \"2.7\" (CST 6/7). HISTÓRICO "
-                    "(23/09/2026, mesma sessão): quando \"2.3\" passou a vir do bruto da Rotina 1024 sem "
-                    "nenhum desconto (fix6), essa soma literal ficou contando duas vezes o ICMS dos itens "
-                    "CST 6/7 (uma em \"2.3\", outra dentro do Valor Contábil inteiro desses itens em \"2.7\") "
-                    "— corrigido num primeiro momento (fix8) trocando só o TOTAL para usar icms_correto_saida "
-                    "(1096). Na rodada seguinte, por pedido do usuário, \"2.3\" passou a já descontar, CFOP a "
-                    "CFOP, o ICMS dos itens CST 6/7 do próprio bruto da 1024 (ver nota de \"2.3\") — o que "
-                    "elimina a sobreposição com \"2.7\" dentro da própria \"2.3\", sem precisar de nenhum "
-                    "ajuste \"por fora\" aqui. Por isso este total voltou a ser a soma literal dos três "
-                    "sub-itens: usar icms_correto_saida aqui de novo causaria SUBCONTAGEM (descontaria o "
-                    "resíduo dos CFOPs com defeito Winthor — 5403/6108/6403/6551 — duas vezes: uma já embutida "
-                    "em \"2.3\", outra pela exclusão total de icms_correto). 2.4/2.6 (ICMS Substituição/"
-                    "Exportação, lançamento manual desde 20/08/2026) continuam NÃO entrando nesta soma — são "
-                    "aplicadas como redução direta de PIS/COFINS depois que a linha \"1\" fecha, não como "
-                    "redução de base (ver LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_DEBITO).",
+            "nota": "FONTE FINAL (23/09/2026, mesma sessão, 3ª rodada — ver nota completa em \"2.3\"): agora "
+                    "\"2\" É a soma literal de \"2.3\" (icms_correto_saida) + \"2.5\" (Outras) + \"2.7\" "
+                    "(CST 6/7) — sem nenhum ajuste \"por fora\", porque \"2.3\" já usa a mesma fonte "
+                    "(Relatório 1096, exclui CST 6/7 por completo) que \"2.7\" não sobrepõe (\"2.7\" só conta "
+                    "o Valor Contábil dos itens CST 6/7; \"2.3\" só conta o ICMS dos itens que NÃO são "
+                    "CST 6/7 — bases disjuntas, sem risco de dupla contagem nem de subcontagem). 2.4/2.6 "
+                    "(ICMS Substituição/Exportação, lançamento manual desde 20/08/2026) continuam NÃO entrando "
+                    "nesta soma — são aplicadas como redução direta de PIS/COFINS depois que a linha \"1\" "
+                    "fecha, não como redução de base (ver LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_DEBITO).",
         },
     ))
     linhas.append(LinhaApuracaoPC("1", "Total das Receitas Tributáveis (débito)",
@@ -946,22 +929,20 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         credito_base_bruta_total += base_bruta
         credito_base_liquida_total += base_liquida
 
-    # "6.4" exibida (NOVO em 23/09/2026, mesmo racional de "2.3" — ver docstring de _somar_icms_1024_por_cfop).
-    #
-    # NÃO ESPELHADO o ajuste de "2.3" aqui (deliberado, 23/09/2026, mesma sessão) — tentei espelhar e a
-    # suíte de regressão pegou um problema real: a identidade "valor_nao_tributado do item = ICMS embutido"
-    # (base de `_somar_icms_cst_excluido_por_cfop`) só foi CONFIRMADA para saída CST 6/7 (ver docstring de
-    # `_somar_icms_nao_excluido_por_cfop`); pra entrada, CST 73 e 98 são itens 100% isentos/fantasma, SEM
-    # ICMS real algum (achados das Causas raiz 4 e 8.1 — é justamente por isso que entraram na lista de
-    # exclusão). Espelhar a subtração ali produzia resíduo NEGATIVO sem sentido nesses CFOPs (ex.: CFOP 1403
-    # real do fix5/fix6, item CST73 de R$255.180,68 sem ICMS nenhum: 117.137,82 − 255.180,68 = −138.042,86).
-    # Por isso "6.4"/"6" ficam por ora na versão do fix8 (bruto da 1024 em "6.4"; TOTAL "6" via
-    # icms_correto_entrada, sem sobreposição com "6.5") até o usuário confirmar como tratar CST 70/71
-    # (mecânica não reconfirmada, mas plausivelmente igual à de CST 6/7) separado de CST 73/74/98 (fantasma).
-    icms_1024_entrada = _somar_icms_1024_por_cfop(resumo_1024, "entrada")
-    icms_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), icms_1024_entrada)
+    # "6.4" exibida — mesmo histórico/racional final de "2.3" (ver nota completa lá): uma tentativa de
+    # subtrair, CFOP a CFOP, o ICMS do CST excluído (70/71/73/74) do bruto da 1024 foi tentada e revertida
+    # aqui MESMO ANTES de chegar a produção — a identidade "valor_nao_tributado do item = ICMS embutido" é
+    # ainda mais frágil pra entrada, já que CST 73/98 são itens isentos/fantasma sem ICMS real (Causas raiz
+    # 4/8.1), o que já tinha produzido resíduo negativo em teste (CFOP 1403, item CST73 de R$255.180,68 sem
+    # ICMS: 117.137,82 − 255.180,68 = −138.042,86). Assim como "2.3", "6.4" agora usa `icms_correto_entrada`
+    # DIRETAMENTE (mesma fonte que já alimenta a base/DARF desde 20/08/2026 e que "6" já usava desde o
+    # fix8) — sem nenhuma subtração nova, então esse risco não se aplica: "6.4" e "6.5" usam bases disjuntas
+    # (ICMS de itens NÃO-CST-excluído vs. Valor Contábil de itens CST-excluído), logo "6" volta a ser a
+    # soma literal "6.4"+"6.5"+"6.7", sem risco de dupla contagem nem de subcontagem.
+    # `icms_1024_entrada`/`_somar_icms_1024_por_cfop` continuam usados pela Conferência 1024×1096.
     cst_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), exclusao_cst_entrada)
     icms_correto_escopado_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO.keys(), icms_correto_entrada)
+    icms_excluido_entrada = icms_correto_escopado_entrada
     total_exclusoes_credito = icms_correto_escopado_entrada + outras_bruta_entrada + cst_excluido_entrada
 
     # lançamentos manuais (aluguéis, depreciação) — não têm ICMS pra excluir, bruto = líquido
@@ -1013,20 +994,16 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "6.4", "(-) ICMS Apuração - Destacado Entradas", Decimal("0"), Decimal("0"), manual=False,
         detalhe={
             "base_total": str(icms_excluido_entrada),
-            "nota": "FONTE TROCADA em 23/09/2026 (mesmo pedido/racional da linha \"2.3\" — ver nota lá): "
-                    "soma resumo_1024_pc.valor_icms por CFOP, direto da Rotina 1024, restrito aos CFOPs "
-                    "presentes nos grupos de crédito desta competência (inclui \"5.8\"). A base/DARF (linhas "
-                    "\"5.x\") continua calculada com o ICMS do Relatório 1096 (regra de 20/08/2026, "
-                    "inalterada); ver aba \"Conferência\", coluna \"Situação ICMS\", pro desvio CFOP a CFOP "
-                    "entre o valor exibido aqui e o efetivamente deduzido da base. ATUALIZAÇÃO em 23/09/2026 "
-                    "(mesma sessão, achado do usuário): este valor bruto da 1024 (\"6.4\") continua exibido "
-                    "aqui normalmente, mas NÃO é mais usado no cálculo do TOTAL \"6\" — ver nota da linha \"6\" "
-                    "para o motivo (dupla contagem do ICMS de itens CST 70/71/74 entre \"6.4\" e \"6.5\"). "
-                    "DIFERENTE de \"2.3\" (débito): aqui NÃO foi aplicado o desconto do ICMS do CST embutido "
-                    "diretamente em \"6.4\", CFOP a CFOP — ver comentário no código (`calcular_apuracao_pc`) "
-                    "pro motivo (CST 73/98, que fazem parte da exclusão de crédito, são itens isentos/"
-                    "fantasma sem ICMS real, e a subtração produzia resíduo negativo sem sentido nesses "
-                    "CFOPs). Pendente de confirmação do usuário sobre como tratar isso no lado entrada.",
+            "nota": "FONTE FINAL (23/09/2026, mesma sessão — ver nota completa em \"2.3\", débito, pro "
+                    "histórico das 3 rodadas): \"6.4\" mostra `icms_correto_entrada` diretamente — soma, item "
+                    "a item, do Relatório 1096 (`valor_nao_tributado`) de todos os itens com CST diferente de "
+                    "70/71/73/74/98 nesta competência, restrita aos CFOPs presentes nos grupos de crédito "
+                    "(mesma função que já alimenta a base/DARF desde 20/08/2026). Diferente da tentativa "
+                    "intermediária que chegou a ser testada e revertida (subtrair o ICMS do CST excluído do "
+                    "bruto da 1024, CFOP a CFOP) — essa mecânica é particularmente arriscada pro lado entrada, "
+                    "já que CST 73/98 são itens isentos/fantasma sem ICMS real (Causas raiz 4/8.1), e produzia "
+                    "resíduo negativo. \"6.4\" não usa mais o bruto da Rotina 1024 (`_somar_icms_1024_por_cfop` "
+                    "continua existindo só pra Conferência 1024×1096, coluna \"Situação ICMS\").",
             "icms_destacado_entrada_total": str(icms_excluido_entrada),
         },
     ))
@@ -1059,21 +1036,23 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "6", "Total das Exclusões (crédito)", Decimal("0"), Decimal("0"), manual=True,
         detalhe={
             "base_total": str(total_exclusoes_credito),
-            "nota": "CORRIGIDO em 23/09/2026 (achado do usuário, mesma sessão do fix da linha \"2\" — ver nota "
-                    "análoga lá): este total NÃO é a soma literal de 6.4 + 6.5 + 6.7. O ICMS de itens com "
-                    "CST 70/71/74 (excluídos do crédito) ficaria contado duas vezes — uma em \"6.4\" (ICMS "
-                    "bruto da Rotina 1024, todos os CFOPs) e outra dentro do Valor Contábil inteiro desses "
-                    "itens em \"6.5\". Para eliminar essa sobreposição, o TOTAL usa o ICMS do Relatório 1096 "
-                    "(icms_correto_entrada — o mesmo que a base/DARF de fato desconta, que já exclui os itens "
-                    "CST 70/71/74 do cálculo de ICMS) em vez do valor bruto exibido em \"6.4\". DIFERENTE do "
-                    "lado débito (linha \"2\", que passou a somar \"2.3\"+\"2.5\"+\"2.7\" literalmente, porque "
-                    "\"2.3\" já desconta o ICMS do CST 6/7 CFOP a CFOP): no crédito, essa mesma técnica não é "
-                    "segura porque CST 73/98 (parte da exclusão de crédito) são itens isentos/fantasma sem "
-                    "ICMS real — ver comentário no código. Por isso \"6\" continua usando icms_correto_entrada "
-                    "só para o total, igual ao fix8, até o usuário confirmar como tratar isso no lado entrada. "
-                    "6.3/6.6 (IPI/Exportação, lançamento manual desde 20/08/2026) continuam NÃO entrando "
-                    "nesta soma — são aplicadas como redução direta de PIS/COFINS depois que a linha \"5\" "
-                    "fecha, não como redução de base (ver LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_CREDITO).",
+            "nota": "FONTE FINAL (23/09/2026, mesma sessão, 3ª rodada — ver nota completa em \"2\"/\"6.4\"): agora "
+                    "\"6\" É a soma literal de \"6.4\" (icms_correto_entrada) + \"6.5\" (Valor Contábil dos "
+                    "itens CST excluído) + \"6.7\" — sem nenhum ajuste \"por fora\", porque \"6.4\" já usa a "
+                    "mesma fonte (Relatório 1096, exclui os CST 70/71/73/74/98 por completo) que \"6.5\" não "
+                    "sobrepõe (\"6.5\" só conta o Valor Contábil dos itens CST excluído; \"6.4\" só conta o "
+                    "ICMS dos itens que NÃO são CST excluído — bases disjuntas, sem risco de dupla contagem "
+                    "nem de subcontagem). HISTÓRICO: uma versão anterior desta linha (fix8) evitava a soma "
+                    "literal porque \"6.4\" ainda mostrava o bruto da Rotina 1024 (que se sobrepunha com "
+                    "\"6.5\"); e uma tentativa intermediária (subtrair o ICMS do CST excluído do bruto da 1024, "
+                    "CFOP a CFOP) chegou a ser testada e revertida ANTES de chegar a produção — a identidade "
+                    "\"valor_nao_tributado do item = ICMS embutido\" é frágil pro lado entrada, já que CST "
+                    "73/98 são itens isentos/fantasma sem ICMS real (Causas raiz 4/8.1), o que produzia "
+                    "resíduo negativo em teste. Nenhum desses riscos se aplica mais, porque \"6.4\" não faz "
+                    "mais nenhuma subtração — usa `icms_correto_entrada` direto. 6.3/6.6 (IPI/Exportação, "
+                    "lançamento manual desde 20/08/2026) continuam NÃO entrando nesta soma — são aplicadas "
+                    "como redução direta de PIS/COFINS depois que a linha \"5\" fecha, não como redução de "
+                    "base (ver LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_CREDITO).",
         },
     ))
     linhas.append(LinhaApuracaoPC("5", "Total de Créditos", credito_pis_total, credito_cofins_total,

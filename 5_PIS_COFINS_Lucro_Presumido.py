@@ -33,6 +33,7 @@ trazer os CFOPs 1202/1411/2202/2411/3202; na direção Saída, a grade traz TODO
 sem restringir aos grupos "1.1"/"1.4" da apuração (mesmo comportamento do Lucro Real).
 """
 import sys
+import io
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -59,6 +60,7 @@ from lib.cst_regras_pc import (
     listar_regras_alerta, salvar_regras_alerta, registrar_inconsistencias_cst_regras,
     adicionar_regra_cfop, adicionar_regra_ncm,
 )
+from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
 from lib import lancamentos_manuais_pc as lmpc
 
 MODULO = "pis_cofins_lucro_presumido"
@@ -106,6 +108,11 @@ def _cache_regras_alerta(_session):
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
 def _cache_cfops_sem_checagem(_session, empresa_id):
     return [dict(r) for r in listar_cfops_sem_checagem(_session, empresa_id)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_ncms_lc224(_session, regime):
+    return [dict(r) for r in listar_ncms_lc224(_session, regime)]
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
@@ -168,6 +175,93 @@ def _cache_historico_edicoes(_session, competencia_id, tipo_operacao):
     return planilha_pc.carregar_historico_edicoes(_session, competencia_id, tipo_operacao)
 
 
+def _montar_export_ncm_inconsistencias_grade(session, competencia_id, tipo_operacao, empresa_ids,
+                                              cfops_permitidos=None):
+    """Exportação 'NCM + Inconsistências' pedida pelo usuário (21/08/2026, sessão de continuação: "quero um
+    botão para exportar o NCM e as inconsistencias" / "sem duplicados"). Ignora DE PROPÓSITO os filtros de
+    tela (CFOP/NCM/tipo de inconsistência/busca) e o limite de linhas — a ideia é levantar TODOS os itens
+    pendentes desta operação/competência, não só o que está sendo mostrado na grade no momento (confirmado
+    com o usuário: "Tudo da operação, ignorando o limite de linhas").
+
+    Agrupado por NCM + CFOP + CST + Inconsistência ("sem duplicados", confirmado com o usuário: "Uma linha
+    por combinação NCM+CFOP+CST") — por isso NÃO tem coluna de Código Produto nem NF: uma única combinação
+    aqui pode reunir vários produtos/notas diferentes, não haveria um valor único pra mostrar nessas colunas
+    (e o sistema não guarda NF em lugar nenhum — nem o Relatório 1096 nem a Rotina 1024 trazem esse dado,
+    ver docstring de `carregar_itens_editavel`). Em vez disso, mostra "Qtd. Itens": quantos itens do
+    Relatório 1096 caem nessa combinação."""
+    df, _ = planilha_pc.carregar_itens_editavel(
+        session, competencia_id, tipo_operacao, empresa_ids, limite=1_000_000, cfops_permitidos=cfops_permitidos,
+    )
+    df_pend = df[df["inconsistencia"].notna()].copy()
+    colunas = ["NCM", "CFOP", "CST", "Inconsistência", "Qtd. Itens"]
+    if df_pend.empty:
+        return pd.DataFrame(columns=colunas)
+    agrupado = (
+        df_pend.groupby(["ncm", "cfop", "cst", "inconsistencia"], dropna=False)
+        .size()
+        .reset_index(name="Qtd. Itens")
+        .rename(columns={"ncm": "NCM", "cfop": "CFOP", "cst": "CST", "inconsistencia": "Inconsistência"})
+        .sort_values(["CFOP", "NCM", "CST"])
+    )
+    return agrupado[colunas]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_export_ncm_inc_grade(_session, competencia_id, tipo_operacao, empresa_ids, cfops_permitidos=None):
+    return _montar_export_ncm_inconsistencias_grade(
+        _session, competencia_id, tipo_operacao, empresa_ids, cfops_permitidos,
+    )
+
+
+def _montar_export_ncm_inconsistencias_geral(session, competencia_id, empresa_ids, cfops_permitidos_entrada=None):
+    """Mesma exportação 'NCM + Inconsistências', a partir da aba módulo ⚠️ Inconsistências — cobre Entrada e
+    Saída juntos (coluna "Operação").
+
+    IMPORTANTE (descoberto ao validar com harness, 21/08/2026): reaproveita `_montar_export_ncm_
+    inconsistencias_grade` para cada operação, em vez de ler direto de `inconsistencias_pc`/`resumo_pc.
+    carregar_inconsistencias` — o "alerta consolidado" (cst_regra_cfop/cst_regra_ncm agrupado só por CST,
+    ver `cst_regras_pc._checar_regra_cfop`/`_checar_regra_ncm`) grava `cfop`/`ncm = NULL` na tabela (é
+    ambíguo por natureza — não tem UM cfop/ncm específico). Se a exportação lesse direto dessa tabela, toda
+    linha desse tipo (o caso MAIS comum, exatamente o do print do usuário) sairia com NCM em branco — inútil
+    como checklist. Indo item a item (mesma resolução caso 1 × caso 2 já usada na grade/card) recupera o
+    NCM/CFOP concreto de cada item, então a exportação geral usa o MESMO caminho, só somando as duas
+    operações."""
+    colunas = ["Operação", "NCM", "CFOP", "CST", "Inconsistência", "Qtd. Itens"]
+    partes = []
+    for tipo_operacao, cfops_permitidos in (("entrada", cfops_permitidos_entrada), ("saida", None)):
+        parte = _montar_export_ncm_inconsistencias_grade(
+            session, competencia_id, tipo_operacao, empresa_ids, cfops_permitidos,
+        )
+        if not parte.empty:
+            parte = parte.copy()
+            parte.insert(0, "Operação", tipo_operacao)
+            partes.append(parte)
+    if not partes:
+        return pd.DataFrame(columns=colunas)
+    return pd.concat(partes, ignore_index=True).sort_values(["Operação", "CFOP", "NCM", "CST"])[colunas]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_export_ncm_inc_geral(_session, competencia_id, empresa_ids, cfops_permitidos_entrada=None):
+    """CORRIGIDO (produção, 21/08/2026 à noite — usuário reportou `sqlalchemy.exc.TimeoutError` na fila de
+    conexões do banco): faltava cache aqui. `_montar_export_ncm_inconsistencias_geral` roda 2 consultas
+    pesadas e SEM limite de linhas (`carregar_itens_editavel(..., limite=1_000_000)`, entrada + saída) — e
+    `st.tabs()` reexecuta o corpo de TODAS as abas a cada interação em QUALQUER lugar da tela (mesmo motivo
+    documentado no comentário de `_TTL_LEITURA`, no topo do arquivo — não é exclusivo desta função). Sem
+    cache, essas 2 consultas completas rodavam de novo a cada clique/gravação em QUALQUER aba da página,
+    para todo usuário simultâneo — exatamente o padrão de esgotar o pool de conexões do banco. A versão da
+    grade (`_cache_export_ncm_inc_grade`, acima) já tinha esse cache desde o início; esta função "geral" foi
+    adicionada sem, por descuido — corrigido aqui, mesmo padrão/TTL das demais."""
+    return _montar_export_ncm_inconsistencias_geral(_session, competencia_id, empresa_ids, cfops_permitidos_entrada)
+
+
+def _xlsx_bytes(df, sheet_name):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buffer.getvalue()
+
+
 def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia_id=None, empresa_ids=None):
     """Card de inconsistência — cópia adaptada de `2_PIS_COFINS_Lucro_Real.py::_card_inconsistencia` (ver lá
     a docstring completa sobre o motivo do `key_prefix`: a mesma inconsistência pode, em tese, aparecer em
@@ -221,6 +315,8 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia
                 _cache_regras_cfop.clear()
                 _cache_inconsistencias.clear()
                 _cache_itens_editavel.clear()
+                _cache_export_ncm_inc_grade.clear()
+                _cache_export_ncm_inc_geral.clear()
                 st.success("Regra de CFOP cadastrada — inconsistências desta competência já recalculadas.")
                 st.rerun()
         elif row["tipo"] == "cst_regra_ncm" and pd.notna(row.get("ncm")) and pd.notna(row.get("cst")):
@@ -240,6 +336,8 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia
                 _cache_regras_ncm.clear()
                 _cache_inconsistencias.clear()
                 _cache_itens_editavel.clear()
+                _cache_export_ncm_inc_grade.clear()
+                _cache_export_ncm_inc_geral.clear()
                 st.success("Regra de NCM cadastrada — inconsistências desta competência já recalculadas.")
                 st.rerun()
 
@@ -572,6 +670,8 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                 with st.spinner("Recalculando inconsistências..."):
                     planilha_pc.recalcular_inconsistencias_apos_edicao(session, competencia_id, empresas_afetadas)
                 _cache_itens_editavel.clear()
+                _cache_export_ncm_inc_grade.clear()
+                _cache_export_ncm_inc_geral.clear()
                 _cache_totalizador.clear()
                 _cache_resumo_por_cfop.clear()
                 _cache_resumo_por_cst.clear()
@@ -627,6 +727,8 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                         _cache_regras_cfop.clear()
                         _cache_inconsistencias.clear()
                         _cache_itens_editavel.clear()
+                        _cache_export_ncm_inc_grade.clear()
+                        _cache_export_ncm_inc_geral.clear()
                         st.success("Regra de CFOP cadastrada — inconsistências desta competência já recalculadas.")
                         st.rerun()
 
@@ -667,8 +769,27 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                             _cache_regras_ncm.clear()
                             _cache_inconsistencias.clear()
                             _cache_itens_editavel.clear()
+                            _cache_export_ncm_inc_grade.clear()
+                            _cache_export_ncm_inc_geral.clear()
                             st.success("Regra de NCM cadastrada — inconsistências desta competência já recalculadas.")
                             st.rerun()
+
+        export_df = _cache_export_ncm_inc_grade(session, competencia_id, tipo_operacao, empresa_ids,
+                                                  cfops_permitidos)
+        st.download_button(
+            "📊 Exportar NCM + Inconsistências (Excel)",
+            data=_xlsx_bytes(export_df, sheet_name=f"Inconsistencias_{tipo_operacao}"),
+            file_name=f"ncm_inconsistencias_{tipo_operacao}_competencia_{competencia_id}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"pres_export_ncm_inc_{tipo_operacao}",
+            disabled=export_df.empty,
+            help="Lista, sem duplicados, cada combinação de NCM + CFOP + CST + Inconsistência pendente "
+                 "desta operação (ignora os filtros e o limite de linhas da grade acima — traz tudo). Use "
+                 "como checklist pra cadastrar as regras que faltam, uma por uma, na aba 🔖 Regras de CST ou "
+                 "no expander acima.",
+        )
+        if export_df.empty:
+            st.caption("Nenhuma inconsistência pendente nesta operação para exportar.")
 
     with st.expander("📝 Histórico de edições desta grade (mais recentes primeiro)"):
         hist = _cache_historico_edicoes(session, competencia_id, tipo_operacao)
@@ -729,14 +850,20 @@ def _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids):
         registrar_inconsistencias_cst_regras(session, competencia_id, empresa_id)
 
 
-def _aba_regras_cst(session, competencia_id, empresa_ids):
+def _aba_regras_cst(session, competencia_id, empresa_ids, regime):
     """Cópia de `2_PIS_COFINS_Lucro_Real.py::_aba_regras_cst` — as 3 tabelas de regra são globais
     (compartilhadas entre Presumido e Real), então editar aqui também vale para o Lucro Real e vice-versa.
 
     `competencia_id`/`empresa_ids` (novos parâmetros, sessão de continuação de 21/08/2026): só usados para
     recalcular as inconsistências desta competência/grupo logo após salvar uma regra — ver
     `_recalcular_regras_cst_grupo`. As regras em si continuam globais (afetam qualquer competência/regime que
-    usar aquele CFOP/NCM/CST), só o recálculo imediato é escopado à competência aberta na tela."""
+    usar aquele CFOP/NCM/CST), só o recálculo imediato é escopado à competência aberta na tela.
+
+    `regime` (novo parâmetro, sessão de continuação de 28/09/2026): usado só pela 4ª sub-aba "NCMs LC
+    224/2025" — `ncms_lc224_pc`, ao contrário das 3 tabelas de regra acima, É por regime (alíquotas
+    diferentes entre Presumido e Real), então essa sub-aba mostra/edita só o regime desta página, sem
+    recalcular inconsistências (não faz parte da checagem do 1096 — é usada direto por
+    `calcular_apuracao_pc_presumido`)."""
     st.markdown(
         "**Para que serve esta aba:** cadastro das regras de CST × CFOP/NCM usadas pela checagem automática "
         "do Relatório 1096 (ver aba ⚠️ Inconsistências) — mesmas 3 tabelas já usadas pelo Lucro Real "
@@ -750,7 +877,9 @@ def _aba_regras_cst(session, competencia_id, empresa_ids):
         "o Relatório 1096 delas for reimportado."
     )
 
-    sub_cfop, sub_ncm, sub_alerta = st.tabs(["Por CFOP", "Por NCM", "Sempre-alerta (por CST)"])
+    sub_cfop, sub_ncm, sub_alerta, sub_lc224 = st.tabs(
+        ["Por CFOP", "Por NCM", "Sempre-alerta (por CST)", "NCMs LC 224/2025"]
+    )
 
     with sub_cfop:
         st.caption("CST esperado quando este CFOP aparecer no Relatório 1096, nesta direção (entrada/saída).")
@@ -777,6 +906,8 @@ def _aba_regras_cst(session, competencia_id, empresa_ids):
                 _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
             _cache_inconsistencias.clear()
             _cache_itens_editavel.clear()
+            _cache_export_ncm_inc_grade.clear()
+            _cache_export_ncm_inc_geral.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
                        f"recalculadas.")
@@ -807,6 +938,8 @@ def _aba_regras_cst(session, competencia_id, empresa_ids):
                 _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
             _cache_inconsistencias.clear()
             _cache_itens_editavel.clear()
+            _cache_export_ncm_inc_grade.clear()
+            _cache_export_ncm_inc_geral.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
                        f"recalculadas.")
@@ -839,9 +972,51 @@ def _aba_regras_cst(session, competencia_id, empresa_ids):
                 _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids)
             _cache_inconsistencias.clear()
             _cache_itens_editavel.clear()
+            _cache_export_ncm_inc_grade.clear()
+            _cache_export_ncm_inc_geral.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
                        f"recalculadas.")
+            st.rerun()
+
+    with sub_lc224:
+        st.caption(
+            "NCMs com incidência residual de PIS/COFINS sobre produtos isentos (CST 6/7 de saída), Lei "
+            "Complementar 224/2025 — fonte da linha \"3.1 — Produtos Isentos com Incidência Residual\" da "
+            "Apuração (`ncms_lc224_pc`, regime='presumido'). Alíquotas na mesma fração decimal do cadastro "
+            "(ex.: 0,000650 = 0,065%). Editar aqui substitui rodar `sql/009_ncms_lc224_pc.sql` manualmente "
+            "no Supabase. Esta lista é só do regime Presumido — o Lucro Real usa alíquotas próprias, "
+            "cadastradas na aba equivalente daquela página."
+        )
+        df_lc224 = pd.DataFrame(_cache_ncms_lc224(session, regime))
+        if df_lc224.empty:
+            df_lc224 = pd.DataFrame(
+                columns=["id", "ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at"])
+        df_lc224_editado = st.data_editor(
+            df_lc224, use_container_width=True, num_rows="dynamic", key="pres_editor_ncms_lc224",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "ncm": st.column_config.TextColumn("NCM", required=True),
+                "aliq_pis": st.column_config.NumberColumn("Alíq. PIS", format="%.6f", required=True),
+                "aliq_cofins": st.column_config.NumberColumn("Alíq. COFINS", format="%.6f", required=True),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at", "id"],
+        )
+        st.caption(
+            "Para incluir: adicione uma linha (ícone + no final da grade) e preencha NCM + alíquotas. Para "
+            "excluir definitivamente: selecione a linha e apague (ícone de lixeira). Para só desativar sem "
+            "perder o cadastro/histórico, desmarque \"Ativo\" em vez de excluir — o cálculo só considera "
+            "linhas com Ativo marcado."
+        )
+        if st.button("💾 Salvar NCMs LC 224/2025", key="pres_salvar_ncms_lc224"):
+            resultado = salvar_ncms_lc224(session, regime, df_lc224, df_lc224_editado)
+            _cache_ncms_lc224.clear()
+            st.success(f"{resultado['incluidos']} incluído(s)/atualizado(s), "
+                       f"{resultado['atualizados']} linha(s) existente(s) atualizada(s), "
+                       f"{resultado['removidos']} removido(s).")
             st.rerun()
 
 
@@ -1220,7 +1395,7 @@ with aba_conferencia:
 
 # ---------------------------------------------------------------------------------------------- Regras de CST
 with aba_regras_cst:
-    _aba_regras_cst(session, competencia_id, empresa_ids_grupo)
+    _aba_regras_cst(session, competencia_id, empresa_ids_grupo, "presumido")
 
 # --------------------------------------------------------------------------------- CFOPs sem Checagem de CST
 with aba_cfop_sem_checagem:
@@ -1233,6 +1408,22 @@ with aba_inconsist:
     else:
         pendentes = df_inc[df_inc["status"] == "pendente"]
         st.caption(f"{len(pendentes)} pendente(s) de {len(df_inc)} no total.")
+
+        export_geral_df = _cache_export_ncm_inc_geral(
+            session, competencia_id, empresa_ids_grupo,
+            cfops_permitidos_entrada=tuple(sorted(CFOPS_1_2_DEVOLUCAO_VENDA)),
+        )
+        st.download_button(
+            "📊 Exportar NCM + Inconsistências (Excel)",
+            data=_xlsx_bytes(export_geral_df, sheet_name="Inconsistencias"),
+            file_name=f"ncm_inconsistencias_competencia_{competencia_id}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="pres_export_ncm_inc_geral",
+            disabled=export_geral_df.empty,
+            help="Lista, sem duplicados, cada combinação de Operação + NCM + CFOP + CST + Inconsistência "
+                 "pendente desta competência (Entrada e Saída juntos, todos os tipos — ignora os filtros "
+                 "abaixo, traz tudo).",
+        )
 
         fi1, fi2, fi3, fi4, fi5 = st.columns(5)
         status_disp = sorted(df_inc["status"].unique())

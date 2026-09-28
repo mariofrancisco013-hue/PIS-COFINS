@@ -28,6 +28,7 @@ from lib.cst_regras_pc import (
     salvar_cfops_sem_checagem, listar_regras_cfop, salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm,
     listar_regras_alerta, salvar_regras_alerta,
 )
+from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual. cfop_sem_grupo não tem CST
 # associado, então fica de fora. Desde 20/08/2026 (pedido do usuário: "que esses ajustes fiquem salvos para
@@ -131,6 +132,11 @@ def _cache_regras_ncm(_session):
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
 def _cache_regras_alerta(_session):
     return [dict(r) for r in listar_regras_alerta(_session)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_ncms_lc224(_session, regime):
+    return [dict(r) for r in listar_ncms_lc224(_session, regime)]
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
@@ -565,7 +571,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                                      competencia_id)
 
 
-def _aba_regras_cst(session):
+def _aba_regras_cst(session, regime):
     st.markdown(
         "**Para que serve esta aba:** cadastro das regras de CST × CFOP/NCM usadas pelas 3 checagens "
         "automáticas do Relatório 1096 (ver aba ⚠️ Inconsistências) — antes só dava para incluir com um "
@@ -579,7 +585,9 @@ def _aba_regras_cst(session):
         "das abas Entrada/Saída (que recalcula as inconsistências daquela filial)."
     )
 
-    sub_cfop, sub_ncm, sub_alerta = st.tabs(["Por CFOP", "Por NCM", "Sempre-alerta (por CST)"])
+    sub_cfop, sub_ncm, sub_alerta, sub_lc224 = st.tabs(
+        ["Por CFOP", "Por NCM", "Sempre-alerta (por CST)", "NCMs LC 224/2025"]
+    )
 
     with sub_cfop:
         st.caption("CST esperado quando este CFOP aparecer no Relatório 1096, nesta direção (entrada/saída).")
@@ -656,6 +664,46 @@ def _aba_regras_cst(session):
             _cache_regras_alerta.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s).")
+            st.rerun()
+
+    with sub_lc224:
+        st.caption(
+            "NCMs com incidência residual de PIS/COFINS sobre produtos isentos (CST 6/7 de saída), Lei "
+            "Complementar 224/2025 — fonte da linha \"4 — Produtos Isentos com Incidência Residual\" da "
+            "Apuração (`ncms_lc224_pc`, regime='real'). Alíquotas na mesma fração decimal do cadastro (ex.: "
+            "0,001650 = 0,165%). Editar aqui substitui rodar `sql/009_ncms_lc224_pc.sql` manualmente no "
+            "Supabase. Esta lista é só do regime Real — o Lucro Presumido usa alíquotas próprias, cadastradas "
+            "na aba equivalente daquela página."
+        )
+        df_lc224 = pd.DataFrame(_cache_ncms_lc224(session, regime))
+        if df_lc224.empty:
+            df_lc224 = pd.DataFrame(
+                columns=["id", "ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at"])
+        df_lc224_editado = st.data_editor(
+            df_lc224, use_container_width=True, num_rows="dynamic", key="editor_ncms_lc224",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "ncm": st.column_config.TextColumn("NCM", required=True),
+                "aliq_pis": st.column_config.NumberColumn("Alíq. PIS", format="%.6f", required=True),
+                "aliq_cofins": st.column_config.NumberColumn("Alíq. COFINS", format="%.6f", required=True),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at", "id"],
+        )
+        st.caption(
+            "Para incluir: adicione uma linha (ícone + no final da grade) e preencha NCM + alíquotas. Para "
+            "excluir definitivamente: selecione a linha e apague (ícone de lixeira). Para só desativar sem "
+            "perder o cadastro/histórico, desmarque \"Ativo\" em vez de excluir — o cálculo só considera "
+            "linhas com Ativo marcado."
+        )
+        if st.button("💾 Salvar NCMs LC 224/2025"):
+            resultado = salvar_ncms_lc224(session, regime, df_lc224, df_lc224_editado)
+            _cache_ncms_lc224.clear()
+            st.success(f"{resultado['incluidos']} incluído(s)/atualizado(s), "
+                       f"{resultado['atualizados']} linha(s) existente(s) atualizada(s), "
+                       f"{resultado['removidos']} removido(s).")
             st.rerun()
 
 
@@ -764,7 +812,7 @@ with aba_saida:
     _aba_planilha_pc(session, competencia_id, "saida", empresa_ids_grupo, df_inc, csts_disponiveis)
 
 with aba_regras_cst:
-    _aba_regras_cst(session)
+    _aba_regras_cst(session, "real")
 
 with aba_cfop_sem_checagem:
     _aba_cfops_sem_checagem(session, filiais_grupo)
@@ -1012,39 +1060,59 @@ with aba_conferencia:
         "Comparação por CFOP entre o resultado da Rotina 1024 (usado na apuração) e a soma direta de "
         "valor_pis/valor_cofins do Relatório 1096 (item a item) — só leitura, não muda nenhum valor "
         "calculado. Diferenças acima de R$ 1,00 aparecem como 'Divergente'; CFOPs que só aparecem em uma "
-        "das duas fontes também são sinalizados."
+        "das duas fontes também são sinalizados. Coluna 'Situação ICMS' (desde 22/09/2026; RESSIGNIFICADA "
+        "em 23/09/2026): compara, por CFOP, o ICMS declarado na Rotina 1024 (`valor_icms`) contra o ICMS "
+        "que o Relatório 1096 implica (item a item, já excluindo CST sem direito a crédito/isenção e as "
+        "exceções pontuais cadastradas). Desde 23/09/2026, as linhas '2.3'/'6.4' da apuração passaram a "
+        "exibir exatamente o valor da Rotina 1024 (pedido do usuário) — a base/DARF continua sendo "
+        "calculada com o ICMS do Relatório 1096, sem mudança. Por isso, 'Divergente ICMS' aqui indica, "
+        "CFOP a CFOP, que o valor exibido em '2.3'/'6.4' é diferente do que de fato foi deduzido da base "
+        "— não afeta o DARF, mas é o sinal de onde investigar (mesmo padrão já encontrado em 5403/6108/"
+        "6403/6551, ver metodologia)."
     )
     linhas_conf = _cache_conferencia(session, competencia_id)
     if not linhas_conf:
         st.info("Nenhum dado de Rotina 1024 nem de Relatório 1096 importado ainda para este grupo/período.")
     else:
-        fc1, fc2, fc3 = st.columns([1.3, 1.7, 1.5])
+        fc1, fc2, fc3, fc4 = st.columns([1.1, 1.5, 1.3, 1.3])
         f_operacao = fc1.selectbox("Operação", ["Todas", "entrada", "saida"], key="conf_f_operacao")
         situacoes_disponiveis = sorted({l["situacao"] for l in linhas_conf})
-        f_situacao = fc2.multiselect("Situação", situacoes_disponiveis, default=situacoes_disponiveis,
+        f_situacao = fc2.multiselect("Situação (PIS/COFINS)", situacoes_disponiveis, default=situacoes_disponiveis,
                                       key="conf_f_situacao")
-        f_cfop = fc3.text_input("Filtrar por CFOP", key="conf_f_cfop")
+        situacoes_icms_disponiveis = sorted({l["situacao_icms"] for l in linhas_conf})
+        f_situacao_icms = fc3.multiselect("Situação ICMS", situacoes_icms_disponiveis,
+                                           default=situacoes_icms_disponiveis, key="conf_f_situacao_icms")
+        f_cfop = fc4.text_input("Filtrar por CFOP", key="conf_f_cfop")
 
         linhas_filtradas = [
             l for l in linhas_conf
             if (f_operacao == "Todas" or l["tipo_operacao"] == f_operacao)
             and l["situacao"] in f_situacao
+            and l["situacao_icms"] in f_situacao_icms
             and (not f_cfop.strip() or str(l["cfop"]).startswith(f_cfop.strip()))
         ]
 
         n_div = sum(1 for l in linhas_conf if l["situacao"] not in ("OK",))
+        n_div_icms = sum(1 for l in linhas_conf if l["situacao_icms"] not in ("OK", "N/A (sem Rotina 1024 para este CFOP)"))
         if n_div:
-            st.warning(f"{n_div} CFOP(s) com divergência ou presentes em só uma das fontes (no total, sem "
-                       f"considerar o filtro acima).")
+            st.warning(f"{n_div} CFOP(s) com divergência de PIS/COFINS ou presentes em só uma das duas "
+                       f"fontes (no total, sem considerar o filtro acima).")
         else:
-            st.success("Todos os CFOPs batem entre Rotina 1024 e Relatório 1096 (dentro da tolerância).")
+            st.success("Todos os CFOPs batem em PIS/COFINS entre Rotina 1024 e Relatório 1096 (dentro da "
+                       "tolerância).")
+        if n_div_icms:
+            st.warning(f"{n_div_icms} CFOP(s) onde o ICMS exibido em '2.3'/'6.4' (Rotina 1024) difere do "
+                       f"ICMS de fato deduzido da base/DARF (Relatório 1096) — no total, sem considerar o "
+                       f"filtro acima. Não afeta o DARF, mas vale investigar se é o mesmo padrão de "
+                       f"5403/6108/6403/6551 (ver metodologia).")
 
         if not linhas_filtradas:
             st.info("Nenhum CFOP corresponde aos filtros selecionados.")
         else:
             st.caption(f"Mostrando {len(linhas_filtradas)} de {len(linhas_conf)} CFOP(s).")
             df_conf = pd.DataFrame(linhas_filtradas)
-            for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins"):
+            for col in ("pis_1024", "cofins_1024", "pis_1096", "cofins_1096", "diff_pis", "diff_cofins",
+                        "icms_1024", "icms_1096", "diff_icms"):
                 df_conf[col] = df_conf[col].apply(lambda v: formatar_moeda(v) if v is not None else "—")
             st.dataframe(df_conf, use_container_width=True, hide_index=True)
 

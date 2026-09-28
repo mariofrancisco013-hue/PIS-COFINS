@@ -604,20 +604,27 @@ def _carregar_fallback_1096_cfops_ausentes_1024(session, competencia_id, tipo_op
 
 
 def _somar_lc224_saida_por_cfop_ncm(session, competencia_id):
-    """[{cfop, ncm, valor}] Valor Contábil (Relatório 1096, saída) agrupado por CFOP+NCM, só itens CST 6/7
-    (excluídos em "2.7") — casado depois, em Python, contra o lookup de `_carregar_ncms_lc224` (mesma
-    mecânica do módulo Presumido — não dá pra filtrar por NCM direto no SQL porque cada NCM pode ter uma
-    alíquota diferente cadastrada, e variantes de zero à esquerda precisam ser casadas em Python)."""
-    placeholders_cst = ", ".join(f":c{i}" for i in range(len(CSTS_EXCLUSAO_SAIDA)))
-    params = {"cid": competencia_id}
-    params.update({f"c{i}": c for i, c in enumerate(CSTS_EXCLUSAO_SAIDA)})
-    rows = session.execute(text(f"""
-        select cfop, ncm, sum(valor_contabil) as valor
+    """[{cfop, ncm, valor}] Valor NÃO TRIBUTADO (Relatório 1096, saída) agrupado por CFOP+NCM — casado
+    depois, em Python, contra o lookup de `_carregar_ncms_lc224` (mesma mecânica do módulo Presumido — não
+    dá pra filtrar por NCM direto no SQL porque cada NCM pode ter uma alíquota diferente cadastrada, e
+    variantes de zero à esquerda precisam ser casadas em Python).
+
+    CORRIGIDO na sessão de continuação de 28/09/2026 — pedido do usuário, validado contra uma planilha de
+    referência própria dele (coluna "Isento" Sim/Não, calculada por produto/NCM): a base certa é o
+    **Valor Não Tributado** do item, não o Valor Contábil (ver comentário no bloco de montagem da linha "4"
+    abaixo). O filtro por `cst in (6,7)` que existia aqui até então FOI REMOVIDO — o usuário confirmou que o
+    critério é "CFOPs de venda e devolução e esses NCMs" (cadastro de `ncms_lc224_pc`), sem mencionar CST:
+    a classificação de isenção é por produto (NCM), não pelo CST que aquela nota específica recebeu — dados
+    reais mostraram itens de um NCM cadastrado lançados com CST 1 ou 49 (não 6/7) que ainda assim compõem a
+    base da linha 4 na apuração de referência do usuário. Ver ressalva sobre dupla-contagem no comentário da
+    linha "4"."""
+    rows = session.execute(text("""
+        select cfop, ncm, sum(valor_nao_tributado) as valor
         from relatorio_pc_itens
         where competencia_id = :cid and tipo_operacao = 'saida'
-          and cst in ({placeholders_cst}) and ncm is not null
+          and ncm is not null
         group by cfop, ncm
-    """), params).mappings().all()
+    """), {"cid": competencia_id}).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -942,20 +949,37 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
 
     # --- Produtos Isentos com Incidência Residual (linha 4, LC 224/2025 — pedido do usuário em 20/08/2026,
     # mesmo conceito implementado primeiro no módulo Presumido; fonte = tabela `ncms_lc224_pc` desde a
-    # migração 009). Base própria (Valor Contábil dos itens CST 6/7 cujo NCM está cadastrado ali) — esses
-    # itens já estão inteiros dentro da exclusão "2.7", então isto não muda a base líquida de nenhum grupo
-    # de débito; é somado só no final (debito_pis_total/debito_cofins_total), do mesmo jeito que Receitas
-    # Financeiras (linha "3") acima. Alíquotas vêm por NCM da tabela (hoje todas iguais: PIS 0,165% / COFINS
-    # 0,76% — 1/10 da alíquota cheia do regime não-cumulativo).
-    # ESCOPO RESTRITO A "1.1" (Faturamento Bruto) desde a sessão de continuação de 20/08/2026 — pedido do
-    # usuário ("somente CFOPs de venda"), mesmo ajuste feito no Presumido (linha "3.1"): o escopo antigo
-    # (`grupo in GRUPOS_DEBITO`) cobria TODOS os grupos de débito, inclusive "1.2 Devolução de Mercadoria de
-    # Compra" e "1.4 Outras Saídas" (que tem CFOPs de devolução de compra, não venda de fato) — não fazia
-    # sentido cobrar a incidência residual da LC 224/2025 sobre uma devolução.
+    # migração 009). Base própria (Valor Não Tributado dos itens cujo NCM está cadastrado ali) — é somada só
+    # no final (debito_pis_total/debito_cofins_total), do mesmo jeito que Receitas Financeiras (linha "3")
+    # acima. Alíquotas vêm por NCM da tabela (hoje todas iguais: PIS 0,165% / COFINS 0,76% — 1/10 da
+    # alíquota cheia do regime não-cumulativo).
+    #
+    # ESCOPO = "1.1" (Faturamento Bruto/venda) + "1.2" (Devolução de Mercadoria de Compra) — REVISADO na
+    # sessão de continuação de 28/09/2026 (antes era só "1.1", ver histórico abaixo). Pedido do usuário:
+    # "SEMPRE SERÃO cfops de venda e devolução e esses ncms" — validado batendo EXATO (R$ 673.159,77, zero de
+    # diferença) contra uma planilha de referência própria dele, cruzando os arquivos reais de saída de
+    # 08/2026 (F6+F59) com uma coluna "Isento" Sim/Não que ele mantém por produto/NCM.
+    # Histórico: até 20/08/2026 cobria TODOS os grupos de débito (`grupo in GRUPOS_DEBITO`, inclusive "1.4
+    # Outras Saídas"); nesse dia foi restrito só a "1.1" a pedido do usuário ("somente CFOPs de venda"), mesmo
+    # ajuste feito no Presumido (linha "3.1"). Agora volta a incluir "1.2" (devolução de compra) também,
+    # mas ainda SEM "1.4"/"1.6" — mudança confirmada pelo usuário nesta sessão, não uma reversão do ajuste
+    # de 20/08.
+    #
+    # RESSALVA (dupla-contagem em potencial, achado na validação desta sessão, NÃO resolvido — decisão do
+    # usuário foi seguir mesmo assim): removido também o filtro `cst in (6,7)` de
+    # `_somar_lc224_saida_por_cfop_ncm` — a classificação de isenção passou a ser só por NCM cadastrado +
+    # CFOP neste escopo, sem olhar o CST do item. Com dados reais de 08/2026, isso incluiu 4 itens (CFOPs de
+    # devolução, R$ 2.173,18 de valor não tributado) com CST 49 — que também entram no cálculo normal da
+    # linha "1.2" (débito), então esses R$ 2.173,18 acabam tributados duas vezes: uma vez na base líquida de
+    # "1.2" (alíquota cheia) e de novo aqui na linha "4" (alíquota reduzida da LC224). Valor pequeno neste
+    # mês (~R$ 20 de PIS+COFINS a mais), mas fica registrado — se isso incomodar depois, a correção mais
+    # correta é ajustar o CST desses itens na origem (aba 🔖 Regras de CST → Por NCM), não reintroduzir o
+    # filtro de CST aqui.
     ncms_lc224_lookup = _carregar_ncms_lc224(session)
     itens_lc224 = _somar_lc224_saida_por_cfop_ncm(session, competencia_id)
     cfops_debito_ativos = {
-        r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "saida" and r["grupo"] == "1.1"
+        r["cfop"] for r in resumo_1024
+        if r["tipo_operacao"] == "saida" and r["grupo"] in ("1.1", "1.2")
     }
     base_lc224 = Decimal("0")
     pis_lc224 = Decimal("0")
@@ -982,13 +1006,14 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         detalhe={
             "base_total": str(base_lc224),
             "base_liquida": str(base_lc224),
-            "nota": "Base = Valor Contábil (Relatório 1096, saída) dos itens com CST 6/7 (já dentro da "
-                    "exclusão '2.7') cujo NCM está cadastrado em ncms_lc224_pc (tabela editável no Supabase "
-                    "desde 20/08/2026 — sql/009_ncms_lc224_pc.sql, substituiu a lista fixa que estava no "
-                    "código). Só conta CFOPs ativos na Rotina 1024 desta competência dentro do grupo "
-                    "\"1.1 — Faturamento Bruto\" (CORRIGIDO na sessão de continuação de 20/08/2026 — pedido "
-                    "do usuário: 'somente CFOPs de venda'; antes cobria todos os grupos de débito "
-                    "1.1/1.2/1.4/1.6, inclusive devolução de compra).",
+            "nota": "Base = Valor Não Tributado (Relatório 1096, saída) dos itens cujo NCM está cadastrado "
+                    "em ncms_lc224_pc (tabela editável no Supabase — aba 🔖 Regras de CST → NCMs LC "
+                    "224/2025 desde 28/09/2026, antes só via SQL Editor). Só conta CFOPs ativos na Rotina "
+                    "1024 desta competência dentro dos grupos \"1.1 — Faturamento Bruto\" e \"1.2 — "
+                    "Devolução de Mercadoria de Compra\" (REVISADO em 28/09/2026 — 'sempre serão CFOPs de "
+                    "venda e devolução e esses NCMs'; validado exato contra planilha de referência do "
+                    "usuário). Não filtra mais por CST do item — a classificação de isenção é só por NCM "
+                    "cadastrado + CFOP neste escopo (antes exigia CST 6/7 também).",
             "base_por_ncm": {k: str(v) for k, v in detalhe_lc224_ncm.items()},
         },
     ))

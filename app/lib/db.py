@@ -27,11 +27,42 @@ código que grava dado já chamava `session.commit()` explicitamente antes disso
 `session.rollback()` no projeto que dependesse do modo anterior).
 """
 import os
+import re
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 _engine = None
 _SessionLocal = None
+
+# CORREÇÃO "ModuleNotFoundError: ... import psycopg" (produção, sessão de continuação, 28/09/2026):
+# reportado repetidas vezes em produção (Streamlit Community Cloud) mesmo depois de confirmar, em rodadas
+# anteriores desta sessão, que (a) o requirements.txt só instala `psycopg2-binary` (nunca `psycopg`, a v3),
+# e (b) a DATABASE_URL colada pelo usuário nos Secrets do painel, testada aqui localmente contra a mesma
+# versão do SQLAlchemy do requirements.txt, resolve corretamente para o dialect `psycopg2`. Ou seja: o
+# valor que o usuário CONFIRMA estar salvo não é, aparentemente, o valor que o processo publicado está de
+# fato recebendo em tempo de execução — causa exata não identificada com certeza à distância (candidatos:
+# um `.streamlit/secrets.toml` antigo commitado no repositório GitHub sobrepondo o secret do painel; cache
+# de processo não limpo por falta de reboot completo; ou alguma outra fonte de env var). Sem acesso direto
+# ao painel do Streamlit Cloud/repositório GitHub do usuário para confirmar a causa exata, a correção mais
+# robusta é tornar `get_database_url()` IMUNE a esse cenário específico, não importa a origem: normaliza
+# qualquer variante "postgres(ql)+<driver>://" para "postgresql://" puro antes de devolver a URL — forçando
+# o SQLAlchemy a sempre resolver para o dialect padrão (`psycopg2`, o único driver de fato instalado via
+# requirements.txt), mesmo que a string armazenada em algum lugar (painel, arquivo antigo, cache) ainda
+# tenha um sufixo de driver diferente (`+psycopg`, `+asyncpg`, etc.) ou o esquema antigo `postgres://`
+# (removido pelo SQLAlchemy 1.4+, mas ainda comum em connection strings copiadas de painéis antigos).
+_RE_DRIVER_SUFFIX = re.compile(r"^postgres(ql)?\+[a-zA-Z0-9_]+://", re.IGNORECASE)
+_RE_BARE_POSTGRES = re.compile(r"^postgres://", re.IGNORECASE)
+
+
+def _normalizar_driver_postgres(url: str) -> str:
+    """Força o esquema da URL para "postgresql://" puro (sem sufixo de driver), garantindo que o
+    SQLAlchemy sempre resolva para o dialect `psycopg2` — o único driver instalado (ver comentário acima,
+    fix14/28-09-2026). Idempotente: uma URL já em "postgresql://" volta inalterada."""
+    if _RE_DRIVER_SUFFIX.match(url):
+        return _RE_DRIVER_SUFFIX.sub("postgresql://", url, count=1)
+    if _RE_BARE_POSTGRES.match(url):
+        return _RE_BARE_POSTGRES.sub("postgresql://", url, count=1)
+    return url
 
 
 def get_database_url() -> str:
@@ -52,7 +83,7 @@ def get_database_url() -> str:
             "responde por IPv6 e a maioria das hospedagens (incluindo Streamlit Community Cloud) não "
             "tem saída IPv6."
         )
-    return url
+    return _normalizar_driver_postgres(url.strip())
 
 
 def _create_engine():

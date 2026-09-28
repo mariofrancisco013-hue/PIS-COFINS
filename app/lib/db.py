@@ -34,34 +34,39 @@ from sqlalchemy.orm import sessionmaker
 _engine = None
 _SessionLocal = None
 
-# CORREÇÃO "ModuleNotFoundError: ... import psycopg" (produção, sessão de continuação, 28/09/2026):
-# reportado repetidas vezes em produção (Streamlit Community Cloud) mesmo depois de confirmar, em rodadas
-# anteriores desta sessão, que (a) o requirements.txt só instala `psycopg2-binary` (nunca `psycopg`, a v3),
-# e (b) a DATABASE_URL colada pelo usuário nos Secrets do painel, testada aqui localmente contra a mesma
-# versão do SQLAlchemy do requirements.txt, resolve corretamente para o dialect `psycopg2`. Ou seja: o
-# valor que o usuário CONFIRMA estar salvo não é, aparentemente, o valor que o processo publicado está de
-# fato recebendo em tempo de execução — causa exata não identificada com certeza à distância (candidatos:
-# um `.streamlit/secrets.toml` antigo commitado no repositório GitHub sobrepondo o secret do painel; cache
-# de processo não limpo por falta de reboot completo; ou alguma outra fonte de env var). Sem acesso direto
-# ao painel do Streamlit Cloud/repositório GitHub do usuário para confirmar a causa exata, a correção mais
-# robusta é tornar `get_database_url()` IMUNE a esse cenário específico, não importa a origem: normaliza
-# qualquer variante "postgres(ql)+<driver>://" para "postgresql://" puro antes de devolver a URL — forçando
-# o SQLAlchemy a sempre resolver para o dialect padrão (`psycopg2`, o único driver de fato instalado via
-# requirements.txt), mesmo que a string armazenada em algum lugar (painel, arquivo antigo, cache) ainda
-# tenha um sufixo de driver diferente (`+psycopg`, `+asyncpg`, etc.) ou o esquema antigo `postgres://`
-# (removido pelo SQLAlchemy 1.4+, mas ainda comum em connection strings copiadas de painéis antigos).
+# CORREÇÃO "ModuleNotFoundError: No module named 'psycopg'" (produção, sessão de continuação, 28/09/2026)
+# — CAUSA RAIZ REAL, confirmada pelos logs de build do Streamlit Cloud que o usuário anexou: o
+# `requirements.txt` pede `sqlalchemy>=2.0` (sem teto de versão), e o build do dia 28/09/2026 instalou
+# `sqlalchemy==2.1.1` (release lançada depois do desenvolvimento original deste projeto). A partir da 2.1,
+# o SQLAlchemy MUDOU o driver padrão de uma URL "postgresql://" pura (sem sufixo de driver) de `psycopg2`
+# para `psycopg` (v3) — confirmado isolando exatamente essa versão: `make_url("postgresql://...").
+# get_dialect()` volta `PGDialect_psycopg` (v3) na 2.1.1, mas `PGDialect_psycopg2` na 2.0.x. Como o
+# `requirements.txt` só instala `psycopg2-binary` (nunca o pacote `psycopg`, a v3), o app quebra assim que
+# o Streamlit Cloud builda com uma SQLAlchemy >= 2.1 — o que passou a acontecer no build mais recente. A
+# tentativa anterior (fix14, mesma data) normalizava a URL para "postgresql://" SEM sufixo de driver — o
+# que era suficiente contra 2.0.x (versão usada nos testes daquela rodada), mas continuou quebrado contra
+# 2.1.x, porque é exatamente esse esquema "limpo" que mudou de driver padrão. Correção definitiva: em vez
+# de normalizar para o esquema BASE (que depende do default de cada versão do SQLAlchemy), normaliza para
+# "postgresql+psycopg2://" EXPLÍCITO — nomeando o driver diretamente, o que é imune a qualquer mudança de
+# default em qualquer versão futura do SQLAlchemy, desde que `psycopg2-binary` continue instalado.
 _RE_DRIVER_SUFFIX = re.compile(r"^postgres(ql)?\+[a-zA-Z0-9_]+://", re.IGNORECASE)
 _RE_BARE_POSTGRES = re.compile(r"^postgres://", re.IGNORECASE)
+_RE_BARE_POSTGRESQL = re.compile(r"^postgresql://", re.IGNORECASE)
 
 
 def _normalizar_driver_postgres(url: str) -> str:
-    """Força o esquema da URL para "postgresql://" puro (sem sufixo de driver), garantindo que o
-    SQLAlchemy sempre resolva para o dialect `psycopg2` — o único driver instalado (ver comentário acima,
-    fix14/28-09-2026). Idempotente: uma URL já em "postgresql://" volta inalterada."""
+    """Força o esquema da URL para "postgresql+psycopg2://" EXPLÍCITO, garantindo que o SQLAlchemy sempre
+    resolva para o dialect `psycopg2` — o único driver instalado via requirements.txt — independentemente
+    de qual driver aquela versão específica do SQLAlchemy escolheria por padrão para uma URL sem sufixo
+    (ver comentário acima, fix15/28-09-2026 — a tentativa anterior, fix14, normalizava para o esquema BASE
+    sem sufixo, o que se mostrou frágil justamente por depender desse default). Idempotente: uma URL já em
+    "postgresql+psycopg2://" volta inalterada."""
     if _RE_DRIVER_SUFFIX.match(url):
-        return _RE_DRIVER_SUFFIX.sub("postgresql://", url, count=1)
+        return _RE_DRIVER_SUFFIX.sub("postgresql+psycopg2://", url, count=1)
     if _RE_BARE_POSTGRES.match(url):
-        return _RE_BARE_POSTGRES.sub("postgresql://", url, count=1)
+        return _RE_BARE_POSTGRES.sub("postgresql+psycopg2://", url, count=1)
+    if _RE_BARE_POSTGRESQL.match(url):
+        return _RE_BARE_POSTGRESQL.sub("postgresql+psycopg2://", url, count=1)
     return url
 
 

@@ -28,6 +28,7 @@ from lib.cst_regras_pc import (
     salvar_cfops_sem_checagem, listar_regras_cfop, salvar_regras_cfop, listar_regras_ncm, salvar_regras_ncm,
     listar_regras_alerta, salvar_regras_alerta,
 )
+from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual. cfop_sem_grupo não tem CST
 # associado, então fica de fora. Desde 20/08/2026 (pedido do usuário: "que esses ajustes fiquem salvos para
@@ -131,6 +132,11 @@ def _cache_regras_ncm(_session):
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
 def _cache_regras_alerta(_session):
     return [dict(r) for r in listar_regras_alerta(_session)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_ncms_lc224(_session, regime):
+    return [dict(r) for r in listar_ncms_lc224(_session, regime)]
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
@@ -565,7 +571,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                                      competencia_id)
 
 
-def _aba_regras_cst(session):
+def _aba_regras_cst(session, regime):
     st.markdown(
         "**Para que serve esta aba:** cadastro das regras de CST × CFOP/NCM usadas pelas 3 checagens "
         "automáticas do Relatório 1096 (ver aba ⚠️ Inconsistências) — antes só dava para incluir com um "
@@ -579,7 +585,9 @@ def _aba_regras_cst(session):
         "das abas Entrada/Saída (que recalcula as inconsistências daquela filial)."
     )
 
-    sub_cfop, sub_ncm, sub_alerta = st.tabs(["Por CFOP", "Por NCM", "Sempre-alerta (por CST)"])
+    sub_cfop, sub_ncm, sub_alerta, sub_lc224 = st.tabs(
+        ["Por CFOP", "Por NCM", "Sempre-alerta (por CST)", "NCMs LC 224/2025"]
+    )
 
     with sub_cfop:
         st.caption("CST esperado quando este CFOP aparecer no Relatório 1096, nesta direção (entrada/saída).")
@@ -656,6 +664,46 @@ def _aba_regras_cst(session):
             _cache_regras_alerta.clear()
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s).")
+            st.rerun()
+
+    with sub_lc224:
+        st.caption(
+            "NCMs com incidência residual de PIS/COFINS sobre produtos isentos (CST 6/7 de saída), Lei "
+            "Complementar 224/2025 — fonte da linha \"4 — Produtos Isentos com Incidência Residual\" da "
+            "Apuração (`ncms_lc224_pc`, regime='real'). Alíquotas na mesma fração decimal do cadastro (ex.: "
+            "0,001650 = 0,165%). Editar aqui substitui rodar `sql/009_ncms_lc224_pc.sql` manualmente no "
+            "Supabase. Esta lista é só do regime Real — o Lucro Presumido usa alíquotas próprias, cadastradas "
+            "na aba equivalente daquela página."
+        )
+        df_lc224 = pd.DataFrame(_cache_ncms_lc224(session, regime))
+        if df_lc224.empty:
+            df_lc224 = pd.DataFrame(
+                columns=["id", "ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at"])
+        df_lc224_editado = st.data_editor(
+            df_lc224, use_container_width=True, num_rows="dynamic", key="editor_ncms_lc224",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "ncm": st.column_config.TextColumn("NCM", required=True),
+                "aliq_pis": st.column_config.NumberColumn("Alíq. PIS", format="%.6f", required=True),
+                "aliq_cofins": st.column_config.NumberColumn("Alíq. COFINS", format="%.6f", required=True),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at", "id"],
+        )
+        st.caption(
+            "Para incluir: adicione uma linha (ícone + no final da grade) e preencha NCM + alíquotas. Para "
+            "excluir definitivamente: selecione a linha e apague (ícone de lixeira). Para só desativar sem "
+            "perder o cadastro/histórico, desmarque \"Ativo\" em vez de excluir — o cálculo só considera "
+            "linhas com Ativo marcado."
+        )
+        if st.button("💾 Salvar NCMs LC 224/2025"):
+            resultado = salvar_ncms_lc224(session, regime, df_lc224, df_lc224_editado)
+            _cache_ncms_lc224.clear()
+            st.success(f"{resultado['incluidos']} incluído(s)/atualizado(s), "
+                       f"{resultado['atualizados']} linha(s) existente(s) atualizada(s), "
+                       f"{resultado['removidos']} removido(s).")
             st.rerun()
 
 
@@ -764,7 +812,7 @@ with aba_saida:
     _aba_planilha_pc(session, competencia_id, "saida", empresa_ids_grupo, df_inc, csts_disponiveis)
 
 with aba_regras_cst:
-    _aba_regras_cst(session)
+    _aba_regras_cst(session, "real")
 
 with aba_cfop_sem_checagem:
     _aba_cfops_sem_checagem(session, filiais_grupo)

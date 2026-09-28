@@ -60,6 +60,7 @@ from lib.cst_regras_pc import (
     listar_regras_alerta, salvar_regras_alerta, registrar_inconsistencias_cst_regras,
     adicionar_regra_cfop, adicionar_regra_ncm,
 )
+from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
 from lib import lancamentos_manuais_pc as lmpc
 
 MODULO = "pis_cofins_lucro_presumido"
@@ -107,6 +108,11 @@ def _cache_regras_alerta(_session):
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
 def _cache_cfops_sem_checagem(_session, empresa_id):
     return [dict(r) for r in listar_cfops_sem_checagem(_session, empresa_id)]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
+def _cache_ncms_lc224(_session, regime):
+    return [dict(r) for r in listar_ncms_lc224(_session, regime)]
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
@@ -844,14 +850,20 @@ def _recalcular_regras_cst_grupo(session, competencia_id, empresa_ids):
         registrar_inconsistencias_cst_regras(session, competencia_id, empresa_id)
 
 
-def _aba_regras_cst(session, competencia_id, empresa_ids):
+def _aba_regras_cst(session, competencia_id, empresa_ids, regime):
     """Cópia de `2_PIS_COFINS_Lucro_Real.py::_aba_regras_cst` — as 3 tabelas de regra são globais
     (compartilhadas entre Presumido e Real), então editar aqui também vale para o Lucro Real e vice-versa.
 
     `competencia_id`/`empresa_ids` (novos parâmetros, sessão de continuação de 21/08/2026): só usados para
     recalcular as inconsistências desta competência/grupo logo após salvar uma regra — ver
     `_recalcular_regras_cst_grupo`. As regras em si continuam globais (afetam qualquer competência/regime que
-    usar aquele CFOP/NCM/CST), só o recálculo imediato é escopado à competência aberta na tela."""
+    usar aquele CFOP/NCM/CST), só o recálculo imediato é escopado à competência aberta na tela.
+
+    `regime` (novo parâmetro, sessão de continuação de 28/09/2026): usado só pela 4ª sub-aba "NCMs LC
+    224/2025" — `ncms_lc224_pc`, ao contrário das 3 tabelas de regra acima, É por regime (alíquotas
+    diferentes entre Presumido e Real), então essa sub-aba mostra/edita só o regime desta página, sem
+    recalcular inconsistências (não faz parte da checagem do 1096 — é usada direto por
+    `calcular_apuracao_pc_presumido`)."""
     st.markdown(
         "**Para que serve esta aba:** cadastro das regras de CST × CFOP/NCM usadas pela checagem automática "
         "do Relatório 1096 (ver aba ⚠️ Inconsistências) — mesmas 3 tabelas já usadas pelo Lucro Real "
@@ -865,7 +877,9 @@ def _aba_regras_cst(session, competencia_id, empresa_ids):
         "o Relatório 1096 delas for reimportado."
     )
 
-    sub_cfop, sub_ncm, sub_alerta = st.tabs(["Por CFOP", "Por NCM", "Sempre-alerta (por CST)"])
+    sub_cfop, sub_ncm, sub_alerta, sub_lc224 = st.tabs(
+        ["Por CFOP", "Por NCM", "Sempre-alerta (por CST)", "NCMs LC 224/2025"]
+    )
 
     with sub_cfop:
         st.caption("CST esperado quando este CFOP aparecer no Relatório 1096, nesta direção (entrada/saída).")
@@ -963,6 +977,46 @@ def _aba_regras_cst(session, competencia_id, empresa_ids):
             st.success(f"{resultado['incluidos']} incluída(s), {resultado['atualizados']} atualizada(s), "
                        f"{resultado['removidos']} removida(s) — inconsistências desta competência já "
                        f"recalculadas.")
+            st.rerun()
+
+    with sub_lc224:
+        st.caption(
+            "NCMs com incidência residual de PIS/COFINS sobre produtos isentos (CST 6/7 de saída), Lei "
+            "Complementar 224/2025 — fonte da linha \"3.1 — Produtos Isentos com Incidência Residual\" da "
+            "Apuração (`ncms_lc224_pc`, regime='presumido'). Alíquotas na mesma fração decimal do cadastro "
+            "(ex.: 0,000650 = 0,065%). Editar aqui substitui rodar `sql/009_ncms_lc224_pc.sql` manualmente "
+            "no Supabase. Esta lista é só do regime Presumido — o Lucro Real usa alíquotas próprias, "
+            "cadastradas na aba equivalente daquela página."
+        )
+        df_lc224 = pd.DataFrame(_cache_ncms_lc224(session, regime))
+        if df_lc224.empty:
+            df_lc224 = pd.DataFrame(
+                columns=["id", "ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at"])
+        df_lc224_editado = st.data_editor(
+            df_lc224, use_container_width=True, num_rows="dynamic", key="pres_editor_ncms_lc224",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "ncm": st.column_config.TextColumn("NCM", required=True),
+                "aliq_pis": st.column_config.NumberColumn("Alíq. PIS", format="%.6f", required=True),
+                "aliq_cofins": st.column_config.NumberColumn("Alíq. COFINS", format="%.6f", required=True),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+                "observacao": st.column_config.TextColumn("Observação (opcional)", width="large"),
+                "created_at": st.column_config.DatetimeColumn("Cadastrado em", disabled=True),
+            },
+            column_order=["ncm", "aliq_pis", "aliq_cofins", "ativo", "observacao", "created_at", "id"],
+        )
+        st.caption(
+            "Para incluir: adicione uma linha (ícone + no final da grade) e preencha NCM + alíquotas. Para "
+            "excluir definitivamente: selecione a linha e apague (ícone de lixeira). Para só desativar sem "
+            "perder o cadastro/histórico, desmarque \"Ativo\" em vez de excluir — o cálculo só considera "
+            "linhas com Ativo marcado."
+        )
+        if st.button("💾 Salvar NCMs LC 224/2025", key="pres_salvar_ncms_lc224"):
+            resultado = salvar_ncms_lc224(session, regime, df_lc224, df_lc224_editado)
+            _cache_ncms_lc224.clear()
+            st.success(f"{resultado['incluidos']} incluído(s)/atualizado(s), "
+                       f"{resultado['atualizados']} linha(s) existente(s) atualizada(s), "
+                       f"{resultado['removidos']} removido(s).")
             st.rerun()
 
 
@@ -1341,7 +1395,7 @@ with aba_conferencia:
 
 # ---------------------------------------------------------------------------------------------- Regras de CST
 with aba_regras_cst:
-    _aba_regras_cst(session, competencia_id, empresa_ids_grupo)
+    _aba_regras_cst(session, competencia_id, empresa_ids_grupo, "presumido")
 
 # --------------------------------------------------------------------------------- CFOPs sem Checagem de CST
 with aba_cfop_sem_checagem:

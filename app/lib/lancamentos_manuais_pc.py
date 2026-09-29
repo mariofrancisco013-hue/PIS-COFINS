@@ -10,7 +10,8 @@ manuais/fora do escopo do 1024/1096 documentadas em "Pontos em aberto" nas duas 
 - **Lucro Real** (`TIPOS`, alíquota cheia do regime não-cumulativo — 1,65%/7,60% pros dois lados, débito e
   crédito): 1.3 (Serviços) e 1.5 (Aluguel recebido) somam em `debito_pis_total`/`debito_cofins_total`
   (linha "1"); 5.9 (Fretes Supply Log) soma em `credito_pis_total`/`credito_cofins_total` (linha "5"), MESMO
-  padrão de Aluguéis/Depreciação já existente; 2.4/2.6 (débito) e 6.3/6.6 (crédito) são EXCLUSÕES — o valor
+  padrão de Aluguéis/Depreciação já existente; 2.4/2.6 (débito) e 6.6 (crédito) são EXCLUSÕES (6.3/IPI também
+  era, até 29/09/2026 — agora vem da Rotina 1057, ver TIPOS_DESATIVADOS) — o valor
   de PIS/COFINS calculado pra elas é SUBTRAÍDO do total do lado correspondente, não somado (ver
   `calculo_pis_cofins_lucro_real.calcular_apuracao_pc`, blocos "lançamentos manuais — exclusões").
 - **Lucro Presumido** (`TIPOS_PRESUMIDO`, alíquota cheia do regime cumulativo — 0,65%/3,00%): diferente do
@@ -49,9 +50,17 @@ TIPOS = {
     "fretes_supply_log_credito": "(5.9) Fretes SUPPLY LOG",
     "icms_substituicao_exclusao": "(2.4) (-) ICMS Substituição",
     "exportacao_debito_exclusao": "(2.6) (-) Exportação de Mercadorias para o Exterior (Débito)",
-    "ipi_exclusao": "(6.3) (-) IPI",
+    # Desativado em 29/09/2026 — "6.3" passou a vir da Rotina 1057 (ver TIPOS_DESATIVADOS abaixo). Mantido
+    # aqui só pra rotular lançamentos antigos na grade.
+    "ipi_exclusao": "(6.3) (-) IPI — desativado, vem da Rotina 1057 (ignorado no cálculo)",
     "exportacao_credito_exclusao": "(6.6) (-) Exportação de Mercadorias para o Exterior (Crédito)",
 }
+
+# Tipos que não podem mais ser lançados (continuam em TIPOS só pra exibir o histórico). "ipi_exclusao": desde
+# 29/09/2026 a linha "6.3" é calculada a partir da Rotina 1057 — o IPI já sai da base de crédito dentro do
+# "valor não tributado" do Relatório 1096, e o lançamento manual descontava o IPI uma segunda vez (o cálculo
+# ignora os lançamentos antigos desse tipo, ver TIPOS_LANCAMENTO_DESATIVADOS em calculo_pis_cofins_lucro_real).
+TIPOS_DESATIVADOS = ("ipi_exclusao",)
 
 # Lucro Presumido — separado de TIPOS (chaves próprias, sufixo "_presumido") pra não colidir com os tipos do
 # Real na mesma tabela `lancamentos_manuais_pc`; `competencia_id` já escopa pro regime certo (via
@@ -86,6 +95,8 @@ def adicionar(session, competencia_id, tipo, descricao, base_valor, usuario=None
     comportamento de sempre, retrocompatível com as chamadas existentes de Aluguéis/Depreciação)."""
     if tipo not in TIPOS and tipo not in TIPOS_PRESUMIDO:
         raise ValueError(f"Tipo de lançamento inválido: {tipo}")
+    if tipo in TIPOS_DESATIVADOS:
+        raise ValueError(f"O tipo {TIPOS[tipo]!r} não é mais lançado manualmente.")
     aliq_pis = aliq_pis if aliq_pis is not None else ALIQ_PIS
     aliq_cofins = aliq_cofins if aliq_cofins is not None else ALIQ_COFINS
     base = Decimal(str(base_valor))

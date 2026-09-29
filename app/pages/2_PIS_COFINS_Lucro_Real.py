@@ -822,13 +822,15 @@ with aba_ajustes:
     st.caption(
         "Valores de PIS/COFINS que não vêm da Rotina 1024/Relatório 1096: crédito (Aluguéis de Prédios/"
         "Máquinas, Depreciação — linhas 5.3/5.4/5.6 — e Fretes Supply Log — 5.9), débito (Serviços/Aluguel "
-        "recebido — 1.3/1.5) e exclusão (ICMS Substituição/Exportação/IPI — 2.4/2.6/6.3/6.6, reduzem o "
-        "total do lado correspondente). Informe a base do mês; o PIS (1,65%) e o COFINS (7,60%) são "
-        "calculados automaticamente, na direção certa conforme o tipo escolhido."
+        "recebido — 1.3/1.5) e exclusão (ICMS Substituição/Exportação — 2.4/2.6/6.6, reduzem o total do "
+        "lado correspondente). Informe a base do mês; o PIS (1,65%) e o COFINS (7,60%) são calculados "
+        "automaticamente, na direção certa conforme o tipo escolhido. O IPI (6.3) não é mais lançado aqui — "
+        "vem da Rotina 1057 (Importar Relatórios)."
     )
     with st.form("novo_lancamento_pc"):
         c1, c2 = st.columns(2)
-        tipo = c1.selectbox("Tipo", list(lmpc.TIPOS.keys()), format_func=lambda t: lmpc.TIPOS[t])
+        tipo = c1.selectbox("Tipo", [t for t in lmpc.TIPOS if t not in lmpc.TIPOS_DESATIVADOS],
+                            format_func=lambda t: lmpc.TIPOS[t])
         base_valor = c2.number_input("Base do mês (R$)", min_value=0.0, step=100.0, format="%.2f")
         descricao = st.text_input("Descrição", placeholder="ex: Aluguel galpão matriz — julho/2026")
         if st.form_submit_button("Adicionar", type="primary"):
@@ -970,6 +972,20 @@ with aba_apuracao:
                 cofins += totais[linha]["valor_cofins"]
         return pis, cofins
 
+    def _total_geral_creditos(totais):
+        """(pis, cofins) do crédito "de verdade" — espelha `_total_geral_debitos`: linha "5" MENOS "6.6"
+        (Exportação, lançamento manual aplicado depois que "5" fecha). Com isso, "Total Geral dos Débitos" −
+        "Total Geral dos Créditos" bate com o DARF de "11.1"/"11.2". "6.3" (IPI) NÃO entra aqui desde
+        29/09/2026: vem da Rotina 1057 e já está embutida na base da linha "5" (sai junto com a "6.4")."""
+        if "5" not in totais:
+            return None, None
+        pis = totais["5"]["valor_pis"]
+        cofins = totais["5"]["valor_cofins"]
+        if "6.6" in totais:
+            pis -= totais["6.6"]["valor_pis"]
+            cofins -= totais["6.6"]["valor_cofins"]
+        return pis, cofins
+
     def _cartao_totais(titulo, icone, cor, base, pis, cofins):
         """Cartão visual (HTML/CSS inline) para destacar a base final de uma seção e o PIS/COFINS
         calculados a partir dela — pedido do usuário: manter débito/exclusões como já estava, e só depois
@@ -1027,6 +1043,23 @@ with aba_apuracao:
             "Débito e do Crédito mostra a Base de Cálculo já líquida (bruto − ICMS excluído) e o PIS/COFINS "
             "calculados em cima dela."
         )
+        diag_1057 = ((totais.get("6.3") or {}).get("detalhe") or {}).get("ipi_1057") or {}
+        if diag_1057.get("status") == "sem_tabela":
+            st.warning("A tabela da Rotina 1057 ainda não existe no banco (rode `sql/016_relatorio_1057_pc.sql`) — "
+                       "a linha 6.3 (IPI) ficou zerada e o IPI continua dentro da 6.4. O total e o DARF não mudam.")
+        elif diag_1057.get("status") == "sem_1057":
+            st.warning("Nenhuma Rotina 1057 de Entrada importada nesta competência — a linha 6.3 (IPI) ficou zerada "
+                       "e o IPI continua dentro da 6.4 (ICMS). O total e o DARF não mudam; importe a 1057 em "
+                       "Importar Relatórios e recalcule para separar o IPI.")
+        elif diag_1057.get("empresas_com_1096_sem_1057"):
+            nomes_filiais = {f["id"]: rotulo_empresa(f) for f in filiais_grupo}
+            sem_1057 = ", ".join(nomes_filiais.get(e, f"id {e}") for e in diag_1057["empresas_com_1096_sem_1057"])
+            st.info(f"Filial(is) com Relatório 1096 de Entrada mas sem Rotina 1057: {sem_1057}. Se ela tiver IPI "
+                    f"nas entradas, importe a 1057 dela — até lá, o IPI dessa filial continua dentro da 6.4.")
+        if ((totais.get("6.3") or {}).get("detalhe") or {}).get("lancamentos_manuais_ignorados"):
+            st.info("Há lançamento manual de IPI nesta competência (aba Ajustes Manuais). Ele é ignorado no cálculo "
+                    "desde 29/09/2026 — o IPI vem da Rotina 1057 e já sai da base junto com a 6.4. Pode excluí-lo.")
+
         cab = st.columns([6, 2, 1.3])
         cab[0].markdown("**Linha**")
         cab[1].markdown("**Base**")
@@ -1057,6 +1090,11 @@ with aba_apuracao:
                 elif secao_atual == SECAO_EXCLUSOES_CREDITO and "5" in totais:
                     _cartao_totais("Base de Cálculo (líquida) — Crédito", "📥", COR_CREDITO, base_credito_liquida,
                                     totais["5"]["valor_pis"], totais["5"]["valor_cofins"])
+                    # Espelha o "Total Geral dos Débitos" do lado saída — ver `_total_geral_creditos`.
+                    pis_geral_creditos, cofins_geral_creditos = _total_geral_creditos(totais)
+                    if pis_geral_creditos is not None:
+                        _cartao_totais("Total Geral dos Créditos (5 − 6.6)", "📥", COR_CREDITO,
+                                        None, pis_geral_creditos, cofins_geral_creditos)
                 st.markdown(f"##### {SECAO_ICONE.get(secao, '')} {secao}")
                 secao_atual = secao
             destaque = nivel == 0  # linha de total da seção — negrito, sem indentação
@@ -1089,7 +1127,7 @@ with aba_apuracao:
             st.warning(
                 f"{n_pendentes_manual} linha(s) desta apuração ainda são manuais/pendentes (valor zerado) — "
                 f"ver 'Pontos em aberto' na metodologia do projeto. Se algum desses valores existir neste "
-                f"período (ex: receita de aluguel recebido, ICMS Substituição, Exportação, IPI), considere "
+                f"período (ex: receita de aluguel recebido, ICMS Substituição, Exportação), considere "
                 f"isso ao ler o resultado final."
             )
 

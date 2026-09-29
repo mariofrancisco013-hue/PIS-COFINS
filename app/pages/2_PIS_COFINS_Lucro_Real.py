@@ -946,6 +946,30 @@ with aba_apuracao:
         except Exception:
             return None
 
+    def _total_geral_debitos(totais):
+        """(pis, cofins) do débito "de verdade" — o que o motor de cálculo soma internamente em
+        `debito_pis_total`/`debito_cofins_total` antes de subtrair o crédito, mas que não tinha um cartão
+        próprio na tela: grupos de CFOP (linha "1") MENOS os lançamentos manuais de exclusão de débito
+        ("2.4" ICMS Substituição / "2.6" Exportação, se houver) MAIS Receitas Financeiras ("3") MAIS
+        Produtos Isentos LC 224/2025 ("4"). Pedido do usuário (29/09/2026, sessão de continuação): "3" e "4"
+        já tinham PIS/COFINS calculados no motor (`valor_pis`/`valor_cofins` de cada linha, salvos em
+        `apuracao_pc_linhas`) — só não apareciam na tela, que só mostrava a coluna "Base". Este total é
+        calculado aqui, na página, a partir dos valores de linha já salvos — não precisou mexer no motor de
+        cálculo (`calculo_pis_cofins_lucro_real.py`)."""
+        if "1" not in totais:
+            return None, None
+        pis = totais["1"]["valor_pis"]
+        cofins = totais["1"]["valor_cofins"]
+        for linha in ("2.4", "2.6"):
+            if linha in totais:
+                pis -= totais[linha]["valor_pis"]
+                cofins -= totais[linha]["valor_cofins"]
+        for linha in ("3", "4"):
+            if linha in totais:
+                pis += totais[linha]["valor_pis"]
+                cofins += totais[linha]["valor_cofins"]
+        return pis, cofins
+
     def _cartao_totais(titulo, icone, cor, base, pis, cofins):
         """Cartão visual (HTML/CSS inline) para destacar a base final de uma seção e o PIS/COFINS
         calculados a partir dela — pedido do usuário: manter débito/exclusões como já estava, e só depois
@@ -1015,6 +1039,21 @@ with aba_apuracao:
                 if secao_atual == SECAO_EXCLUSOES_DEBITO and "1" in totais:
                     _cartao_totais("Base de Cálculo (líquida) — Débito", "📤", COR_DEBITO, base_debito_liquida,
                                     totais["1"]["valor_pis"], totais["1"]["valor_cofins"])
+                elif secao_atual == SECAO_FINANCEIRAS and "3" in totais:
+                    # Pedido do usuário (29/09/2026): evidenciar o PIS/COFINS da linha "3" (Receitas
+                    # Financeiras, alíquota reduzida 0,65%/4%) — já calculado no motor, só faltava aparecer.
+                    _cartao_totais("Receitas Financeiras — PIS/COFINS (alíquota reduzida)", "💹", COR_DEBITO,
+                                    None, totais["3"]["valor_pis"], totais["3"]["valor_cofins"])
+                elif secao_atual == SECAO_LC224 and "4" in totais:
+                    # Idem, pedido do usuário: evidenciar o PIS/COFINS da linha "4" (LC 224/2025). Como "4" é
+                    # a última seção antes do Crédito começar, aproveita o mesmo ponto pra mostrar também o
+                    # Total Geral dos Débitos (grupos "1" − 2.4/2.6 + "3" + "4") — ver `_total_geral_debitos`.
+                    _cartao_totais("Produtos Isentos LC 224/2025 — PIS/COFINS", "⚖️", COR_DEBITO,
+                                    None, totais["4"]["valor_pis"], totais["4"]["valor_cofins"])
+                    pis_geral_debitos, cofins_geral_debitos = _total_geral_debitos(totais)
+                    if pis_geral_debitos is not None:
+                        _cartao_totais("Total Geral dos Débitos (1 − 2.4/2.6 + 3 + 4)", "📤", COR_DEBITO,
+                                        None, pis_geral_debitos, cofins_geral_debitos)
                 elif secao_atual == SECAO_EXCLUSOES_CREDITO and "5" in totais:
                     _cartao_totais("Base de Cálculo (líquida) — Crédito", "📥", COR_CREDITO, base_credito_liquida,
                                     totais["5"]["valor_pis"], totais["5"]["valor_cofins"])

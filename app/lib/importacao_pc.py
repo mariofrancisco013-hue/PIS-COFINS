@@ -16,6 +16,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from lib.cst_regras_pc import registrar_inconsistencias_cst_regras, clausula_entrada_permitida_presumido
+from lib.competencia_status_pc import exigir_competencia_aberta
 
 COLS = [
     "produto_codigo", "ncm", "cst", "cfop", "quantidade", "valor_contabil", "valor_desconto",
@@ -260,6 +261,7 @@ def importar_1096(session, empresa_id, competencia_id, arquivo_entrada=None, arq
     — não alimenta mais a apuração diretamente."""
     if not arquivo_entrada and not arquivo_saida:
         raise ValueError("Informe pelo menos um arquivo (Entrada e/ou Saída).")
+    exigir_competencia_aberta(session, competencia_id)
 
     tipos = []
     if arquivo_entrada:

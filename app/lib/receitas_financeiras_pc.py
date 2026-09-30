@@ -19,6 +19,7 @@ não uma lista de lançamentos individuais. Mesmo padrão de `saldo_credor_anter
 from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import text
+from lib.competencia_status_pc import exigir_competencia_aberta
 
 # Alíquotas reduzidas da Lei 8.426/2015 — bem diferentes das cheias (1,65%/7,60%) usadas no resto da
 # apuração e em lancamentos_manuais_pc. Mantidas aqui, não em calculo_pis_cofins_lucro_real.py, para ficarem
@@ -60,6 +61,7 @@ def salvar_receitas_financeiras(session, competencia_id, valores: dict, usuario=
     """`valores` = {tipo: novo_valor} — grava só os tipos presentes no dict (upsert por tipo). Devolve a
     base total (soma dos 6, depois de salvar) para a tela mostrar o preview de PIS/COFINS sem precisar de
     uma segunda consulta."""
+    exigir_competencia_aberta(session, competencia_id)
     usuario = usuario or {}
     for tipo, valor in valores.items():
         if tipo not in TIPOS_RECEITA_FINANCEIRA:

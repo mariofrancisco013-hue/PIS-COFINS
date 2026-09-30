@@ -40,6 +40,7 @@ from decimal import Decimal
 
 import pdfplumber
 from sqlalchemy import text
+from lib.competencia_status_pc import exigir_competencia_aberta
 
 from lib.cst_regras_pc import clausula_entrada_permitida_presumido
 
@@ -122,6 +123,7 @@ def checar_duplicacao_1024(session, competencia_id, empresa_id, substituir):
 def importar_1024(session, empresa_id, competencia_id, arquivo_pdf, substituir=False):
     """Fluxo completo pra uma filial: lê o PDF, checa duplicação, grava em resumo_1024_pc, sinaliza CFOP
     sem grupo cadastrado. Devolve uma mensagem curta pra tela."""
+    exigir_competencia_aberta(session, competencia_id)
     linhas = parse_rotina_1024(arquivo_pdf)
     removidos = checar_duplicacao_1024(session, competencia_id, empresa_id, substituir)
 

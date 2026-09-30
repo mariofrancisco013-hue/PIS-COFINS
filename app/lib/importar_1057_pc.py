@@ -21,6 +21,7 @@ import re
 import pandas as pd
 from sqlalchemy import inspect as sa_inspect, text
 
+from lib.competencia_status_pc import exigir_competencia_aberta
 from lib.formatacao import formatar_moeda
 
 COLS_ENTRADA = [
@@ -148,6 +149,7 @@ def importar_1057(session, empresa_id, competencia_id, arquivo_entrada=None, arq
     filial + tipo: substituir a Entrada de uma filial não mexe na Saída nem nas outras filiais."""
     if not arquivo_entrada and not arquivo_saida:
         raise ValueError("Informe pelo menos um arquivo (Entrada e/ou Saída).")
+    exigir_competencia_aberta(session, competencia_id)
 
     arquivos = []
     if arquivo_entrada:

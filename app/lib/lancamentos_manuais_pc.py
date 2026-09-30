@@ -32,6 +32,7 @@ sempre); quem chama do Presumido passa `ALIQ_PIS_PRESUMIDO`/`ALIQ_COFINS_PRESUMI
 from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import text
+from lib.competencia_status_pc import exigir_competencia_aberta
 
 ALIQ_PIS = Decimal("0.0165")
 ALIQ_COFINS = Decimal("0.0760")
@@ -97,6 +98,7 @@ def adicionar(session, competencia_id, tipo, descricao, base_valor, usuario=None
         raise ValueError(f"Tipo de lançamento inválido: {tipo}")
     if tipo in TIPOS_DESATIVADOS:
         raise ValueError(f"O tipo {TIPOS[tipo]!r} não é mais lançado manualmente.")
+    exigir_competencia_aberta(session, competencia_id)
     aliq_pis = aliq_pis if aliq_pis is not None else ALIQ_PIS
     aliq_cofins = aliq_cofins if aliq_cofins is not None else ALIQ_COFINS
     base = Decimal(str(base_valor))
@@ -115,7 +117,14 @@ def adicionar(session, competencia_id, tipo, descricao, base_valor, usuario=None
     return {"valor_pis": valor_pis, "valor_cofins": valor_cofins}
 
 
+def _exigir_aberta_do_lancamento(session, lancamento_id):
+    cid = session.execute(text("select competencia_id from lancamentos_manuais_pc where id = :id"),
+                          {"id": int(lancamento_id)}).scalar()
+    exigir_competencia_aberta(session, cid)
+
+
 def excluir(session, lancamento_id):
+    _exigir_aberta_do_lancamento(session, lancamento_id)
     session.execute(text("delete from lancamentos_manuais_pc where id = :id"), {"id": lancamento_id})
     session.commit()
 
@@ -130,6 +139,8 @@ def excluir_removidos(session, df_original, df_editado) -> int:
     ids_editados = set(df_editado["id"].dropna().astype(int)) if "id" in df_editado.columns and not df_editado.empty else set()
     removidos = ids_originais - ids_editados
     for lid in removidos:
+        _exigir_aberta_do_lancamento(session, lid)
+    for lid in removidos:
         session.execute(text("delete from lancamentos_manuais_pc where id = :id"), {"id": int(lid)})
     if removidos:
         session.commit()
@@ -137,6 +148,7 @@ def excluir_removidos(session, df_original, df_editado) -> int:
 
 
 def salvar_saldo_anterior(session, competencia_id, saldo_pis, saldo_cofins):
+    exigir_competencia_aberta(session, competencia_id)
     session.execute(text("""
         insert into saldo_credor_anterior_pc (competencia_id, saldo_pis, saldo_cofins, updated_at)
         values (:cid, :pis, :cofins, now())

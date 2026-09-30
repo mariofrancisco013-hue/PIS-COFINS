@@ -4,6 +4,12 @@ from sqlalchemy import text
 
 
 def classificar_status(status_calculo: str, n_pendentes: int) -> dict:
+    if status_calculo == "fechada":  # competência encerrada (migração 017) — já calculada e travada
+        return {
+            "valida": not n_pendentes, "n_pendentes": n_pendentes, "nivel": "success" if not n_pendentes else "warning",
+            "texto": "Competência encerrada." + (f" {n_pendentes} inconsistência(s) pendente(s) no encerramento."
+                                                  if n_pendentes else ""),
+        }
     if status_calculo != "calculada":
         return {
             "valida": False, "n_pendentes": n_pendentes, "nivel": "info",

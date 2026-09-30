@@ -284,6 +284,12 @@ def _dec(v):
     return Decimal(str(v)) if v is not None else Decimal("0")
 
 
+def _moeda(valor):
+    """R$ 1.234,56 — só para os textos de observação gravados no detalhe das linhas."""
+    texto = f"{Decimal(str(valor)):,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return f"R$ {texto}"
+
+
 def _pis_cofins_da_base(base):
     """(PIS, COFINS) de uma base à alíquota cheia (1,65%/7,60%) — usado nas linhas de exclusão calculadas
     (2.3/2.5/2.7 e 6.3/6.4/6.5/6.7) desde 29/09/2026, pra que "2"/"6" possam ser a soma literal dos filhos
@@ -666,36 +672,18 @@ def _normalizar_produto(v):
         return s or None
 
 
-def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos):
-    """IPI da Rotina 1057 (Entrada) que está DENTRO do `valor_nao_tributado` do Relatório 1096, por CFOP —
-    fonte da linha "6.3". NOVO em 29/09/2026 (migração 016, decisão do usuário: "o IPI vira agora da 1057").
+def _casar_ipi_1057_entrada(session, competencia_id):
+    """Casamento item a item do IPI da Rotina 1057 (Entrada) com os itens do Relatório 1096 — usado pela
+    "6.3" (`_carregar_ipi_1057_entrada_por_cfop`) e pelo relatório da escrituração (lista de itens com o IPI
+    de cada um), pra que os dois usem exatamente a mesma regra. Ver docstring da função da "6.3".
 
-    Por que "dentro do valor_nao_tributado": confirmado com os dados reais de 08/2026 (Filial 6) que, nos
-    itens de CST com crédito, `valor_nao_tributado = ICMS + IPI` (654 de 678 itens batem exato com a 1057).
-    Ou seja, `icms_correto_entrada` (que soma essa coluna) sempre tirou o IPI da base junto com o ICMS — a
-    "6.3" é só a RECLASSIFICAÇÃO dessa fatia, de dentro da "6.4" para uma linha própria. Por isso o IPI de
-    cada item é limitado ao `valor_nao_tributado` dele (em itens com dado defeituoso no Winthor o IPI às
-    vezes está fora dessa coluna — aí não saiu da base, e não pode aparecer como excluído).
-
-    Casamento 1057 × 1096 (nenhum dos dois relatórios tem chave comum de item — o 1096 não traz nº de nota):
-    por filial + código do produto + CFOP + valor (Vl.Total da 1057 = Valor Contábil do 1096, validado em
-    100% dos itens com IPI), com índice de ocorrência para desempatar repetidos. O IPI que não casar exato é
-    rateado entre as linhas ainda sem par do mesmo produto + CFOP, proporcional ao Valor Contábil (em
-    08/2026: 688 de 743 linhas exatas, 96% do valor). IPI de produto + CFOP que nem existe no 1096 fica de
-    fora da "6.3" (não dá pra saber o CST) e continua dentro da "6.4" — aparece em `diagnostico`.
-
-    Só entra na "6.3" o IPI de itens com CST FORA de `csts_excluidos`: nos itens de CST excluído (70/71/73/
-    74/98) o Valor Contábil inteiro — IPI incluso — já sai pela "6.5" (item sem direito a crédito), então o
-    IPI desses itens fica lá. O escopo de grupo (fora do catch-all "5.8") é aplicado por quem chama, com o
-    mesmo `_somar_exclusao_cst_escopada` da "6.4".
-
-    Devolve ({cfop: Decimal(ipi)}, diagnostico). Se a tabela da migração 016 ainda não existir, devolve
-    ({}, {"status": "sem_tabela"}) — a "6.3" fica zerada e o IPI continua dentro da "6.4" (total e DARF
-    iguais)."""
+    Devolve {"diag": {...}, "rows_1096": [...], "ipi_item": {id_1096: Decimal}, "pares_1057":
+    {id_1057: ("exato", id_1096) | ("rateio", None) | ("sem_par", None)}}. diag["status"] = "sem_tabela" /
+    "sem_1057" / "ok"."""
     # Checagem de existência da tabela via inspector (não via SAVEPOINT/try): o engine de produção roda em
     # AUTOCOMMIT (ver lib/db.py), onde SAVEPOINT não existe fora de bloco de transação.
     if not sa_inspect(session.get_bind()).has_table("relatorio_1057_pc"):
-        return {}, {"status": "sem_tabela"}
+        return {"diag": {"status": "sem_tabela"}, "rows_1096": [], "ipi_item": {}, "pares_1057": {}}
     rows_1057 = session.execute(text("""
         select id, empresa_id, produto_codigo, cfop, vl_total, vl_ipi
         from relatorio_1057_pc
@@ -717,7 +705,7 @@ def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos)
         "empresas_com_1096_sem_1057": sorted(e for e in empresas_1096 - empresas_1057 if e is not None),
     }
     if not rows_1057:
-        return {}, diag
+        return {"diag": diag, "rows_1096": rows_1096, "ipi_item": {}, "pares_1057": {}}
 
     def _chave_grupo(r):
         return (r["empresa_id"], _normalizar_produto(r["produto_codigo"]), int(r["cfop"]))
@@ -725,6 +713,7 @@ def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos)
     # 1) casamento exato (grupo + valor arredondado + ocorrência)
     ocorr_57, ocorr_96 = {}, {}
     ipi_por_chave_exata = {}
+    id_1057_por_chave = {}
     ipi_total_grupo = {}
     ipi_total = Decimal("0")
     for r in rows_1057:
@@ -737,8 +726,10 @@ def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos)
         ipi_total_grupo[g] = ipi_total_grupo.get(g, Decimal("0")) + ipi
         if ipi:
             ipi_por_chave_exata[(g, valor, n)] = ipi
+            id_1057_por_chave[(g, valor, n)] = r["id"]
 
     ipi_item = {}  # id do item 1096 -> IPI atribuído
+    pares_1057 = {}
     casado_grupo = {}
     sem_par_por_grupo = {}
     for r in rows_1096:
@@ -748,6 +739,7 @@ def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos)
         ocorr_96[(g, valor)] = n + 1
         if (g, valor, n) in ipi_por_chave_exata:
             ipi = ipi_por_chave_exata.pop((g, valor, n))
+            pares_1057[id_1057_por_chave[(g, valor, n)]] = ("exato", r["id"])
             ipi_item[r["id"]] = ipi
             casado_grupo[g] = casado_grupo.get(g, Decimal("0")) + ipi
         else:
@@ -757,6 +749,7 @@ def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos)
     # 2) rateio do resíduo de cada grupo entre as linhas do 1096 ainda sem par, pelo Valor Contábil
     ipi_rateado = Decimal("0")
     ipi_sem_par = Decimal("0")
+    grupos_sem_par = set()
     for g, total in ipi_total_grupo.items():
         residuo = total - casado_grupo.get(g, Decimal("0"))
         if not residuo:
@@ -765,42 +758,82 @@ def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos)
         soma = sum((_dec(r["valor_contabil"]) for r in candidatas), Decimal("0"))
         if soma <= 0:
             ipi_sem_par += residuo
+            grupos_sem_par.add(g)
             continue
         for r in candidatas:
             parte = residuo * _dec(r["valor_contabil"]) / soma
             ipi_item[r["id"]] = ipi_item.get(r["id"], Decimal("0")) + parte
             ipi_rateado += parte
 
-    # 3) por CFOP, só CST com crédito, limitado ao valor_nao_tributado do item
-    csts_exc = set(csts_excluidos)
-    por_cfop = {}
-    ipi_cst_excluido = Decimal("0")
-    ipi_fora_nao_trib = Decimal("0")
-    itens_ipi_fora_nao_trib = 0
-    for r in rows_1096:
-        ipi = ipi_item.get(r["id"])
-        if not ipi:
-            continue
-        if r["cst"] in csts_exc:
-            ipi_cst_excluido += ipi
-            continue
-        nao_trib = max(_dec(r["valor_nao_tributado"]), Decimal("0"))
-        dentro = min(ipi, nao_trib)
-        if dentro < ipi:
-            ipi_fora_nao_trib += ipi - dentro
-            itens_ipi_fora_nao_trib += 1
-        por_cfop[r["cfop"]] = por_cfop.get(r["cfop"], Decimal("0")) + dentro
+    for r in rows_1057:
+        if _dec(r["vl_ipi"]) and r["id"] not in pares_1057:
+            pares_1057[r["id"]] = ("sem_par", None) if _chave_grupo(r) in grupos_sem_par else ("rateio", None)
 
     diag.update({
         "ipi_total_1057": str(ipi_total),
         "ipi_casado_exato": str(ipi_exato),
         "ipi_rateado": str(ipi_rateado.quantize(Decimal("0.01"))),
         "ipi_sem_par_no_1096": str(ipi_sem_par),
-        "ipi_em_cst_excluido": str(ipi_cst_excluido.quantize(Decimal("0.01"))),
-        "ipi_fora_do_nao_tributado": str(ipi_fora_nao_trib.quantize(Decimal("0.01"))),
-        "itens_ipi_fora_do_nao_tributado": itens_ipi_fora_nao_trib,
     })
-    return {cfop: v.quantize(Decimal("0.01")) for cfop, v in por_cfop.items()}, diag
+    return {"diag": diag, "rows_1096": rows_1096, "ipi_item": ipi_item, "pares_1057": pares_1057}
+
+
+def _carregar_ipi_1057_entrada_por_cfop(session, competencia_id, csts_excluidos):
+    """IPI da Rotina 1057 (Entrada) que está DENTRO do `valor_nao_tributado` do Relatório 1096, por CFOP —
+    fonte da linha "6.3". NOVO em 29/09/2026 (migração 016, decisão do usuário: "o IPI vira agora da 1057").
+
+    Por que "dentro do valor_nao_tributado": confirmado com os dados reais de 08/2026 (Filial 6) que, nos
+    itens de CST com crédito, `valor_nao_tributado = ICMS + IPI` (654 de 678 itens batem exato com a 1057).
+    Ou seja, `icms_correto_entrada` (que soma essa coluna) sempre tirou o IPI da base junto com o ICMS — a
+    "6.3" é só a RECLASSIFICAÇÃO dessa fatia, de dentro da "6.4" para uma linha própria. Por isso o IPI de
+    cada item é limitado ao `valor_nao_tributado` dele (em itens com dado defeituoso no Winthor o IPI às
+    vezes está fora dessa coluna — aí não saiu da base, e não pode aparecer como excluído).
+
+    Casamento 1057 × 1096 (nenhum dos dois relatórios tem chave comum de item — o 1096 não traz nº de nota):
+    por filial + código do produto + CFOP + valor (Vl.Total da 1057 = Valor Contábil do 1096, validado em
+    100% dos itens com IPI), com índice de ocorrência para desempatar repetidos. O IPI que não casar exato é
+    rateado entre as linhas ainda sem par do mesmo produto + CFOP, proporcional ao Valor Contábil (em
+    08/2026: 688 de 743 linhas exatas, 96% do valor). IPI de produto + CFOP que nem existe no 1096 fica de
+    fora da "6.3" (não dá pra saber o CST) e continua dentro da "6.4" — aparece em `diagnostico`.
+
+    REVISADO no mesmo dia (pedido do usuário: "deixar ele evidente no IPI e tirar dos demais, deixando só a
+    observação"): a "6.3" passa a juntar TODO o IPI que está dentro de alguma linha de "6" — não só o da
+    "6.4". Por isso a função devolve o IPI por CFOP separado pelo tipo de item, e quem chama tira cada fatia
+    da linha certa (escopo de grupo aplicado lá):
+      - "credito_limitado": itens de CST com crédito, IPI limitado ao `valor_nao_tributado` do item — sai da
+        "6.4" (que soma essa coluna);
+      - "credito_bruto": os mesmos itens sem o limite — usado no grupo "5.8", cuja "6.7" é o Valor Contábil
+        bruto (IPI inteiro dentro);
+      - "excluido": itens de CST 70/71/73/74/98 — sai da "6.5" (Valor Contábil inteiro do item, IPI incluso).
+
+    Devolve ({"credito_limitado": {cfop: ipi}, "credito_bruto": {...}, "excluido": {...}}, diagnostico). Se
+    a tabela da migração 016 ainda não existir, devolve ({}, {"status": "sem_tabela"}) — a "6.3" fica
+    zerada e o IPI continua dentro das outras linhas (total e DARF iguais)."""
+    casamento = _casar_ipi_1057_entrada(session, competencia_id)
+    if casamento["diag"]["status"] != "ok":
+        return {}, casamento["diag"]
+    rows_1096, ipi_item, diag = casamento["rows_1096"], casamento["ipi_item"], casamento["diag"]
+
+    # 3) por CFOP, separado pelo tipo de item (ver docstring)
+    csts_exc = set(csts_excluidos)
+    por_tipo = {"credito_limitado": {}, "credito_bruto": {}, "excluido": {}}
+
+    def _somar(tipo, cfop, valor):
+        por_tipo[tipo][cfop] = por_tipo[tipo].get(cfop, Decimal("0")) + valor
+
+    for r in rows_1096:
+        ipi = ipi_item.get(r["id"])
+        if not ipi:
+            continue
+        if r["cst"] in csts_exc:
+            _somar("excluido", r["cfop"], ipi)
+            continue
+        nao_trib = max(_dec(r["valor_nao_tributado"]), Decimal("0"))
+        _somar("credito_limitado", r["cfop"], min(ipi, nao_trib))
+        _somar("credito_bruto", r["cfop"], ipi)
+
+    return ({tipo: {cfop: v.quantize(Decimal("0.01")) for cfop, v in d.items()} for tipo, d in por_tipo.items()},
+            diag)
 
 
 def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
@@ -1238,20 +1271,41 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     GRUPOS_CREDITO_SEM_CATCHALL = GRUPOS_CREDITO.keys() - {"5.8"}
     cst_excluido_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO_SEM_CATCHALL, exclusao_cst_entrada)
     icms_correto_escopado_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO_SEM_CATCHALL, icms_correto_entrada)
-    # "6.3" (IPI) — 29/09/2026, migração 016: IPI da Rotina 1057 que está DENTRO do `valor_nao_tributado`
-    # usado em `icms_correto_entrada`, no mesmo escopo da "6.4" (grupos não-catch-all, CST com crédito). É
-    # tirado da "6.4" (reclassificação): "6.3" + "6.4" = `icms_correto_escopado_entrada`, exatamente o mesmo
-    # valor que sai da base — a base líquida, a linha "5" e o total "6" não mudam por causa disso.
-    ipi_1057_entrada_por_cfop, diag_ipi_1057 = _carregar_ipi_1057_entrada_por_cfop(
+    # "6.3" (IPI) — 29/09/2026, migração 016 + revisão do mesmo dia (pedido do usuário: "deixar ele evidente
+    # no IPI e tirar dos demais, deixando só a observação"). O IPI da Rotina 1057 já estava DENTRO das outras
+    # linhas de "6" — "6.4" (valor_nao_tributado = ICMS + IPI), "6.5" (Valor Contábil inteiro do item de CST
+    # sem crédito) e "6.7" (Valor Contábil bruto do grupo "5.8"). Cada fatia é tirada da linha onde estava e
+    # somada na "6.3" (reclassificação): 6.3 + 6.4 + 6.5 + 6.7 continua igual, e a base líquida, a linha "5",
+    # o total "6" e o DARF não mudam. As linhas de onde o IPI saiu ganham uma `observacao` com o valor.
+    ipi_1057_entrada, diag_ipi_1057 = _carregar_ipi_1057_entrada_por_cfop(
         session, competencia_id, CSTS_EXCLUSAO_ENTRADA)
-    ipi_escopado_entrada = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO_SEM_CATCHALL,
-                                                        ipi_1057_entrada_por_cfop)
-    icms_excluido_entrada = icms_correto_escopado_entrada - ipi_escopado_entrada
-    # "6.7" (Outras Entradas, grupo "5.8") — fix13: mesma mudança de "2.5" (ver nota lá), espelhada. Passa a
-    # ser o valor BRUTO do grupo "5.8" (`base_bruta_5_8_entrada`, capturado no loop acima).
+    ipi_da_64 = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO_SEM_CATCHALL,
+                                             ipi_1057_entrada.get("credito_limitado", {}))
+    ipi_da_65 = _somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO_SEM_CATCHALL,
+                                             ipi_1057_entrada.get("excluido", {}))
+    # CFOPs que compõem o bruto do "5.8" (mesmo conjunto usado em `_base_por_grupo`: Rotina 1024 + fallback
+    # de CFOP ausente + override usa_base_1096).
+    cfops_5_8_entrada = ({r["cfop"] for r in resumo_1024 if r["tipo_operacao"] == "entrada" and r["grupo"] == "5.8"}
+                         | set(fallback_1096_entrada_58)
+                         | {cfop for cfop, (g, _v) in override_1096_entrada.items() if g == "5.8"})
+    ipi_da_67 = sum((v for tipo in ("credito_bruto", "excluido")
+                     for cfop, v in ipi_1057_entrada.get(tipo, {}).items() if cfop in cfops_5_8_entrada),
+                    Decimal("0"))
+    ipi_escopado_entrada = ipi_da_64 + ipi_da_65 + ipi_da_67
+    # IPI de itens de CST com crédito que NÃO está dentro do valor_nao_tributado (dado defeituoso no Winthor:
+    # esse IPI não saiu da base, então não pode ir pra "6.3") — só informativo.
+    ipi_fora_da_base = (_somar_exclusao_cst_escopada("entrada", GRUPOS_CREDITO_SEM_CATCHALL,
+                                                     ipi_1057_entrada.get("credito_bruto", {}))
+                        - ipi_da_64)
+    icms_excluido_entrada = icms_correto_escopado_entrada - ipi_da_64
+    cst_excluido_entrada_sem_ipi = cst_excluido_entrada - ipi_da_65
+    # "6.7" (Outras Entradas, grupo "5.8") — fix13: mesma mudança de "2.5" (ver nota lá), espelhada. É o valor
+    # BRUTO do grupo "5.8" (`base_bruta_5_8_entrada`, capturado no loop acima) — menos o IPI desse grupo, que
+    # desde 29/09/2026 aparece na "6.3".
     outras_nao_trib_entrada = base_bruta_5_8_entrada
-    # Exclusões EMBUTIDAS na base líquida dos grupos de CFOP (6.3 + 6.4 + 6.5 + 6.7) — é o que a checagem
-    # "5" − "6" usa. O total exibido em "6" soma também "6.6" (lançamento manual), ver abaixo.
+    outras_entrada_sem_ipi = base_bruta_5_8_entrada - ipi_da_67
+    # Exclusões EMBUTIDAS na base líquida dos grupos de CFOP (6.3 + 6.4 + 6.5 + 6.7 — o IPI só muda de linha,
+    # então é o mesmo valor de antes da "6.3") — é o que a checagem "5" − "6" usa. O total exibido em "6" soma também "6.6" (lançamento manual), ver abaixo.
     total_exclusoes_credito = icms_correto_escopado_entrada + outras_nao_trib_entrada + cst_excluido_entrada
 
     # lançamentos manuais (aluguéis, depreciação) — não têm ICMS pra excluir, bruto = líquido
@@ -1302,20 +1356,34 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         cofins_exclusao_credito += soma_cofins
     ipi_manual_ignorado = [l for l in lancamentos if l["tipo"] in TIPOS_LANCAMENTO_DESATIVADOS]
 
+    def _obs_ipi(valor):
+        return (f"IPI de {_moeda(valor)} destes itens está na linha 6.3 (Rotina 1057) — valor já descontado "
+                f"daqui.") if valor else None
+
+    obs_63 = None
+    if ipi_escopado_entrada:
+        partes = [f"{_moeda(v)} vindos da {l}" for l, v in (("6.4", ipi_da_64), ("6.5", ipi_da_65), ("6.7", ipi_da_67)) if v]
+        obs_63 = "IPI da Rotina 1057 que estava dentro das outras exclusões: " + "; ".join(partes) + "."
+        if ipi_fora_da_base > 0:
+            obs_63 += (f" {_moeda(ipi_fora_da_base)} de IPI da 1057 ficaram de fora: nesses itens o IPI não "
+                       f"está na coluna \"não tributado\" do 1096 (dado do Winthor), ou seja, não saiu da base.")
     pis_63, cofins_63 = _pis_cofins_da_base(ipi_escopado_entrada)
     linha_63 = LinhaApuracaoPC("6.3", "(-) IPI", pis_63, cofins_63, detalhe={
         "base_total": str(ipi_escopado_entrada),
+        "observacao": obs_63,
         "fonte": "rotina_1057",
-        "ipi_1057": diag_ipi_1057,
+        "ipi_1057": {**diag_ipi_1057, "ipi_da_6_4": str(ipi_da_64), "ipi_da_6_5": str(ipi_da_65),
+                     "ipi_da_6_7": str(ipi_da_67), "ipi_fora_da_base": str(ipi_fora_da_base)},
         "lancamentos_manuais_ignorados": [
             {"descricao": l["descricao"], "base": str(l["base_valor"])} for l in ipi_manual_ignorado],
         "nota": "FONTE (29/09/2026, migração 016): IPI da Rotina 1057 (Entrada), casado item a item com o "
-                "Relatório 1096 por filial + produto + CFOP + valor, só dos itens com CST com crédito e fora "
-                "do grupo \"5.8\" — mesmo escopo da \"6.4\". Esse IPI já estava dentro da coluna \"valor não "
-                "tributado\" do 1096 (= ICMS + IPI nesses itens), ou seja, sempre saiu da base junto com o "
-                "ICMS: esta linha só o separa da \"6.4\" (\"6.3\" + \"6.4\" = o que sai da base). Não é mais "
-                "lançamento manual — lançamentos antigos do tipo IPI são ignorados (descontavam o IPI uma "
-                "segunda vez). PIS/COFINS = base × 1,65%/7,60% (informativo, já embutido na linha \"5\").",
+                "Relatório 1096 por filial + produto + CFOP + valor. Esse IPI já estava dentro das outras "
+                "exclusões de crédito — \"6.4\" (coluna \"valor não tributado\" do 1096 = ICMS + IPI nos itens "
+                "com crédito), \"6.5\" (Valor Contábil inteiro dos itens de CST sem crédito) e \"6.7\" (Valor "
+                "Contábil bruto do grupo \"5.8\") — e é tirado de cada uma delas pra aparecer só aqui (pedido "
+                "do usuário: deixar o IPI evidente e só uma observação nas demais). 6.3+6.4+6.5+6.7 não muda. "
+                "Não é mais lançamento manual — lançamentos antigos do tipo IPI são ignorados (descontavam o "
+                "IPI uma segunda vez). PIS/COFINS = base × 1,65%/7,60% (informativo, já embutido na linha \"5\").",
     })
     pis_64, cofins_64 = _pis_cofins_da_base(icms_excluido_entrada)
     linha_64 = LinhaApuracaoPC(
@@ -1329,29 +1397,35 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
                     "\"6.3\" e descontado daqui, então \"6.4\" fica só com o ICMS. ESCOPO (fix12): CFOPs "
                     "presentes na Rotina 1024 desta competência, grupos de crédito NÃO-catch-all "
                     "(\"5.1\"/\"5.2\"/\"5.5\"/\"5.7\" — \"5.8\" é coberto inteiro por \"6.7\").",
+            "observacao": _obs_ipi(ipi_da_64),
             "icms_destacado_entrada_total": str(icms_excluido_entrada),
             "icms_mais_ipi_1096": str(icms_correto_escopado_entrada),
         },
     )
-    pis_65, cofins_65 = _pis_cofins_da_base(cst_excluido_entrada)
+    pis_65, cofins_65 = _pis_cofins_da_base(cst_excluido_entrada_sem_ipi)
     linha_65 = LinhaApuracaoPC(
         "6.5", "(-) Entradas com CST 70/71/73/74/98 (sem direito a crédito/isenção/sem incidência)",
         pis_65, cofins_65, manual=False,
         detalhe={
-            "base_total": str(cst_excluido_entrada),
+            "base_total": str(cst_excluido_entrada_sem_ipi),
+            "observacao": _obs_ipi(ipi_da_65),
+            "valor_contabil_com_ipi": str(cst_excluido_entrada),
             "nota": "Valor Contábil (todas as filiais) dos itens do Relatório 1096 com CST 70, 71, 73, 74 ou 98 "
-                    "— sem direito a crédito de PIS/COFINS (o IPI desses itens, se houver, sai aqui junto com o "
-                    "item inteiro). Só CFOPs presentes na Rotina 1024 desta competência, grupos de crédito "
+                    "— sem direito a crédito de PIS/COFINS — menos o IPI desses itens, que desde 29/09/2026 "
+                    "aparece na \"6.3\" (Rotina 1057). Só CFOPs presentes na Rotina 1024 desta competência, grupos de crédito "
                     "NÃO-catch-all (\"5.8\" é coberto inteiro por \"6.7\" — fix12, espelha \"2.7\").",
         },
     )
-    pis_67, cofins_67 = _pis_cofins_da_base(outras_nao_trib_entrada)
+    pis_67, cofins_67 = _pis_cofins_da_base(outras_entrada_sem_ipi)
     linha_67 = LinhaApuracaoPC(
         "6.7", "(-) Outras Entradas (grupo \"5.8\")", pis_67, cofins_67, manual=False,
         detalhe={
-            "base_total": str(outras_nao_trib_entrada),
+            "base_total": str(outras_entrada_sem_ipi),
+            "observacao": _obs_ipi(ipi_da_67),
+            "bruto_grupo_5_8": str(outras_nao_trib_entrada),
             "nota": "FONTE (fix13, 24/09/2026 — espelha \"2.5\"): valor BRUTO do grupo \"5.8\" "
-                    "(`base_bruta_5_8_entrada`) — garante \"5.8\" = \"6.7\" sempre, por construção. Os CFOPs "
+                    "(`base_bruta_5_8_entrada`) menos o IPI desse grupo, que desde 29/09/2026 aparece na "
+                    "\"6.3\" — \"5.8\" = \"6.7\" + IPI do grupo. Os CFOPs "
                     "1407 e 1912 contam inteiros aqui como não tributados (decisão do usuário, 29/09/2026 — no "
                     "1096 de 08/2026 eles vinham com CST 70 e valor tributado/colunas zeradas, defeito de dado "
                     "do Winthor).",
@@ -1363,9 +1437,9 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
         "6", "Total das Exclusões (crédito)", [linha_63, linha_64, linha_65, linha_66, linha_67],
         "\"6\" = soma literal de \"6.3\" (IPI, Rotina 1057) + \"6.4\" (ICMS) + \"6.5\" (CST sem crédito) + "
         "\"6.6\" (Exportação, lançamento manual) + \"6.7\" (grupo \"5.8\") — base, PIS e COFINS (regra do "
-        "usuário, 29/09/2026: total = soma de todos os filhos). Bases disjuntas: 6.3/6.4 só itens de CST com "
-        "crédito fora do \"5.8\", 6.5 só CST sem crédito fora do \"5.8\", 6.7 só o \"5.8\", 6.6 vem de "
-        "lançamento manual. Validado com dados reais de 08/2026: \"6\" = soma da coluna \"valor não "
+        "usuário, 29/09/2026: total = soma de todos os filhos). Bases disjuntas: 6.4 só ICMS de itens de CST "
+        "com crédito fora do \"5.8\", 6.5 só CST sem crédito fora do \"5.8\", 6.7 só o \"5.8\" — cada uma "
+        "SEM o IPI, que fica todo na 6.3 —, 6.6 vem de lançamento manual. Validado com dados reais de 08/2026: \"6\" = soma da coluna \"valor não "
         "tributado\" do 1096 (F6+F59) + CFOPs 1407/1912 considerados inteiros como não tributados.",
     ))
     # Checagem de consistência (fix13): "5" (base bruta) − exclusões EMBUTIDAS na base (6.3+6.4+6.5+6.7) =
@@ -1423,6 +1497,8 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
 
 def salvar_apuracao_pc(session, competencia_id: int, linhas: list[LinhaApuracaoPC]):
     import json
+    from lib.competencia_status_pc import exigir_competencia_aberta
+    exigir_competencia_aberta(session, competencia_id)
     for l in linhas:
         session.execute(text("""
             insert into apuracao_pc_linhas

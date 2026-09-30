@@ -29,6 +29,8 @@ from lib.cst_regras_pc import (
     listar_regras_alerta, salvar_regras_alerta,
 )
 from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
+from lib.competencia_status_pc import competencia_fechada
+from lib import encerramento_pc
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual. cfop_sem_grupo não tem CST
 # associado, então fica de fora. Desde 20/08/2026 (pedido do usuário: "que esses ajustes fiquem salvos para
@@ -285,7 +287,8 @@ def _card_inconsistencia(session, row, csts_disponiveis, key_prefix, competencia
                 "Observação (opcional)", key=f"{key_prefix}_obs_ajuste_{row['id']}"
             )
             rotulo_botao = "✅ Aplicar CST corrigido e recalcular" if seguro else "Registrar ajuste (só histórico)"
-            if st.button(rotulo_botao, key=f"{key_prefix}_ajustar_{row['id']}"):
+            if st.button(rotulo_botao, key=f"{key_prefix}_ajustar_{row['id']}",
+                         disabled=globals().get("COMPETENCIA_FECHADA", False)):
                 if seguro:
                     resultado = aplicar_ajuste_cst(
                         session, row["id"], cst_corrigido, observacao_ajuste or None, usuario_atual(),
@@ -502,7 +505,7 @@ def _aba_planilha_pc(session, competencia_id, tipo_operacao, empresa_ids, df_inc
                 "valor_nao_tributado": coluna_moeda("Valor Não Tributado"),
             },
         )
-        if st.button("💾 Salvar alterações", key=f"salvar_pc_{tipo_operacao}"):
+        if st.button("💾 Salvar alterações", key=f"salvar_pc_{tipo_operacao}", disabled=COMPETENCIA_FECHADA):
             n, empresas_afetadas = planilha_pc.salvar_itens_editados(
                 session, df, editado, competencia_id=competencia_id, tipo_operacao=tipo_operacao,
                 usuario=usuario_atual(),
@@ -782,6 +785,12 @@ comp_row = session.execute(text("select status from competencias where id = :id"
 status = status_competencia(session, competencia_id, comp_row["status"])
 getattr(st, status["nivel"])(status["texto"])
 
+# Competência encerrada (29/09/2026, migração 017) — trava tudo que grava; ver lib/competencia_status_pc.py.
+COMPETENCIA_FECHADA = competencia_fechada(session, competencia_id)
+if COMPETENCIA_FECHADA:
+    st.info("🔒 Competência encerrada — os valores estão travados no relatório da escrituração. Para alterar "
+            "alguma coisa, reabra a competência na aba 📋 Apuração.")
+
 filiais_grupo = _cache_listar_filiais_grupo(session, grupo["cnpj_raiz"])
 empresa_ids_grupo = [f["id"] for f in filiais_grupo]
 
@@ -817,6 +826,102 @@ with aba_regras_cst:
 with aba_cfop_sem_checagem:
     _aba_cfops_sem_checagem(session, filiais_grupo)
 
+# ---------------------------------------------------------------------------------------------- Encerramento
+@st.cache_data(show_spinner=False, max_entries=6)
+def _cache_arquivos_escrituracao(competencia_id, versao):
+    """Arquivos gravados no encerramento — em cache por (competência, versão), que nunca mudam depois de
+    gravados, pra não baixar ~2 MB do banco a cada interação da tela."""
+    return encerramento_pc.arquivos(get_session(), competencia_id, versao)
+
+
+def _botoes_download(competencia_id, versao, chave):
+    arqs = _cache_arquivos_escrituracao(competencia_id, versao)
+    if not arqs:
+        st.error("Arquivos desta versão não encontrados.")
+        return
+    c1, c2 = st.columns(2)
+    c1.download_button("📄 Relatório da escrituração (PDF)", arqs["pdf"], file_name=arqs["nome_pdf"],
+                       mime="application/pdf", key=f"dl_pdf_{chave}", use_container_width=True)
+    c2.download_button("📎 Anexo — memória de cálculo (Excel)", arqs["xlsx"], file_name=arqs["nome_xlsx"],
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key=f"dl_xlsx_{chave}", use_container_width=True)
+
+
+def _secao_encerramento(session, competencia_id, calculada):
+    """Encerrar a competência e exportar o relatório da escrituração (PDF + Excel anexo). Pedido do usuário
+    (29/09/2026): "criar um botão para exportar o relatório da escrituração daquele período encerrado", com
+    tudo que levou ao DARF. Ver lib/encerramento_pc.py e lib/escrituracao_pc.py."""
+    st.markdown("---")
+    st.markdown("##### 🔒 Encerramento e relatório da escrituração")
+    if not encerramento_pc.tabelas_prontas(session):
+        st.warning("Falta rodar `sql/017_encerramento_escrituracao_pc.sql` no SQL Editor do Supabase para "
+                   "habilitar o encerramento e o relatório da escrituração.")
+        return
+    versoes = encerramento_pc.versoes(session, competencia_id)
+    usuario = (usuario_atual() or {}).get("email")
+
+    if COMPETENCIA_FECHADA:
+        atual = versoes[0] if versoes else None
+        if atual:
+            st.success(
+                f"Competência encerrada — relatório versão {atual['versao']}, gerado em "
+                f"{atual['gerado_em'].astimezone().strftime('%d/%m/%Y %H:%M') if hasattr(atual['gerado_em'], 'astimezone') else atual['gerado_em']}"
+                f"{' por ' + atual['gerado_por'] if atual.get('gerado_por') else ''}. DARF: PIS "
+                f"{formatar_moeda(atual['pis_darf'])} • COFINS {formatar_moeda(atual['cofins_darf'])}."
+            )
+            _botoes_download(competencia_id, atual["versao"], "atual")
+        if len(versoes) > 1:
+            with st.expander(f"Versões anteriores ({len(versoes) - 1})"):
+                for v in versoes[1:]:
+                    st.caption(f"Versão {v['versao']} — DARF PIS {formatar_moeda(v['pis_darf'])} • COFINS "
+                               f"{formatar_moeda(v['cofins_darf'])} — {v.get('gerado_por') or ''}")
+                    _botoes_download(competencia_id, v["versao"], f"v{v['versao']}")
+        with st.expander("Reabrir competência"):
+            st.caption("Reabrir libera importações, ajustes e recálculo. O relatório desta versão continua "
+                       "gravado; ao encerrar de novo, é gerada a versão seguinte.")
+            motivo = st.text_area("Motivo da reabertura", key="motivo_reabrir")
+            if st.button("🔓 Reabrir competência", disabled=not (motivo or "").strip()):
+                encerramento_pc.reabrir_competencia(session, competencia_id, usuario, motivo)
+                st.rerun()
+        hist = encerramento_pc.historico(session, competencia_id)
+        if hist:
+            with st.expander("Histórico de encerramentos"):
+                st.dataframe(pd.DataFrame(hist).rename(columns={"acao": "Ação", "usuario": "Usuário",
+                                                                "motivo": "Motivo", "em": "Quando"}),
+                             hide_index=True, use_container_width=True)
+        return
+
+    st.caption(
+        "Encerrar recalcula a apuração uma última vez, gera o relatório da escrituração — PDF com a memória de "
+        "cálculo até o DARF e o Excel anexo com as consolidações e todos os itens — e trava a competência "
+        "(importações, ajustes e recálculo). O relatório fica gravado e pode ser baixado a qualquer momento."
+    )
+    if not calculada:
+        st.info("Calcule a apuração antes de encerrar.")
+        return
+    n_pend = status.get("n_pendentes") or 0
+    if n_pend:
+        st.warning(f"Há {n_pend} inconsistência(s) pendente(s). Elas não impedem o encerramento e vão listadas "
+                   f"no relatório, mas vale revisar antes.")
+    confirma = st.checkbox("Conferi os valores do DARF e quero encerrar esta competência", key="confirma_encerrar")
+    if st.button("🔒 Encerrar competência e gerar escrituração", type="primary", disabled=not confirma):
+        with st.spinner("Recalculando e gerando o relatório (PDF + Excel)..."):
+            try:
+                res = encerramento_pc.encerrar_competencia(session, competencia_id, usuario)
+            except ValueError as e:
+                st.error(str(e))
+                return
+        _cache_arquivos_escrituracao.clear()
+        st.session_state["msg_encerramento"] = res
+        st.rerun()
+    if versoes:
+        with st.expander(f"Relatórios de encerramentos anteriores ({len(versoes)})"):
+            for v in versoes:
+                st.caption(f"Versão {v['versao']} — DARF PIS {formatar_moeda(v['pis_darf'])} • COFINS "
+                           f"{formatar_moeda(v['cofins_darf'])}")
+                _botoes_download(competencia_id, v["versao"], f"ant{v['versao']}")
+
+
 # ---------------------------------------------------------------------------------------------- Ajustes Manuais
 with aba_ajustes:
     st.caption(
@@ -833,7 +938,7 @@ with aba_ajustes:
                             format_func=lambda t: lmpc.TIPOS[t])
         base_valor = c2.number_input("Base do mês (R$)", min_value=0.0, step=100.0, format="%.2f")
         descricao = st.text_input("Descrição", placeholder="ex: Aluguel galpão matriz — julho/2026")
-        if st.form_submit_button("Adicionar", type="primary"):
+        if st.form_submit_button("Adicionar", type="primary", disabled=COMPETENCIA_FECHADA):
             if not descricao.strip():
                 st.error("Informe uma descrição.")
             elif base_valor <= 0:
@@ -854,7 +959,8 @@ with aba_ajustes:
         df_original = pd.DataFrame(lancamentos)
         df_original["tipo"] = df_original["tipo"].map(lmpc.TIPOS)
         df_editado = st.data_editor(
-            df_original, use_container_width=True, hide_index=True, num_rows="dynamic",
+            df_original, use_container_width=True, hide_index=True,
+            num_rows="fixed" if COMPETENCIA_FECHADA else "dynamic",
             disabled=["id", "tipo", "descricao", "base_valor", "valor_pis", "valor_cofins", "created_at"],
             column_config={
                 "base_valor": coluna_moeda("Base"), "valor_pis": coluna_moeda("PIS"),
@@ -879,7 +985,7 @@ with aba_ajustes:
                                        step=10.0, format="%.2f")
     saldo_cofins_input = c2.number_input("Saldo Credor de COFINS do período anterior",
                                           value=float(saldo_atual["saldo_cofins"]), step=10.0, format="%.2f")
-    if st.button("Salvar saldo anterior"):
+    if st.button("Salvar saldo anterior", disabled=COMPETENCIA_FECHADA):
         lmpc.salvar_saldo_anterior(session, competencia_id, saldo_pis_input, saldo_cofins_input)
         st.success("Saldo anterior salvo.")
         st.rerun()
@@ -900,7 +1006,7 @@ with aba_ajustes:
                 rotulo, value=float(valores_fin_atuais[tipo]), step=100.0, format="%.2f",
                 key=f"rf_{tipo}",
             )
-        salvar_fin = st.form_submit_button("💾 Salvar Receitas Financeiras")
+        salvar_fin = st.form_submit_button("💾 Salvar Receitas Financeiras", disabled=COMPETENCIA_FECHADA)
     base_preview = sum((Decimal(str(v)) for v in novos_valores.values()), Decimal("0"))
     pis_preview, cofins_preview = calcular_pis_cofins_financeiras(base_preview)
     st.caption(
@@ -915,11 +1021,19 @@ with aba_ajustes:
 
 # ---------------------------------------------------------------------------------------------- Apuração
 with aba_apuracao:
-    if st.button("🔄 Calcular apuração", type="primary"):
+    if st.button("🔄 Calcular apuração", type="primary", disabled=COMPETENCIA_FECHADA,
+                 help="Competência encerrada — reabra para recalcular." if COMPETENCIA_FECHADA else None):
         linhas = calcular_apuracao_pc(session, competencia_id)
         salvar_apuracao_pc(session, competencia_id, linhas)
         st.success("Apuração calculada.")
         st.rerun()
+
+    res_enc = st.session_state.pop("msg_encerramento", None)
+    if res_enc:
+        st.success(f"Competência encerrada — relatório versão {res_enc['versao']} gerado. Baixe o PDF e o Excel "
+                   f"anexo no fim desta aba.")
+        for c in res_enc.get("conferencias_com_diferenca") or []:
+            st.warning(f"Conferência com diferença no relatório: {c['descricao']} ({formatar_moeda(c['diferenca'])}).")
 
     linhas_salvas = session.execute(text("""
         select linha, descricao, valor_pis, valor_cofins, manual, detalhe
@@ -1107,6 +1221,12 @@ with aba_apuracao:
                                     unsafe_allow_html=True)
             linha_cols[1].markdown(f"{abre}{base_txt}{fecha}")
             linha_cols[2].markdown("⏳ pendente" if r["manual"] else "✅")
+            # Observação gravada pelo motor no detalhe da linha (ex.: "IPI de R$ X destes itens está na 6.3") —
+            # pedido do usuário (29/09/2026): o IPI aparece só na 6.3, e as linhas de onde ele saiu ficam só
+            # com a observação.
+            observacao = (r["detalhe"] or {}).get("observacao") if isinstance(r["detalhe"], dict) else None
+            if observacao:
+                st.caption(f"{indent}{indent}ℹ️ {observacao}", unsafe_allow_html=True)
 
         st.markdown("---")
         if "11.3" in totais:
@@ -1130,6 +1250,8 @@ with aba_apuracao:
                 f"período (ex: receita de aluguel recebido, ICMS Substituição, Exportação), considere "
                 f"isso ao ler o resultado final."
             )
+
+    _secao_encerramento(session, competencia_id, bool(linhas_salvas))
 
 # ---------------------------------------------------------------------------------------------- Conferência
 with aba_conferencia:

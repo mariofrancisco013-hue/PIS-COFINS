@@ -10,6 +10,7 @@ from lib.formatacao import rotulo_empresa
 from lib import importacao_pc
 from lib.importar_1024_pc import importar_1024
 from lib.importar_1057_pc import importar_1057, contagem_por_filial
+from lib.competencia_status_pc import competencia_fechada
 from lib.theme_sodine import inject_main_theme
 
 st.set_page_config(page_title="Importar Relatórios", layout="wide")
@@ -56,6 +57,11 @@ mes = col3.number_input("Mês", min_value=1, max_value=12, value=7, step=1)
 
 status_filiais, competencia_id = importacao_pc.status_filiais_grupo(session, grupo["cnpj_raiz"], ano, mes,
                                                                       modulo=modulo)
+# Competência encerrada (migração 017) — importação travada até reabrir na aba Apuração.
+fechada = competencia_fechada(session, competencia_id)
+if fechada:
+    st.info("🔒 Esta competência está encerrada — importações bloqueadas. Para importar de novo, reabra a "
+            "competência na aba 📋 Apuração da página PIS/COFINS.")
 # Rotina 1057 (29/09/2026) — contagem à parte (tabela da migração 016). None = tabela ainda não existe.
 contagem_1057 = contagem_por_filial(session, competencia_id) if competencia_id else {}
 for f in status_filiais:
@@ -104,7 +110,7 @@ with aba_1024:
         st.info("Esta filial já tem Rotina 1024 importada neste período — marque 'substituir' para "
                 "reimportar (PDF corrigido).")
 
-    if st.button("Importar Rotina 1024", type="primary", disabled=not arq_1024):
+    if st.button("Importar Rotina 1024", type="primary", disabled=not arq_1024 or fechada):
         with st.spinner("Lendo PDF..."):
             try:
                 cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes, modulo=modulo)
@@ -133,7 +139,7 @@ with aba_1096:
         value=False, disabled=not ja_tem_1096, key="sub_1096",
     )
 
-    if st.button("Importar Relatório 1096", type="primary", disabled=not (arq_entrada or arq_saida)):
+    if st.button("Importar Relatório 1096", type="primary", disabled=not (arq_entrada or arq_saida) or fechada):
         with st.spinner("Importando..."):
             try:
                 cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes, modulo=modulo)
@@ -170,7 +176,7 @@ with aba_1057:
     )
 
     if st.button("Importar Rotina 1057", type="primary",
-                 disabled=not (arq_1057_entrada or arq_1057_saida) or contagem_1057 is None):
+                 disabled=not (arq_1057_entrada or arq_1057_saida) or contagem_1057 is None or fechada):
         with st.spinner("Importando..."):
             try:
                 cid = importacao_pc.get_or_create_competencia_grupo(session, grupo["cnpj_raiz"], ano, mes, modulo=modulo)

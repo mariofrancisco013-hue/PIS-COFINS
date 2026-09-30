@@ -41,6 +41,7 @@ mais dois complementos, ver sql/006_planilha_editavel_pc.sql:
 """
 import pandas as pd
 from sqlalchemy import text
+from lib.competencia_status_pc import exigir_competencia_aberta
 
 from lib.calculo_pis_cofins_lucro_presumido import CFOPS_1_2_DEVOLUCAO_VENDA
 
@@ -496,6 +497,7 @@ def aplicar_ajuste_cst(session, inconsistencia_id, cst_corrigido, observacao=Non
     """), {"id": inconsistencia_id}).mappings().first()
     if row is None:
         raise ValueError("Inconsistência não encontrada.")
+    exigir_competencia_aberta(session, row["competencia_id"])
     if not escopo_ajuste_seguro(row):
         raise ValueError(
             "Esta inconsistência não tem um CFOP ou NCM específico associado (o mesmo CST aparece em itens "

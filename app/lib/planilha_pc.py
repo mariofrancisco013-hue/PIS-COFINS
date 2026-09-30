@@ -28,6 +28,7 @@ naquele outro fluxo.
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
+from lib.competencia_status_pc import exigir_competencia_aberta
 
 COLUNAS_EDITAVEIS = [
     "id", "produto_codigo", "ncm", "cfop", "quantidade", "valor_contabil", "valor_desconto", "valor_itens",
@@ -271,6 +272,7 @@ def salvar_itens_editados(session, df_original, df_editado, competencia_id, tipo
     quando recalcular (ver `recalcular_inconsistencias_apos_edicao` mais abaixo), porque recalcular é uma
     operação por filial e esta função não sabe quais filiais tiveram itens alterados até terminar o loop.
     Retorna (n_atualizados, {empresa_ids que tiveram pelo menos um item alterado})."""
+    exigir_competencia_aberta(session, competencia_id)
     if df_original.empty:
         return 0, set()
     orig = df_original.set_index("id")

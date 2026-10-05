@@ -146,17 +146,45 @@ def get_session():
     NÃO precisou tocar nenhuma página (`Home.py`, `2_PIS_COFINS_Lucro_Real.py` incluído) — a correção é só
     aqui dentro, e não muda nenhuma query nem resultado, só QUANDO a conexão é devolvida ao pool."""
     try:
+        import threading
         import streamlit as st
-        if "_db_session" not in st.session_state or st.session_state["_db_session"] is None:
-            st.session_state["_db_session"] = sessionmaker(bind=get_engine())()
+        # CORREÇÃO "InvalidRequestError: This session is provisioning a new connection; concurrent operations
+        # are not permitted" (produção, 05/10/2026, ao importar o Relatório 1096): com `runner.fastReruns`
+        # (padrão do Streamlit), um rerun da mesma aba NÃO espera o anterior acabar — o Streamlit pede para o
+        # ScriptRunner antigo parar e já cria OUTRO, numa thread nova. O pedido de parada só vale no próximo
+        # comando `st.*`, então se o run antigo estiver no meio de uma operação longa de banco (ex.: gravar os
+        # ~35 mil itens do 1096), as duas threads usam a MESMA Session guardada em st.session_state ao mesmo
+        # tempo — o que o SQLAlchemy não permite. Agora há uma Session por THREAD de execução (ainda dentro
+        # do st.session_state da aba, então continua no máximo 1 conexão por run ativo), e as Sessions de
+        # threads que já terminaram são fechadas aqui, na próxima chamada — nunca enquanto ainda estão em uso.
+        sessoes = st.session_state.get("_db_sessions")
+        if sessoes is None:
+            sessoes = {}
+            st.session_state["_db_sessions"] = sessoes
+            antiga = st.session_state.pop("_db_session", None)  # formato anterior (uma por aba)
+            if antiga is not None:
+                try:
+                    antiga.close()
+                except Exception:
+                    pass
+        vivas = {t.ident for t in threading.enumerate()}
+        for tid in [t for t in sessoes if t not in vivas]:
+            try:
+                sessoes.pop(tid).close()
+            except Exception:
+                sessoes.pop(tid, None)
+        tid = threading.get_ident()
+        sessao = sessoes.get(tid)
+        if sessao is None:
+            sessao = sessoes[tid] = sessionmaker(bind=get_engine())()
         else:
             try:
-                st.session_state["_db_session"].rollback()
+                sessao.rollback()
             except Exception:
                 # Sessão realmente morta (ex.: conexão caiu e pool_pre_ping não deu conta) -- descarta e
                 # cria uma nova, em vez de propagar erro de uma sessão zumbi pro resto da página.
-                st.session_state["_db_session"] = sessionmaker(bind=get_engine())()
-        return st.session_state["_db_session"]
+                sessao = sessoes[tid] = sessionmaker(bind=get_engine())()
+        return sessao
     except Exception:
         pass
     global _SessionLocal

@@ -974,7 +974,7 @@ with aba_ajustes:
     st.caption(
         "Valores de PIS/COFINS que não vêm da Rotina 1024/Relatório 1096: crédito (Aluguéis de Prédios/"
         "Máquinas, Depreciação — linhas 5.3/5.4/5.6 — e Fretes Supply Log — 5.9), débito (Serviços/Aluguel "
-        "recebido — 1.3/1.5) e exclusão (ICMS Substituição/Exportação — 2.4/2.6/6.6, reduzem o total do "
+        "recebido — 1.3/1.5; Demais Operações — soma dentro da linha 1.6) e exclusão (ICMS Substituição/Exportação — 2.4/2.6/6.6, reduzem o total do "
         "lado correspondente). Informe a base do mês; o PIS (1,65%) e o COFINS (7,60%) são calculados "
         "automaticamente, na direção certa conforme o tipo escolhido. O IPI (6.3) não é mais lançado aqui — "
         "vem da Rotina 1057 (Importar Relatórios)."

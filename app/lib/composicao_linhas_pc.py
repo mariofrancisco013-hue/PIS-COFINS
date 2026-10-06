@@ -218,6 +218,13 @@ def montar_composicao(session, competencia_id):
                         l["icms"], l["cst"] = ic, cs
                     l["liquida"] = vc - ic - cs
                 linhas.append(l)
+            # ajuste manual somado dentro do grupo (fix27 — "1.6 Demais Operações")
+            if tipo == "saida" and grupo != catchall:
+                for aj in ((gravadas.get(grupo) or {}).get("detalhe") or {}).get("ajustes_manuais") or []:
+                    base_aj = _d(aj.get("base"))
+                    linhas.append({"cfop": "—", "descricao": f"Ajuste manual: {aj.get('descricao') or ''}",
+                                   "filial": "—", "origem": "Lançamento manual", "contabil": base_aj,
+                                   "icms": ZERO, "cst": ZERO, "liquida": base_aj})
             if grupo == catchall:
                 lin_exc = "6.7" if tipo == "entrada" else "2.5"
                 colunas = [COL_CFOP, COL_DESC, COL_FILIAL, COL_ORIGEM, ("contabil", "Valor contábil", "moeda")]

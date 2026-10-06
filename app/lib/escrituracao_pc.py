@@ -286,6 +286,16 @@ def montar_escrituracao(session, competencia_id, usuario=None, versao=None):
                         linha["cst"] = cst
                 linha["pis"], linha["cofins"] = calc._pis_cofins_da_base(linha["liquido"])
                 consolidacao[tipo].append(linha)
+            # ajuste manual somado dentro do grupo (fix27 — "1.6 Demais Operações")
+            if tipo == "saida" and grupo != catchall:
+                for aj in (T.get(grupo, {}).get("detalhe") or {}).get("ajustes_manuais") or []:
+                    base_aj = _d(aj.get("base"))
+                    pis_aj, cofins_aj = calc._pis_cofins_da_base(base_aj)
+                    consolidacao[tipo].append({
+                        "grupo": grupo, "grupo_desc": grupos[grupo], "cfop": None,
+                        "descricao": f"Ajuste manual: {aj.get('descricao') or ''}", "fonte": "Lançamento manual",
+                        "contabil": base_aj, "ipi": ZERO, "icms": ZERO, "cst": ZERO, "outras": ZERO,
+                        "liquido": base_aj, "pis": pis_aj, "cofins": cofins_aj})
 
     # ---- itens do 1096 com a linha da apuração
     ncms_lc224 = calc._carregar_ncms_lc224(session)
@@ -419,6 +429,7 @@ def montar_escrituracao(session, competencia_id, usuario=None, versao=None):
     # ---- lançamentos, receitas financeiras
     linha_por_tipo = {**{k: v[0] for k, v in calc.LANCAMENTO_TIPO_PARA_LINHA.items()},
                       **{k: v[0] for k, v in calc.LANCAMENTO_TIPO_PARA_LINHA_DEBITO.items()},
+                      **dict(calc.LANCAMENTO_TIPO_PARA_GRUPO_DEBITO),
                       **{k: v[0] for k, v in calc.LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_DEBITO.items()},
                       **{k: v[0] for k, v in calc.LANCAMENTO_TIPO_PARA_LINHA_EXCLUSAO_CREDITO.items()}}
     lancamentos = []

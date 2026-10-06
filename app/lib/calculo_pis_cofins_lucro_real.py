@@ -194,6 +194,13 @@ LANCAMENTO_TIPO_PARA_LINHA_DEBITO = {
     "servicos_debito": ("1.3", "Faturamento Bruto (Prestação de Serviços)"),
     "aluguel_recebido_debito": ("1.5", "Receitas de Aluguel de Bens"),
 }
+# Lançamentos manuais que somam DENTRO de um grupo de CFOP já existente (não viram linha própria) — 06/10/2026
+# (fix27, migração 018): "ajuste manual que ao ser adicionado vá para o item 1.6 Demais Operações". A base
+# soma no bruto E no líquido do grupo (sem exclusão de ICMS/CST), e o PIS/COFINS do grupo é recalculado sobre
+# o líquido total. A linha ganha uma observação com o valor; a composição (🔍) lista cada ajuste.
+LANCAMENTO_TIPO_PARA_GRUPO_DEBITO = {
+    "demais_operacoes_debito": "1.6",
+}
 
 # Lançamentos manuais que SUBTRAEM do total do lado deles (exclusões sem CFOP/grupo próprio na Rotina 1024 —
 # diferente de 2.3/2.5/2.7/6.4/6.5/6.7, que já saem embutidas na base líquida de cada grupo de CFOP, estas
@@ -914,12 +921,28 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
     debito_base_bruta_total = Decimal("0")   # soma de Valor Contábil (antes de excluir o ICMS)
     debito_base_liquida_total = Decimal("0")  # = base bruta - ICMS - Outras - CST 6/7 — é o que vira PIS/COFINS
     base_bruta_1_4_saida = Decimal("0")  # capturado dentro do loop abaixo — ver fix13, alimenta só "2.5"
+    # Ajustes manuais somados dentro de um grupo de débito (fix27 — hoje só "1.6", ver
+    # LANCAMENTO_TIPO_PARA_GRUPO_DEBITO).
+    ajustes_grupo_debito = {}
+    if LANCAMENTO_TIPO_PARA_GRUPO_DEBITO:
+        tipos_aj = list(LANCAMENTO_TIPO_PARA_GRUPO_DEBITO)
+        for l in session.execute(text(f"""
+            select tipo, descricao, base_valor from lancamentos_manuais_pc
+            where competencia_id = :cid and tipo in ({", ".join(f":t{i}" for i in range(len(tipos_aj)))})
+            order by id
+        """), {"cid": competencia_id, **{f"t{i}": t for i, t in enumerate(tipos_aj)}}).mappings().all():
+            ajustes_grupo_debito.setdefault(LANCAMENTO_TIPO_PARA_GRUPO_DEBITO[l["tipo"]], []).append(l)
     for grupo, descricao in GRUPOS_DEBITO.items():
         override_deste_grupo = {cfop: v for cfop, (g, v) in override_1096_saida.items() if g == grupo}
         fallback_deste_grupo = fallback_1096_saida_14 if grupo == "1.4" else None
         base_bruta, base_liquida, det = _base_por_grupo(resumo_1024, "saida", grupo, exclusao_cst_saida,
                                                           icms_correto_saida, override_deste_grupo,
                                                           fallback_deste_grupo)
+        ajustes = ajustes_grupo_debito.get(grupo, [])
+        ajuste_total = sum((_dec(l["base_valor"]) for l in ajustes), Decimal("0"))
+        if ajustes and grupo != "1.4":  # o catch-all tem base líquida zerada; ajuste não é mapeado para lá
+            base_bruta += ajuste_total
+            base_liquida += ajuste_total
         if grupo == "1.4":
             # "1.4 Outras Saídas" (catch-all de CFOP da Rotina 1024) — pedido do usuário em 19/08/2026, 2ª
             # revisão: o grupo "1.4" inteiro é excluído da base líquida (base_liquida = 0, não gera PIS/
@@ -930,11 +953,19 @@ def calcular_apuracao_pc(session, competencia_id: int) -> list[LinhaApuracaoPC]:
             base_bruta_1_4_saida = base_bruta  # fix13: "2.5" passa a ser exatamente este valor
         soma_pis = (base_liquida * ALIQ_PIS).quantize(Decimal("0.01"))
         soma_cofins = (base_liquida * ALIQ_COFINS).quantize(Decimal("0.01"))
-        linhas.append(LinhaApuracaoPC(grupo, descricao, soma_pis, soma_cofins, detalhe={
+        detalhe_grupo = {
             "base_total": str(base_bruta),
             "base_liquida": str(base_liquida),
             "base_por_cfop": {str(k): str(v) for k, v in det.items()},
-        }))
+        }
+        if ajustes and grupo != "1.4":
+            detalhe_grupo["ajuste_manual_total"] = str(ajuste_total)
+            detalhe_grupo["ajustes_manuais"] = [{"descricao": l["descricao"], "base": str(l["base_valor"])}
+                                                for l in ajustes]
+            detalhe_grupo["observacao"] = (
+                f"Inclui {_moeda(ajuste_total)} de ajuste manual ({len(ajustes)} lançamento(s) na aba Ajustes "
+                f"Manuais) — somado no bruto e na base líquida, sem exclusões.")
+        linhas.append(LinhaApuracaoPC(grupo, descricao, soma_pis, soma_cofins, detalhe=detalhe_grupo))
         debito_pis_total += soma_pis
         debito_cofins_total += soma_cofins
         debito_base_bruta_total += base_bruta

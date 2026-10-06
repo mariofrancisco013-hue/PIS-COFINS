@@ -490,7 +490,7 @@ def gerar_pdf(dados, nome_anexo) -> bytes:
                 sub = [x for x in linhas_c if x["grupo"] == grupo_atual]
                 rows_.append({"valores": [grupo_atual, "", c["grupo_desc"]] +
                               [_br(sum((x[k] for x in sub), ZERO)) for _c, k in cols if k], "b": 1})
-            rows_.append({"valores": ["", str(c["cfop"]), c.get("descricao") or ""] +
+            rows_.append({"valores": ["", "" if c["cfop"] is None else str(c["cfop"]), c.get("descricao") or ""] +
                           [_br(c[k]) for _c, k in cols if k]})
             for _c, k in cols:
                 if k:

@@ -48,6 +48,8 @@ TIPOS = {
     # (LAYOUT_LINHAS em calculo_pis_cofins_lucro_real.py).
     "servicos_debito": "(1.3) Faturamento Bruto (Prestação de Serviços)",
     "aluguel_recebido_debito": "(1.5) Receitas de Aluguel de Bens",
+    # 06/10/2026 (fix27, migração 018) — soma DENTRO da linha 1.6 (bruto e líquido), não é linha própria.
+    "demais_operacoes_debito": "(1.6) Demais Operações — ajuste manual",
     "fretes_supply_log_credito": "(5.9) Fretes SUPPLY LOG",
     "icms_substituicao_exclusao": "(2.4) (-) ICMS Substituição",
     "exportacao_debito_exclusao": "(2.6) (-) Exportação de Mercadorias para o Exterior (Débito)",
@@ -62,6 +64,9 @@ TIPOS = {
 # "valor não tributado" do Relatório 1096, e o lançamento manual descontava o IPI uma segunda vez (o cálculo
 # ignora os lançamentos antigos desse tipo, ver TIPOS_LANCAMENTO_DESATIVADOS em calculo_pis_cofins_lucro_real).
 TIPOS_DESATIVADOS = ("ipi_exclusao",)
+
+# Tipos que só aceitam base positiva (decisão do usuário, 06/10/2026: o ajuste do 1.6 só acrescenta).
+TIPOS_SOMENTE_POSITIVO = ("demais_operacoes_debito",)
 
 # Lucro Presumido — separado de TIPOS (chaves próprias, sufixo "_presumido") pra não colidir com os tipos do
 # Real na mesma tabela `lancamentos_manuais_pc`; `competencia_id` já escopa pro regime certo (via
@@ -102,6 +107,8 @@ def adicionar(session, competencia_id, tipo, descricao, base_valor, usuario=None
     aliq_pis = aliq_pis if aliq_pis is not None else ALIQ_PIS
     aliq_cofins = aliq_cofins if aliq_cofins is not None else ALIQ_COFINS
     base = Decimal(str(base_valor))
+    if tipo in TIPOS_SOMENTE_POSITIVO and base <= 0:
+        raise ValueError("Informe uma base maior que zero.")
     valor_pis = _arred(base * aliq_pis)
     valor_cofins = _arred(base * aliq_cofins)
     usuario = usuario or {}

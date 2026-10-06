@@ -31,6 +31,7 @@ from lib.cst_regras_pc import (
 from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
 from lib.competencia_status_pc import competencia_fechada
 from lib import encerramento_pc
+from lib.composicao_linhas_pc import LINHAS_COM_COMPOSICAO, montar_composicao
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual. cfop_sem_grupo não tem CST
 # associado, então fica de fora. Desde 20/08/2026 (pedido do usuário: "que esses ajustes fiquem salvos para
@@ -78,6 +79,52 @@ def _cache_listar_filiais_grupo(_session, cnpj_raiz):
 def _cache_csts_disponiveis(_session):
     rows = _session.execute(text("select codigo, descricao from cst_pis_cofins order by codigo")).mappings().all()
     return [dict(r) for r in rows]
+
+
+@st.cache_data(ttl=_TTL_LEITURA, show_spinner="Montando a composição…")
+def _cache_composicao(_session, competencia_id, calculado_em):
+    # `calculado_em` só entra na chave: recalcular a apuração gera uma composição nova na hora (fix25).
+    return montar_composicao(_session, competencia_id)
+
+
+def _mostrar_composicao(c):
+    """Composição CFOP × filial de uma linha (fix25) — logo abaixo da linha, ao clicar no 🔍."""
+    with st.container(border=True):
+        st.markdown(f"**🔍 Composição — {c['titulo']}**")
+        st.caption(c["explicacao"])
+
+        def _df(linhas, colunas):
+            df = pd.DataFrame([{rot: l.get(chave) for chave, rot, _t in colunas} for l in linhas],
+                              columns=[rot for _c, rot, _t in colunas])
+            for _chave, rot, tipo in colunas:
+                if tipo == "moeda":
+                    df[rot] = df[rot].apply(lambda v: "—" if v is None else formatar_moeda(v))
+                elif tipo == "aliq":
+                    df[rot] = df[rot].apply(lambda v: "—" if v is None else f"{float(v):.3f}%".replace(".", ","))
+                elif tipo == "txt":
+                    df[rot] = df[rot].apply(lambda v: "" if v is None else str(v))
+            return df
+
+        if c["linhas"]:
+            st.dataframe(_df(c["linhas"], c["colunas"]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Nada compõe esta linha nesta competência.")
+        if c["valor_gravado"] is None:
+            st.caption(f"Total da composição: **{formatar_moeda(c['total'])}**")
+        elif c["bate"]:
+            st.markdown(f"Total: **{formatar_moeda(c['total'])}** — ✔ bate com o valor da linha.")
+        else:
+            st.warning(f"Total da composição {formatar_moeda(c['total'])} ≠ valor da linha "
+                       f"{formatar_moeda(c['valor_gravado'])} (diferença {formatar_moeda(c['diferenca'])}). Algo foi "
+                       f"importado ou alterado depois do último cálculo — clique em **Calcular apuração**.")
+        if c.get("aviso"):
+            st.info(c["aviso"])
+        if c.get("fora") is not None:
+            st.markdown("**Fora da apuração** — CFOPs importados que não entram em nenhuma linha")
+            if c["fora"]:
+                st.dataframe(_df(c["fora"], c["colunas_fora"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhum CFOP ficou de fora.")
 
 
 @st.cache_data(ttl=_TTL_LEITURA, show_spinner=False)
@@ -1174,7 +1221,15 @@ with aba_apuracao:
             st.info("Há lançamento manual de IPI nesta competência (aba Ajustes Manuais). Ele é ignorado no cálculo "
                     "desde 29/09/2026 — o IPI vem da Rotina 1057 e já sai da base junto com a 6.4. Pode excluí-lo.")
 
-        cab = st.columns([6, 2, 1.3])
+        # Composição (fix25): botão 🔍 por linha abre o detalhe CFOP × filial logo abaixo dela.
+        calculado_em = session.execute(text(
+            "select max(calculado_em) from apuracao_pc_linhas where competencia_id = :cid"),
+            {"cid": competencia_id}).scalar()
+        comp_abertas = st.session_state.setdefault(f"comp_abertas_{competencia_id}", set())
+        composicao = (_cache_composicao(session, competencia_id, str(calculado_em)) if comp_abertas else {})
+
+        st.caption("Clique em 🔍 numa linha para ver o que compõe o valor (CFOP × filial, com a origem).")
+        cab = st.columns([6, 2, 1.3, 0.6])
         cab[0].markdown("**Linha**")
         cab[1].markdown("**Base**")
         cab[2].markdown("**Situação**")
@@ -1216,17 +1271,33 @@ with aba_apuracao:
             abre, fecha = ("**", "**") if destaque else ("", "")
             base = _base_da_linha(r["detalhe"])
             base_txt = formatar_moeda(base) if base is not None else "—"
-            linha_cols = st.columns([6, 2, 1.3])
+            linha_cols = st.columns([6, 2, 1.3, 0.6])
             linha_cols[0].markdown(f"{indent}{abre}{r['linha']} — {r['descricao']}{fecha}",
                                     unsafe_allow_html=True)
             linha_cols[1].markdown(f"{abre}{base_txt}{fecha}")
             linha_cols[2].markdown("⏳ pendente" if r["manual"] else "✅")
+            tem_composicao = r["linha"] in LINHAS_COM_COMPOSICAO and (
+                not r["manual"] or r["valor_pis"] or r["valor_cofins"])
+            if tem_composicao:
+                aberta = r["linha"] in comp_abertas
+                if linha_cols[3].button("✖" if aberta else "🔍", key=f"comp_{competencia_id}_{r['linha']}",
+                                        help="Fechar composição" if aberta else "Ver composição desta linha"):
+                    if aberta:
+                        comp_abertas.discard(r["linha"])
+                    else:
+                        comp_abertas.add(r["linha"])
+                    st.rerun()
             # Observação gravada pelo motor no detalhe da linha (ex.: "IPI de R$ X destes itens está na 6.3") —
             # pedido do usuário (29/09/2026): o IPI aparece só na 6.3, e as linhas de onde ele saiu ficam só
             # com a observação.
             observacao = (r["detalhe"] or {}).get("observacao") if isinstance(r["detalhe"], dict) else None
             if observacao:
                 st.caption(f"{indent}{indent}ℹ️ {observacao}", unsafe_allow_html=True)
+            if tem_composicao and r["linha"] in comp_abertas:
+                if r["linha"] in composicao:
+                    _mostrar_composicao(composicao[r["linha"]])
+                else:
+                    st.caption("Sem composição para esta linha nesta competência.")
 
         st.markdown("---")
         if "11.3" in totais:

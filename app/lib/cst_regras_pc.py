@@ -370,6 +370,22 @@ def _checar_alerta(session, competencia_id, empresa_id):
 
 
 # --------------------------------------------------------------------------------------- Revisão / aprendizado
+def _nativo(v, tipo):
+    """None para vazio/NaN; senão o valor convertido para int/str nativo do Python (psycopg2 não sabe gravar
+    numpy.int64, e NaN não cabe em coluna integer)."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if tipo is int:
+        return int(v)
+    v = str(v).strip()
+    return v or None
+
+
 def registrar_revisao(session, inconsistencia_id, empresa_id, tipo, chave_agrupamento, ncm, cfop,
                        tipo_operacao, novo_status, justificativa, replicar, usuario=None):
     """Revisa/ignora um grupo de inconsistência (ou só salva a justificativa, sem mudar status, se
@@ -380,6 +396,13 @@ def registrar_revisao(session, inconsistencia_id, empresa_id, tipo, chave_agrupa
     if replicar and not (justificativa or "").strip():
         raise ValueError("Para replicar nas próximas apurações, escreva a justificativa antes.")
 
+    # fix26 (06/10/2026): os valores chegam de uma linha de DataFrame (iterrows) — CFOP/NCM vazios viram NaN
+    # (float) e os inteiros viram numpy.int64. NaN num campo integer quebrava o insert da exceção
+    # ("NumericValueOutOfRange" ao justificar com "replicar" um grupo sem CFOP, ex.: CST × NCM / alerta).
+    inconsistencia_id, empresa_id = _nativo(inconsistencia_id, int), _nativo(empresa_id, int)
+    cfop = _nativo(cfop, int)
+    ncm, tipo, chave_agrupamento, tipo_operacao = (_nativo(v, str) for v in (ncm, tipo, chave_agrupamento,
+                                                                                tipo_operacao))
     usuario = usuario or {}
     status_final = novo_status  # None = mantém o status atual, só atualiza a justificativa
     if status_final:

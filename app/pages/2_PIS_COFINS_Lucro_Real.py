@@ -32,6 +32,8 @@ from lib.ncms_lc224_pc import listar_ncms_lc224, salvar_ncms_lc224
 from lib.competencia_status_pc import competencia_fechada
 from lib import encerramento_pc
 from lib.composicao_linhas_pc import LINHAS_COM_COMPOSICAO, montar_composicao
+from lib import contabilizacao_pc
+from lib.contabilizacao_pc import codigo_filial as codigo_filial_pc
 
 # Tipos de inconsistência que carregam um CST passível de ajuste manual. cfop_sem_grupo não tem CST
 # associado, então fica de fora. Desde 20/08/2026 (pedido do usuário: "que esses ajustes fiquem salvos para
@@ -894,6 +896,72 @@ def _botoes_download(competencia_id, versao, chave):
                        key=f"dl_xlsx_{chave}", use_container_width=True)
 
 
+def _secao_contabilizacao(session, competencia_id, filiais, cnpj_raiz):
+    """Exportação dos lançamentos contábeis (fix28) — Receitas Financeiras, Aluguéis e Depreciação no layout
+    da planilha de importação do Winthor. Ver lib/contabilizacao_pc.py."""
+    st.markdown("---")
+    st.markdown("##### 📤 Lançamentos contábeis (importação)")
+    if not contabilizacao_pc.tabela_pronta(session):
+        st.warning("Rode `sql/019_contabilizacao_pc.sql` no Supabase para habilitar a exportação dos lançamentos.")
+        return
+    st.caption("Gera a planilha de importação com PIS/COFINS de Receitas Financeiras (3), Aluguéis (5.3 + 5.4) e "
+               "Depreciação (5.6), com as contas abaixo. Cada evento sai em 4 linhas: D PIS, D COFINS, C PIS, "
+               "C COFINS, com a data do último dia da competência.")
+    opcoes = {codigo_filial_pc(f["filial_winthor"]): rotulo_empresa(f) for f in filiais if f.get("filial_winthor")}
+    if not opcoes:
+        st.info("Nenhuma filial com código do Winthor cadastrado neste grupo.")
+        return
+    filial = st.selectbox("Filial dos lançamentos (coluna L)", list(opcoes), format_func=lambda k: opcoes[k],
+                          key=f"contab_filial_{competencia_id}")
+    try:
+        dados = contabilizacao_pc.montar_lancamentos(session, competencia_id, filial)
+    except ValueError as e:
+        st.error(str(e))
+        return
+    for a in dados["avisos"]:
+        st.warning(a)
+    st.dataframe(pd.DataFrame([{"Evento": r["evento"], "PIS": formatar_moeda(r["pis"]),
+                                "COFINS": formatar_moeda(r["cofins"]), "Situação": r["situacao"]}
+                               for r in dados["resumo"]]), use_container_width=True, hide_index=True)
+    if dados["linhas"]:
+        with st.expander(f"Prévia do arquivo ({len(dados['linhas'])} linhas)"):
+            st.dataframe(pd.DataFrame([{**l, "G": formatar_moeda(l["G"])} for l in dados["linhas"]]),
+                         use_container_width=True, hide_index=True)
+        st.download_button("📤 Exportar lançamentos (Excel)", data=contabilizacao_pc.gerar_xlsx(dados),
+                           file_name=contabilizacao_pc.nome_arquivo(dados, cnpj_raiz),
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           type="primary", key=f"contab_dl_{competencia_id}_{filial}")
+    else:
+        st.info("Nada a exportar nesta competência (eventos sem valor).")
+
+    with st.expander("⚙️ Contas contábeis da exportação"):
+        contas = contabilizacao_pc.listar_contas(session)
+        rotulos = {k: v[0] for k, v in contabilizacao_pc.EVENTOS.items()}
+        df_contas = pd.DataFrame(contas)
+        editado = st.data_editor(
+            df_contas, hide_index=True, use_container_width=True, key="contab_contas_editor",
+            disabled=["evento"],
+            column_config={
+                "evento": st.column_config.TextColumn("Evento"),
+                "conta_debito_pis": st.column_config.NumberColumn("D PIS", format="%d", step=1),
+                "conta_debito_cofins": st.column_config.NumberColumn("D COFINS", format="%d", step=1),
+                "conta_credito_pis": st.column_config.NumberColumn("C PIS", format="%d", step=1),
+                "conta_credito_cofins": st.column_config.NumberColumn("C COFINS", format="%d", step=1),
+                "historico_pis": st.column_config.TextColumn("Histórico PIS"),
+                "historico_cofins": st.column_config.TextColumn("Histórico COFINS"),
+                "cod_historico": st.column_config.NumberColumn("Cód. hist.", format="%d", step=1),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+            })
+        st.caption("Eventos: " + "; ".join(f"{k} = {v}" for k, v in rotulos.items()) + ".")
+        if st.button("💾 Salvar contas", key="contab_salvar_contas"):
+            try:
+                contabilizacao_pc.salvar_contas(session, editado.to_dict("records"))
+                st.success("Contas salvas.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+
 def _secao_encerramento(session, competencia_id, calculada):
     """Encerrar a competência e exportar o relatório da escrituração (PDF + Excel anexo). Pedido do usuário
     (29/09/2026): "criar um botão para exportar o relatório da escrituração daquele período encerrado", com
@@ -1323,6 +1391,7 @@ with aba_apuracao:
             )
 
     _secao_encerramento(session, competencia_id, bool(linhas_salvas))
+    _secao_contabilizacao(session, competencia_id, filiais_grupo, grupo["cnpj_raiz"])
 
 # ---------------------------------------------------------------------------------------------- Conferência
 with aba_conferencia:
